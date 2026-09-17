@@ -117,7 +117,7 @@ pub struct AuthnRequestOptions {
 }
 
 /// Options for creating a Response (IdP-side).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ResponseOptions {
     /// IdP entity ID (used as Issuer).
     pub idp_entity_id: String,
@@ -153,24 +153,6 @@ pub struct ResponseOptions {
     /// (SAML Core §2.7.2.2). For an originating IdP this is normally empty;
     /// a proxying IdP MUST name the authority it relied on.
     pub authenticating_authorities: Vec<String>,
-}
-
-impl Default for ResponseOptions {
-    fn default() -> Self {
-        Self {
-            idp_entity_id: String::new(),
-            in_response_to: None,
-            sp_entity_id: String::new(),
-            acs_url: String::new(),
-            assertion_lifetime_seconds: 0,
-            session_index: None,
-            session_not_on_or_after: None,
-            authn_context_class_ref: None,
-            client_address: None,
-            attributes: Vec::new(),
-            authenticating_authorities: Vec::new(),
-        }
-    }
 }
 
 /// The two semantically-distinct instants that go into a Response.

@@ -203,7 +203,14 @@ mod tests {
         let release = PassThroughRelease::new();
         let attrs = vec![mail("alice@example.com")];
         let out = release
-            .release(attrs.clone(), "https://sp.example.com", &[], &[], &[], SubjectIdReq::None)
+            .release(
+                attrs.clone(),
+                "https://sp.example.com",
+                &[],
+                &[],
+                &[],
+                SubjectIdReq::None,
+            )
             .unwrap();
         assert_eq!(out, attrs);
     }

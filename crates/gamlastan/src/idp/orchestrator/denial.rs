@@ -49,8 +49,7 @@ impl Denial {
                 constants::STATUS_RESPONDER,
                 constants::STATUS_NO_PASSIVE,
                 Some(
-                    "Passive authentication is not possible without a reusable session"
-                        .to_string(),
+                    "Passive authentication is not possible without a reusable session".to_string(),
                 ),
             ),
             Denial::NoAuthnContext => Status::with_sub_status(
@@ -129,14 +128,13 @@ mod tests {
                 .sub_status
                 .as_ref()
                 .expect("{denial:?} must carry a sub-status");
-            assert_eq!(
-                sub.value.as_str(),
-                *expected_sub,
-                "{denial:?} sub-status"
-            );
+            assert_eq!(sub.value.as_str(), *expected_sub, "{denial:?} sub-status");
             // The message is always present and is a fixed IdP string.
             assert!(
-                status.status_message.as_ref().is_some_and(|m| !m.is_empty()),
+                status
+                    .status_message
+                    .as_ref()
+                    .is_some_and(|m| !m.is_empty()),
                 "{denial:?} must carry a status message"
             );
         }

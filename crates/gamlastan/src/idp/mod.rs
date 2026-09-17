@@ -15,7 +15,10 @@
 //! - [`authn_broker`] - matching `RequestedAuthnContext` against available
 //!   authentication methods;
 //! - [`assertion_store`] - storing issued assertions so back-channel
-//!   AssertionIDRequest and AuthnQuery messages can be answered.
+//!   AssertionIDRequest and AuthnQuery messages can be answered;
+//! - [`orchestrator`] - composes the primitives above into the SAML Web
+//!   Browser SSO response-assembly flow (the one tested place the bridge
+//!   between policy and a signed `Response` lives).
 //!
 //! # Deployment Model
 //!
@@ -96,4 +99,9 @@ pub use assertion_store::{AssertionStore, InMemoryAssertionStore};
 pub use authn_broker::{AuthnBroker, AuthnMethod};
 pub use eptid::Eptid;
 pub use ident::{IdentDb, IdentError, IdentityStore, InMemoryIdentityStore};
+pub use orchestrator::{
+    check_request, create_authn_response, create_denial_response, AttributeRelease,
+    AuthenticatedSubject, AuthnMethodRef, ChainedRelease, Denial, Disposition, EstablishedSession,
+    IssuedResponse, PassThroughRelease, ResponseEngine, ResponseOutcome, ResponseParams,
+};
 pub use policy::{PolicyEntry, PolicyError, ReleasePolicy, SignTargets};

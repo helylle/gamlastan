@@ -1,0 +1,517 @@
+//! Unit tests for the response orchestrator.
+//!
+//! The highest-value surface is [`check_request`]: it is pure and I/O-free, so
+//! the whole ForceAuthn × IsPassive × RequestedAuthnContext matrix can be
+//! asserted exhaustively. The remaining tests cover `AuthnMethodRef`
+//! resolution (including the ambiguous/unknown broker reference) and the
+//! `fail_on_missing_requested` on/off behaviour through
+//! [`create_authn_response`].
+
+use chrono::Utc;
+
+use crate::core::assertion::attribute::{Attribute, AttributeValue};
+use crate::core::constants;
+use crate::core::protocol::request::AuthnContextComparison;
+use crate::crypto::keys::loader;
+use crate::crypto::{KeyUsage, KeysManager, SamlSigner};
+use crate::idp::authn_broker::AuthnBroker;
+use crate::idp::ident::IdentDb;
+use crate::idp::orchestrator::release::PassThroughRelease;
+use crate::idp::orchestrator::{
+    check_request, create_authn_response, AuthnMethodRef, Disposition, EstablishedSession,
+    ResponseEngine, ResponseOutcome, ResponseParams,
+};
+use crate::idp::policy::ReleasePolicy;
+use crate::metadata::types::sp::{AttributeConsumingService, RequestedAttribute, SpSsoDescriptor};
+use crate::profiles::sso::idp::ProcessedAuthnRequest;
+
+const IDP: &str = "https://idp.example.org/metadata";
+const SP: &str = "https://sp.example.org/metadata";
+const ACS: &str = "https://sp.example.org/acs";
+
+const PASSWORD: &str = constants::AUTHN_CONTEXT_PASSWORD;
+const PPT: &str = constants::AUTHN_CONTEXT_PASSWORD_PROTECTED_TRANSPORT;
+const X509: &str = constants::AUTHN_CONTEXT_X509;
+
+const CERT_PEM: &str = include_str!("../../../tests/fixtures/enc-cert.pem");
+const KEY_PEM: &str = include_str!("../../../tests/fixtures/enc-key.pem");
+
+/// A signer backed by the fixture RSA key, with the cert as base64 DER.
+///
+/// Denials sign the Response envelope unconditionally, so any test that
+/// exercises the denial path needs a real signing key.
+fn fixture_signer() -> (SamlSigner, &'static str) {
+    let mut key = loader::load_pem_auto(KEY_PEM.as_bytes(), None).expect("load private key");
+    key.usage = KeyUsage::Sign;
+    let mut km = KeysManager::new();
+    km.add_key(key);
+    let signer = SamlSigner::new(km);
+    let cert_b64: String = CERT_PEM
+        .lines()
+        .filter(|l| !l.starts_with("-----"))
+        .map(str::trim)
+        .collect();
+    (signer, Box::leak(cert_b64.into_boxed_str()))
+}
+
+/// A broker with three methods at increasing strength.
+fn broker() -> AuthnBroker {
+    let mut b = AuthnBroker::new();
+    b.add(PASSWORD, "/login/password", 1, None);
+    b.add(PPT, "/login/ppt", 2, None);
+    b.add(X509, "/login/cert", 3, None);
+    b
+}
+
+/// A `ProcessedAuthnRequest` with the given constraint flags.
+fn processed(
+    force_authn: bool,
+    is_passive: bool,
+    class_refs: Vec<&str>,
+    comparison: Option<AuthnContextComparison>,
+) -> ProcessedAuthnRequest {
+    ProcessedAuthnRequest {
+        request_id: "_req1".to_string(),
+        sp_entity_id: SP.to_string(),
+        acs_url: ACS.to_string(),
+        acs_binding: "urn:oasis:names:tc:SAML:2.0:bindings:HTTP-POST".to_string(),
+        force_authn,
+        is_passive,
+        requested_name_id_format: None,
+        requested_sp_name_qualifier: None,
+        allow_create: false,
+        has_name_id_policy: false,
+        requested_authn_context_class_refs: class_refs.into_iter().map(String::from).collect(),
+        authn_context_comparison: comparison,
+        attribute_consuming_service_index: None,
+        extensions: None,
+    }
+}
+
+/// An `SpSsoDescriptor` with no attribute requirements.
+fn sp_sso() -> SpSsoDescriptor {
+    SpSsoDescriptor {
+        sso_base: crate::metadata::types::role_descriptor::SsoDescriptorBase {
+            base: crate::metadata::types::role_descriptor::RoleDescriptorBase::new(vec![
+                "urn:oasis:names:tc:SAML:2.0:protocol".to_string(),
+            ]),
+            artifact_resolution_services: vec![],
+            single_logout_services: vec![],
+            manage_name_id_services: vec![],
+            name_id_formats: vec![],
+        },
+        authn_requests_signed: None,
+        want_assertions_signed: Some(true),
+        assertion_consumer_services: vec![],
+        attribute_consuming_services: vec![],
+    }
+}
+
+fn params(p: ProcessedAuthnRequest) -> ResponseParams {
+    ResponseParams {
+        processed: p,
+        sp_sso: sp_sso(),
+        sp_entity: None,
+    }
+}
+
+/// A `ResponseEngine` wired to the test broker and an in-memory identity DB.
+fn engine() -> ResponseEngine<'static> {
+    static BROKER: std::sync::OnceLock<AuthnBroker> = std::sync::OnceLock::new();
+    static IDENTS: std::sync::OnceLock<IdentDb> = std::sync::OnceLock::new();
+    static DECISIONS: std::sync::OnceLock<ReleasePolicy> = std::sync::OnceLock::new();
+    static SIGNER: std::sync::OnceLock<SamlSigner> = std::sync::OnceLock::new();
+
+    let broker = BROKER.get_or_init(broker);
+    let idents = IDENTS.get_or_init(|| IdentDb::in_memory(IDP));
+    let decisions = DECISIONS.get_or_init(ReleasePolicy::new);
+    let signer = SIGNER.get_or_init(|| SamlSigner::new(KeysManager::new()));
+
+    ResponseEngine {
+        idp_entity_id: IDP,
+        decisions,
+        release: &PassThroughRelease,
+        idents,
+        broker,
+        assertions: None,
+        signer,
+        cert_der_b64: "",
+    }
+}
+
+/// A session established by the given method reference.
+fn session(method: AuthnMethodRef) -> EstablishedSession {
+    EstablishedSession {
+        subject_id: "alice".to_string(),
+        authn_method: method,
+        authn_instant: Utc::now(),
+        session_index: "_sess_1".to_string(),
+    }
+}
+
+// ── check_request: the ForceAuthn × IsPassive × ACR matrix ─────────────────
+
+#[test]
+fn no_session_no_passive_authenticates() {
+    let engine = engine();
+    let p = params(processed(false, false, vec![], None));
+    let d = check_request(&engine, &p, None);
+    // No constraint: every registered method is offered.
+    assert!(matches!(d, Disposition::Authenticate { .. }));
+}
+
+#[test]
+fn no_session_passive_denies_no_passive() {
+    let engine = engine();
+    let p = params(processed(false, true, vec![], None));
+    let d = check_request(&engine, &p, None);
+    assert!(matches!(
+        d,
+        Disposition::Deny {
+            denial: crate::idp::orchestrator::Denial::NoPassive
+        }
+    ));
+}
+
+#[test]
+fn reusable_session_is_reused() {
+    let engine = engine();
+    let p = params(processed(
+        false,
+        false,
+        vec![PASSWORD],
+        Some(AuthnContextComparison::Exact),
+    ));
+    let s = session(AuthnMethodRef::Inline {
+        class_ref: PASSWORD.to_string(),
+        authn_authority: None,
+    });
+    let d = check_request(&engine, &p, Some(&s));
+    assert!(matches!(d, Disposition::ReuseSession { .. }));
+}
+
+#[test]
+fn force_authn_defeats_session_reuse() {
+    let engine = engine();
+    // ForceAuthn set: the session must not be reused even though it satisfies
+    // the request.
+    let p = params(processed(
+        true,
+        false,
+        vec![PASSWORD],
+        Some(AuthnContextComparison::Exact),
+    ));
+    let s = session(AuthnMethodRef::Inline {
+        class_ref: PASSWORD.to_string(),
+        authn_authority: None,
+    });
+    let d = check_request(&engine, &p, Some(&s));
+    assert!(matches!(d, Disposition::Authenticate { .. }));
+}
+
+#[test]
+fn force_authn_plus_passive_denies_no_passive() {
+    let engine = engine();
+    // ForceAuthn defeats reuse, and IsPassive forbids a fresh login: NoPassive.
+    let p = params(processed(
+        true,
+        true,
+        vec![PASSWORD],
+        Some(AuthnContextComparison::Exact),
+    ));
+    let s = session(AuthnMethodRef::Inline {
+        class_ref: PASSWORD.to_string(),
+        authn_authority: None,
+    });
+    let d = check_request(&engine, &p, Some(&s));
+    assert!(matches!(
+        d,
+        Disposition::Deny {
+            denial: crate::idp::orchestrator::Denial::NoPassive
+        }
+    ));
+}
+
+#[test]
+fn session_method_below_minimum_is_not_reused() {
+    let engine = engine();
+    // Requested PPT at minimum; the session was established by Password (level
+    // 1 < 2), so it does not satisfy the request and must not be reused.
+    let p = params(processed(
+        false,
+        false,
+        vec![PPT],
+        Some(AuthnContextComparison::Minimum),
+    ));
+    let s = session(AuthnMethodRef::Inline {
+        class_ref: PASSWORD.to_string(),
+        authn_authority: None,
+    });
+    let d = check_request(&engine, &p, Some(&s));
+    assert!(matches!(d, Disposition::Authenticate { .. }));
+}
+
+#[test]
+fn session_method_at_or_above_minimum_is_reused() {
+    let engine = engine();
+    // Requested Password at minimum; the session was established by PPT (level
+    // 2 >= 1), so it satisfies the request and is reused.
+    let p = params(processed(
+        false,
+        false,
+        vec![PASSWORD],
+        Some(AuthnContextComparison::Minimum),
+    ));
+    let s = session(AuthnMethodRef::Inline {
+        class_ref: PPT.to_string(),
+        authn_authority: None,
+    });
+    let d = check_request(&engine, &p, Some(&s));
+    assert!(matches!(d, Disposition::ReuseSession { .. }));
+}
+
+#[test]
+fn exact_unregistered_class_denies_no_authn_context() {
+    let engine = engine();
+    // An exact request for a class the broker does not register: nothing is
+    // picked, so the request is denied.
+    let p = params(processed(
+        false,
+        false,
+        vec!["urn:example:unknown"],
+        Some(AuthnContextComparison::Exact),
+    ));
+    let d = check_request(&engine, &p, None);
+    assert!(matches!(
+        d,
+        Disposition::Deny {
+            denial: crate::idp::orchestrator::Denial::NoAuthnContext
+        }
+    ));
+}
+
+#[test]
+fn minimum_picks_stronger_methods() {
+    let engine = engine();
+    let p = params(processed(
+        false,
+        false,
+        vec![PASSWORD],
+        Some(AuthnContextComparison::Minimum),
+    ));
+    let d = check_request(&engine, &p, None);
+    if let Disposition::Authenticate { methods } = d {
+        let refs: Vec<&str> = methods.iter().map(|m| m.class_ref.as_str()).collect();
+        // Password (1), PPT (2), X509 (3) all satisfy minimum-Password.
+        assert!(refs.contains(&PASSWORD));
+        assert!(refs.contains(&PPT));
+        assert!(refs.contains(&X509));
+    } else {
+        panic!("expected Authenticate, got {d:?}");
+    }
+}
+
+#[test]
+fn better_excludes_requested_class() {
+    let engine = engine();
+    let p = params(processed(
+        false,
+        false,
+        vec![PASSWORD],
+        Some(AuthnContextComparison::Better),
+    ));
+    let d = check_request(&engine, &p, None);
+    if let Disposition::Authenticate { methods } = d {
+        let refs: Vec<&str> = methods.iter().map(|m| m.class_ref.as_str()).collect();
+        // "better" than Password: PPT and X509, but not Password itself.
+        assert!(!refs.contains(&PASSWORD));
+        assert!(refs.contains(&PPT));
+        assert!(refs.contains(&X509));
+    } else {
+        panic!("expected Authenticate, got {d:?}");
+    }
+}
+
+#[test]
+fn passive_with_satisfying_session_reuses() {
+    let engine = engine();
+    // IsPassive with a session that satisfies the request: reuse, no denial.
+    let p = params(processed(
+        false,
+        true,
+        vec![PASSWORD],
+        Some(AuthnContextComparison::Exact),
+    ));
+    let s = session(AuthnMethodRef::Inline {
+        class_ref: PASSWORD.to_string(),
+        authn_authority: None,
+    });
+    let d = check_request(&engine, &p, Some(&s));
+    assert!(matches!(d, Disposition::ReuseSession { .. }));
+}
+
+// ── AuthnMethodRef resolution ───────────────────────────────────────────────
+
+#[test]
+fn inline_method_resolves_as_is() {
+    let b = broker();
+    let m = AuthnMethodRef::Inline {
+        class_ref: PPT.to_string(),
+        authn_authority: Some("https://upstream.example.org".to_string()),
+    };
+    let (class_ref, authority) = m.resolve(&b);
+    assert_eq!(class_ref, PPT);
+    assert_eq!(authority.as_deref(), Some("https://upstream.example.org"));
+}
+
+#[test]
+fn broker_reference_resolves_from_registration() {
+    let b = broker();
+    // The broker assigns references "1", "2", "3" in registration order.
+    let m = AuthnMethodRef::BrokerReference("2".to_string());
+    let (class_ref, authority) = m.resolve(&b);
+    assert_eq!(class_ref, PPT);
+    assert_eq!(authority, None);
+}
+
+#[test]
+fn unknown_broker_reference_falls_back_to_reference() {
+    let b = broker();
+    // An unregistered reference resolves to itself with no authority (a
+    // defensive fallback, not an error).
+    let m = AuthnMethodRef::BrokerReference("does-not-exist".to_string());
+    let (class_ref, authority) = m.resolve(&b);
+    assert_eq!(class_ref, "does-not-exist");
+    assert_eq!(authority, None);
+}
+
+// ── fail_on_missing_requested through create_authn_response ─────────────────
+
+fn mail_attribute() -> Attribute {
+    Attribute {
+        name: "urn:oid:0.9.2342.19200300.100.1.3".to_string(),
+        name_format: Some(constants::ATTRNAME_FORMAT_URI.to_string()),
+        friendly_name: Some("mail".to_string()),
+        values: vec![AttributeValue::String("alice@example.org".to_string())],
+    }
+}
+
+/// An `SpSsoDescriptor` whose default AttributeConsumingService requires `mail`.
+fn sp_sso_requiring_mail() -> SpSsoDescriptor {
+    let mut sp = sp_sso();
+    sp.attribute_consuming_services = vec![AttributeConsumingService {
+        index: 0,
+        is_default: Some(true),
+        service_names: vec![],
+        service_descriptions: vec![],
+        requested_attributes: vec![RequestedAttribute {
+            attribute: mail_attribute(),
+            is_required: Some(true),
+        }],
+    }];
+    sp
+}
+
+fn subject_with_mail() -> crate::idp::orchestrator::AuthenticatedSubject {
+    crate::idp::orchestrator::AuthenticatedSubject {
+        subject_id: "alice".to_string(),
+        attributes: vec![mail_attribute()],
+        authn_method: AuthnMethodRef::Inline {
+            class_ref: PASSWORD.to_string(),
+            authn_authority: None,
+        },
+        authn_instant: None,
+        session_index: Some("_sess_1".to_string()),
+    }
+}
+
+fn subject_without_mail() -> crate::idp::orchestrator::AuthenticatedSubject {
+    crate::idp::orchestrator::AuthenticatedSubject {
+        subject_id: "alice".to_string(),
+        attributes: vec![],
+        authn_method: AuthnMethodRef::Inline {
+            class_ref: PASSWORD.to_string(),
+            authn_authority: None,
+        },
+        authn_instant: None,
+        session_index: Some("_sess_1".to_string()),
+    }
+}
+
+/// An engine whose release seam is a pass-through (so the held attributes are
+/// what the subject supplied) and whose decisions control
+/// `fail_on_missing_requested`. Uses a fixture-backed signer so the denial
+/// path (which signs unconditionally) can run.
+fn engine_with_decisions(decisions: &ReleasePolicy) -> ResponseEngine<'_> {
+    static BROKER: std::sync::OnceLock<AuthnBroker> = std::sync::OnceLock::new();
+    static IDENTS: std::sync::OnceLock<IdentDb> = std::sync::OnceLock::new();
+    static SIGNER: std::sync::OnceLock<SamlSigner> = std::sync::OnceLock::new();
+    static CERT: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
+
+    let broker = BROKER.get_or_init(broker);
+    let idents = IDENTS.get_or_init(|| IdentDb::in_memory(IDP));
+    let (signer, cert) = fixture_signer();
+    let signer = SIGNER.get_or_init(|| signer);
+    let cert = CERT.get_or_init(|| cert);
+
+    ResponseEngine {
+        idp_entity_id: IDP,
+        decisions,
+        release: &PassThroughRelease,
+        idents,
+        broker,
+        assertions: None,
+        signer,
+        cert_der_b64: cert,
+    }
+}
+
+#[test]
+fn fail_on_missing_requested_denies_when_required_attribute_absent() {
+    let decisions = ReleasePolicy::new(); // fail_on_missing_requested defaults to true
+    let engine = engine_with_decisions(&decisions);
+    let mut p = params(processed(false, false, vec![], None));
+    p.sp_sso = sp_sso_requiring_mail();
+
+    // The subject holds no `mail`, so the required attribute is missing.
+    let outcome = create_authn_response(&engine, &p, &subject_without_mail()).unwrap();
+    assert!(matches!(
+        outcome,
+        ResponseOutcome::Denied {
+            denial: crate::idp::orchestrator::Denial::MissingRequiredAttributes,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn fail_on_missing_requested_issued_when_attribute_present() {
+    let decisions = ReleasePolicy::new();
+    let engine = engine_with_decisions(&decisions);
+    let mut p = params(processed(false, false, vec![], None));
+    p.sp_sso = sp_sso_requiring_mail();
+
+    // The subject holds `mail`, so the required attribute is satisfied.
+    let outcome = create_authn_response(&engine, &p, &subject_with_mail()).unwrap();
+    assert!(matches!(outcome, ResponseOutcome::Issued(_)));
+}
+
+#[test]
+fn fail_on_missing_requested_disabled_omits_silently() {
+    let decisions = ReleasePolicy::with_default(
+        crate::idp::policy::PolicyEntry::new().with_fail_on_missing_requested(false),
+    );
+    let engine = engine_with_decisions(&decisions);
+    let mut p = params(processed(false, false, vec![], None));
+    p.sp_sso = sp_sso_requiring_mail();
+
+    // With the flag off, a missing required attribute is a silent omission,
+    // not a denial.
+    let outcome = create_authn_response(&engine, &p, &subject_without_mail()).unwrap();
+    match outcome {
+        ResponseOutcome::Issued(issued) => {
+            assert!(issued.released_attribute_names.is_empty());
+        }
+        other => panic!("expected Issued, got {other:?}"),
+    }
+}

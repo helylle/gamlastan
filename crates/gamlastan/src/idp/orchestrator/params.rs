@@ -49,18 +49,19 @@ impl AuthnMethodRef {
     /// itself with no authority (a defensive fallback, not an error — the
     /// broker is the source of truth for level-based matching, which happens
     /// separately in `check_request`).
-    pub fn resolve(&self, broker: &crate::idp::authn_broker::AuthnBroker) -> (String, Option<String>) {
+    pub fn resolve(
+        &self,
+        broker: &crate::idp::authn_broker::AuthnBroker,
+    ) -> (String, Option<String>) {
         match self {
             AuthnMethodRef::Inline {
                 class_ref,
                 authn_authority,
             } => (class_ref.clone(), authn_authority.clone()),
-            AuthnMethodRef::BrokerReference(reference) => {
-                match broker.get(reference) {
-                    Some(method) => (method.class_ref.clone(), method.authn_authority.clone()),
-                    None => (reference.clone(), None),
-                }
-            }
+            AuthnMethodRef::BrokerReference(reference) => match broker.get(reference) {
+                Some(method) => (method.class_ref.clone(), method.authn_authority.clone()),
+                None => (reference.clone(), None),
+            },
         }
     }
 }
@@ -135,7 +136,9 @@ impl ResponseParams {
         use crate::idp::entity_category::SubjectIdReq;
         self.sp_entity
             .as_ref()
-            .map(|e| SubjectIdReq::from_metadata_values(&e.entity_attribute_values("subject-id:req")))
+            .map(|e| {
+                SubjectIdReq::from_metadata_values(&e.entity_attribute_values("subject-id:req"))
+            })
             .unwrap_or_default()
     }
 
@@ -156,7 +159,9 @@ impl ResponseParams {
     }
 
     /// The raw AuthnRequest's `RequestedAuthnContext`, if any.
-    pub fn requested_authn_context(&self) -> Option<crate::core::protocol::request::RequestedAuthnContext> {
+    pub fn requested_authn_context(
+        &self,
+    ) -> Option<crate::core::protocol::request::RequestedAuthnContext> {
         if self.processed.requested_authn_context_class_refs.is_empty() {
             return None;
         }

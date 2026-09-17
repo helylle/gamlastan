@@ -89,6 +89,7 @@ pub mod authn_broker;
 pub mod entity_category;
 pub mod eptid;
 pub mod ident;
+pub mod orchestrator;
 pub mod policy;
 
 pub use assertion_store::{AssertionStore, InMemoryAssertionStore};

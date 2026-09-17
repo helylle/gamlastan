@@ -68,6 +68,7 @@ fn sample_options() -> ResponseOptions {
         ),
         client_address: None,
         attributes: vec![],
+        authenticating_authorities: vec![],
     }
 }
 

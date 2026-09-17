@@ -66,6 +66,10 @@ pub struct ProcessedAuthnRequest {
     /// Requested NameID format (from NameIDPolicy).
     pub requested_name_id_format: Option<String>,
 
+    /// The SP name qualifier requested in NameIDPolicy (E14). When present it
+    /// overrides the SP entity ID as the NameID's `SPNameQualifier`.
+    pub requested_sp_name_qualifier: Option<String>,
+
     /// Whether creation of new identifiers is allowed (E14).
     pub allow_create: bool,
 
@@ -129,10 +133,15 @@ pub fn process_authn_request(
     let is_passive = request.is_passive.unwrap_or(false);
 
     // Extract NameIDPolicy
-    let (requested_name_id_format, allow_create) = match &request.name_id_policy {
-        Some(policy) => (policy.format.clone(), policy.allow_create),
-        None => (None, false),
-    };
+    let (requested_name_id_format, requested_sp_name_qualifier, allow_create) =
+        match &request.name_id_policy {
+            Some(policy) => (
+                policy.format.clone(),
+                policy.sp_name_qualifier.clone(),
+                policy.allow_create,
+            ),
+            None => (None, None, false),
+        };
 
     // Extract RequestedAuthnContext
     let (requested_authn_context_class_refs, authn_context_comparison) =
@@ -149,6 +158,7 @@ pub fn process_authn_request(
         force_authn,
         is_passive,
         requested_name_id_format,
+        requested_sp_name_qualifier,
         allow_create,
         requested_authn_context_class_refs,
         authn_context_comparison,
@@ -277,7 +287,7 @@ pub fn create_response(
         authn_context: AuthnContext {
             authn_context_class_ref: options.authn_context_class_ref.clone(),
             authn_context_decl_ref: None,
-            authenticating_authorities: vec![],
+            authenticating_authorities: options.authenticating_authorities.clone(),
         },
     };
 
@@ -477,6 +487,7 @@ pub fn create_unsolicited_response(
         authn_context_class_ref: authn_context_class_ref.map(|s| s.to_string()),
         client_address: client_address.map(|s| s.to_string()),
         attributes: attributes.to_vec(),
+        authenticating_authorities: vec![],
     };
 
     create_response(&options, principal_name_id, times)
@@ -855,6 +866,7 @@ mod tests {
                 friendly_name: None,
                 values: vec![],
             }],
+            authenticating_authorities: vec![],
         };
         let name_id = NameId {
             value: "user@example.com".to_string(),
@@ -939,6 +951,7 @@ mod tests {
             authn_context_class_ref: Some(constants::AUTHN_CONTEXT_PASSWORD.to_string()),
             client_address: None,
             attributes: vec![],
+            authenticating_authorities: vec![],
         };
         let name_id = NameId {
             value: "user@example.com".to_string(),

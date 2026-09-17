@@ -333,6 +333,7 @@ async fn idp_sso(
             .realip_remote_addr()
             .map(|s| s.to_string()),
         attributes: authn_result.attributes.clone(),
+        authenticating_authorities: vec![],
     };
 
     let times = ResponseTimes {

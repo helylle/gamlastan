@@ -5,6 +5,28 @@ All notable changes to this repository will be documented in this file.
 The project is still pre-1.0, so minor releases may include behavior changes
 where needed to correct protocol handling.
 
+## [Unreleased]
+
+### Added
+
+- Added `ResponseOptions::authenticating_authorities` and an `impl Default`
+  for `ResponseOptions`. `create_response` now writes the field into the
+  `AuthnContext` instead of hardcoding an empty list, so proxying IdPs can
+  name the authority they relied on (SAML Core §2.7.2.2).
+- Added `ProcessedAuthnRequest::requested_sp_name_qualifier`, extracted from
+  the request's `NameIDPolicy/@SPNameQualifier`, so `IdentDb::construct_nameid`
+  can honour it instead of always falling back to the SP entity ID.
+
+### Changed
+
+- **Breaking:** `ResponseOptions` gained the `authenticating_authorities`
+  field. Every struct literal must add it (or use `..Default::default()`).
+  External consumers with hand-built literals (e.g. tunnelbana) need a
+  one-line-per-site compat patch.
+- **Breaking:** `ProcessedAuthnRequest` gained
+  `requested_sp_name_qualifier`. The struct is only produced by
+  `process_authn_request`, so hand-construction sites need one added line.
+
 ## [0.9.0] - 2026-09-03
 
 ### Added

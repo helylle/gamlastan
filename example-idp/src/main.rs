@@ -683,6 +683,7 @@ fn build_saml_response(
         authn_context_class_ref: Some(authn_context_class_ref),
         client_address: None,
         attributes: user.attributes(),
+        authenticating_authorities: vec![],
     };
 
     let response = idp_profile::create_response(

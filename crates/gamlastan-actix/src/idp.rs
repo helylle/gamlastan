@@ -22,6 +22,10 @@ use gamlastan::profiles::logout;
 use gamlastan::profiles::sso::idp as idp_profile;
 // The canonical enveloped-signature template now lives in core gamlastan;
 // re-export it so existing call sites (and the doc links) keep resolving.
+use gamlastan::idp::orchestrator::{
+    create_authn_response, create_denial_response, AuthenticatedSubject, Denial, ResponseEngine,
+    ResponseOutcome, ResponseParams,
+};
 pub use gamlastan::profiles::sso::idp::signature_template;
 use gamlastan::profiles::sso::web_browser::{ResponseOptions, ResponseTimes};
 use gamlastan::xml::serialize::SamlSerialize;
@@ -136,6 +140,49 @@ pub struct AuthnCallbackResult {
     pub authn_instant: Option<DateTime<Utc>>,
 }
 
+/// The higher-level authentication contract for the IdP SSO handler.
+///
+/// Unlike [`AuthnCallback`] — which returns a fully-decided
+/// [`AuthnCallbackResult`] (NameID already constructed, attributes already
+/// filtered, authn context already matched) — this callback reports only the
+/// *identity facts* the application knows, and lets the
+/// [`ResponseEngine`](gamlastan::idp::orchestrator::ResponseEngine) derive the
+/// NameID, released attributes, and authn context, then assemble and sign the
+/// response. This is the crate's policy-driven path; [`AuthnCallback`] remains
+/// the lower-level escape hatch for integrators who want to bypass crate policy.
+///
+/// Register both this callback and a `ResponseEngine` as application data to
+/// use it; the SSO handler prefers it over [`AuthnCallback`] when both are
+/// present.
+pub type AuthnSubjectCallback = Box<
+    dyn Fn(
+            &idp_profile::ProcessedAuthnRequest,
+            &HttpRequest,
+        ) -> Result<AuthnSubjectResult, SamlActixError>
+        + Send
+        + Sync
+        + 'static,
+>;
+
+/// The outcome of the [`AuthnSubjectCallback`].
+///
+/// - [`Authenticated`](AuthnSubjectResult::Authenticated) — the principal
+///   authenticated; the engine assembles and signs the response from the
+///   supplied [`AuthenticatedSubject`].
+/// - [`Redirect`](AuthnSubjectResult::Redirect) — the application takes over
+///   delivery (e.g. a login form, a step-up redirect, or an IdP-initiated
+///   response) and returns its own `HttpResponse`.
+/// - [`Deny`](AuthnSubjectResult::Deny) — the request is refused with a signed
+///   SAML protocol error carrying the given [`Denial`].
+pub enum AuthnSubjectResult {
+    /// The principal authenticated; assemble a response from these facts.
+    Authenticated(AuthenticatedSubject),
+    /// The application returns its own response (no SAML assembly here).
+    Redirect(HttpResponse),
+    /// Refuse the request with a signed protocol error.
+    Deny(Denial),
+}
+
 /// Register all IdP routes on the given service configuration.
 ///
 /// Routes:
@@ -244,6 +291,8 @@ async fn idp_sso(
     config: web::Data<IdpConfig>,
     signing_ctx: Option<web::Data<Arc<IdpSigningContext>>>,
     authn_callback: Option<web::Data<AuthnCallback>>,
+    authn_subject_callback: Option<web::Data<AuthnSubjectCallback>>,
+    response_engine: Option<web::Data<Arc<ResponseEngine<'static>>>>,
     req: HttpRequest,
 ) -> Result<HttpResponse, SamlActixError> {
     // Save relay state before msg is consumed
@@ -305,6 +354,37 @@ async fn idp_sso(
     let processed =
         idp_profile::process_authn_request(&authn_request, &sp_sso, request_signature_verified)
             .map_err(SamlActixError::Profile)?;
+
+    // The higher-level, policy-driven path: when both an AuthnSubjectCallback
+    // and a ResponseEngine are registered, the engine derives the NameID,
+    // released attributes, and authn context, then assembles and signs the
+    // response. This is preferred over the lower-level AuthnCallback.
+    if let (Some(callback), Some(engine)) = (&authn_subject_callback, &response_engine) {
+        let params = ResponseParams {
+            processed: processed.clone(),
+            sp_sso: sp_sso.clone(),
+            sp_entity: None,
+        };
+        let engine = engine.get_ref();
+        let result = callback(&processed, &req)?;
+        return match result {
+            AuthnSubjectResult::Authenticated(subject) => {
+                let outcome = create_authn_response(engine, &params, &subject)
+                    .map_err(SamlActixError::Profile)?;
+                let issued = match outcome {
+                    ResponseOutcome::Issued(issued) => issued,
+                    ResponseOutcome::Denied { response, .. } => response,
+                };
+                post_issued_response(&issued, &processed.acs_url, relay_state_str.as_deref())
+            }
+            AuthnSubjectResult::Redirect(response) => Ok(response),
+            AuthnSubjectResult::Deny(denial) => {
+                let issued = create_denial_response(engine, &params, &denial)
+                    .map_err(SamlActixError::Profile)?;
+                post_issued_response(&issued, &processed.acs_url, relay_state_str.as_deref())
+            }
+        };
+    }
 
     // Call the authentication callback
     let callback = authn_callback.ok_or_else(|| {
@@ -378,6 +458,23 @@ async fn idp_sso(
         relay_state.as_ref(),
     );
 
+    Ok(crate::response_adapter::post_binding_response(&html))
+}
+
+/// POST-encode a signed, assembled response to the SP's ACS and wrap it as the
+/// HTTP-POST binding response.
+fn post_issued_response(
+    issued: &gamlastan::idp::orchestrator::IssuedResponse,
+    acs_url: &str,
+    relay_state: Option<&str>,
+) -> Result<HttpResponse, SamlActixError> {
+    let relay = relay_state.map(RelayState::echo);
+    let html = gamlastan::bindings::post::post_encode(
+        issued.xml.as_bytes(),
+        false, // is_response, not request
+        acs_url,
+        relay.as_ref(),
+    );
     Ok(crate::response_adapter::post_binding_response(&html))
 }
 
@@ -1508,5 +1605,62 @@ mod tests {
             metadata_signing_cert_b64(&config, None),
             Some("CONFIG_CERT")
         );
+    }
+
+    #[test]
+    fn test_authn_subject_result_variants() {
+        // The three outcomes are constructible and distinguishable.
+        let subject = gamlastan::idp::orchestrator::AuthenticatedSubject {
+            subject_id: "alice".to_string(),
+            attributes: vec![],
+            authn_method: gamlastan::idp::orchestrator::AuthnMethodRef::Inline {
+                class_ref: "urn:oasis:names:tc:SAML:2.0:ac:classes:Password".to_string(),
+                authn_authority: None,
+            },
+            authn_instant: None,
+            session_index: Some("_sess_1".to_string()),
+        };
+        assert!(matches!(
+            AuthnSubjectResult::Authenticated(subject),
+            AuthnSubjectResult::Authenticated(_)
+        ));
+        assert!(matches!(
+            AuthnSubjectResult::Redirect(HttpResponse::Ok().body("login form")),
+            AuthnSubjectResult::Redirect(_)
+        ));
+        assert!(matches!(
+            AuthnSubjectResult::Deny(Denial::NoPassive),
+            AuthnSubjectResult::Deny(_)
+        ));
+    }
+
+    #[actix_web::test]
+    async fn test_post_issued_response_wraps_post_binding() {
+        let issued = gamlastan::idp::orchestrator::IssuedResponse {
+            xml: "<samlp:Response/>".to_string(),
+            response_id: "_r1".to_string(),
+            assertion_id: None,
+            name_id: NameId {
+                value: "user@example.com".to_string(),
+                format: None,
+                name_qualifier: None,
+                sp_name_qualifier: None,
+                sp_provided_id: None,
+            },
+            session_index: None,
+            not_on_or_after: Utc::now(),
+            released_attribute_names: vec![],
+        };
+        let response =
+            post_issued_response(&issued, "https://sp.example.com/acs", Some("relay")).unwrap();
+        assert_eq!(response.status(), actix_web::http::StatusCode::OK);
+        let body = actix_web::body::to_bytes(response.into_body())
+            .await
+            .unwrap();
+        let body = std::str::from_utf8(&body).unwrap();
+        // The signed XML is POST-encoded to the ACS and the RelayState is echoed.
+        assert!(body.contains("SAMLResponse"));
+        assert!(body.contains("https://sp.example.com/acs"));
+        assert!(body.contains("RelayState"));
     }
 }

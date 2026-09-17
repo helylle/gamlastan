@@ -73,6 +73,12 @@ pub struct ProcessedAuthnRequest {
     /// Whether creation of new identifiers is allowed (E14).
     pub allow_create: bool,
 
+    /// Whether the request carried a `NameIDPolicy` element at all. Needed to
+    /// distinguish "no NameIDPolicy" (fall back to the IdP's default format)
+    /// from "NameIDPolicy with AllowCreate=false" (E14: no new identifier may
+    /// be created).
+    pub has_name_id_policy: bool,
+
     /// Requested authentication context class refs.
     pub requested_authn_context_class_refs: Vec<String>,
 
@@ -133,14 +139,15 @@ pub fn process_authn_request(
     let is_passive = request.is_passive.unwrap_or(false);
 
     // Extract NameIDPolicy
-    let (requested_name_id_format, requested_sp_name_qualifier, allow_create) =
+    let (requested_name_id_format, requested_sp_name_qualifier, allow_create, has_name_id_policy) =
         match &request.name_id_policy {
             Some(policy) => (
                 policy.format.clone(),
                 policy.sp_name_qualifier.clone(),
                 policy.allow_create,
+                true,
             ),
-            None => (None, None, false),
+            None => (None, None, false, false),
         };
 
     // Extract RequestedAuthnContext
@@ -160,6 +167,7 @@ pub fn process_authn_request(
         requested_name_id_format,
         requested_sp_name_qualifier,
         allow_create,
+        has_name_id_policy,
         requested_authn_context_class_refs,
         authn_context_comparison,
         attribute_consuming_service_index: request.attribute_consuming_service_index,

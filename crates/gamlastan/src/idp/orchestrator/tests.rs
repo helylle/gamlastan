@@ -515,3 +515,118 @@ fn fail_on_missing_requested_disabled_omits_silently() {
         other => panic!("expected Issued, got {other:?}"),
     }
 }
+
+// ── NameID construction through create_authn_response ──────────────────────
+
+#[test]
+fn no_name_id_policy_uses_decisions_default_format() {
+    // `decisions.nameid_format(sp)` defaults to transient; a request with no
+    // NameIDPolicy at all must fall back to it rather than erroring.
+    let engine = engine();
+    let p = params(processed(false, false, vec![], None));
+    let outcome = create_authn_response(&engine, &p, &subject_without_mail()).unwrap();
+    match outcome {
+        ResponseOutcome::Issued(issued) => {
+            assert_eq!(
+                issued.name_id.format.as_deref(),
+                Some(constants::NAMEID_TRANSIENT)
+            );
+        }
+        other => panic!("expected Issued, got {other:?}"),
+    }
+}
+
+/// A `ProcessedAuthnRequest` carrying a `NameIDPolicy`.
+fn processed_with_name_id_policy(
+    format: Option<&str>,
+    sp_name_qualifier: Option<&str>,
+    allow_create: bool,
+) -> ProcessedAuthnRequest {
+    let mut p = processed(false, false, vec![], None);
+    p.has_name_id_policy = true;
+    p.requested_name_id_format = format.map(String::from);
+    p.requested_sp_name_qualifier = sp_name_qualifier.map(String::from);
+    p.allow_create = allow_create;
+    p
+}
+
+#[test]
+fn sp_name_qualifier_honoured_over_sp_entity_id() {
+    let engine = engine();
+    let p = params(processed_with_name_id_policy(
+        Some(constants::NAMEID_TRANSIENT),
+        Some("https://requester.example.org"),
+        true,
+    ));
+    let outcome = create_authn_response(&engine, &p, &subject_without_mail()).unwrap();
+    match outcome {
+        ResponseOutcome::Issued(issued) => {
+            // The policy's explicit SPNameQualifier wins over the SP entity ID
+            // the request actually came from.
+            assert_eq!(
+                issued.name_id.sp_name_qualifier.as_deref(),
+                Some("https://requester.example.org")
+            );
+        }
+        other => panic!("expected Issued, got {other:?}"),
+    }
+}
+
+#[test]
+fn persistent_format_disallowed_create_denies_creation() {
+    // Persistent format, AllowCreate=false, and no identifier already exists
+    // for this (user, SP) pair: the IdP must refuse to fabricate one.
+    let decisions = ReleasePolicy::new();
+    let engine = engine_with_decisions(&decisions);
+    let p = params(processed_with_name_id_policy(
+        Some(constants::NAMEID_PERSISTENT),
+        None,
+        false,
+    ));
+    let outcome = create_authn_response(&engine, &p, &subject_without_mail()).unwrap();
+    assert!(matches!(
+        outcome,
+        ResponseOutcome::Denied {
+            denial: crate::idp::orchestrator::Denial::NameIdCreationNotAllowed,
+            ..
+        }
+    ));
+}
+
+// ── Two-consumer falsification test (ADR's own condition) ──────────────────
+
+#[test]
+fn proxy_shape_produces_compliant_response_without_release_policy_filter() {
+    // A fixture IdP configured the way a proxy (e.g. tunnelbana) would use the
+    // engine: `PassThroughRelease` (attributes already filtered upstream) and
+    // an inline authn method carrying a non-empty `authenticating_authorities`
+    // chain. If the engine can only produce a compliant response by routing
+    // through `ReleasePolicy::filter`, the release seam is the wrong
+    // abstraction — this is the ADR's own falsification condition, not a
+    // nice-to-have.
+    let engine = engine(); // release: &PassThroughRelease, see engine()
+    let p = params(processed(false, false, vec![], None));
+    let subject = crate::idp::orchestrator::AuthenticatedSubject {
+        subject_id: "alice".to_string(),
+        attributes: vec![mail_attribute()],
+        authn_method: AuthnMethodRef::Inline {
+            class_ref: PASSWORD.to_string(),
+            authn_authority: Some("https://upstream.example.org/idp".to_string()),
+        },
+        authn_instant: None,
+        session_index: Some("_sess_1".to_string()),
+    };
+
+    let outcome = create_authn_response(&engine, &p, &subject).unwrap();
+    match outcome {
+        ResponseOutcome::Issued(issued) => {
+            // The pass-through attribute survived untouched (no
+            // ReleasePolicy::filter ran on it).
+            assert_eq!(issued.released_attribute_names.len(), 1);
+            assert!(issued
+                .xml
+                .contains("<saml:AuthenticatingAuthority>https://upstream.example.org/idp</saml:AuthenticatingAuthority>"));
+        }
+        other => panic!("expected Issued, got {other:?}"),
+    }
+}

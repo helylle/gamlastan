@@ -9,6 +9,20 @@ where needed to correct protocol handling.
 
 ### Added
 
+- Added `idp::orchestrator`, a new module composing the existing IdP
+  primitives (`ReleasePolicy`, `IdentDb`, `AuthnBroker`, `AssertionStore`)
+  into the actual SAML Web Browser SSO response-assembly flow:
+  `ResponseEngine`, `check_request` (the pure ForceAuthn × IsPassive ×
+  RequestedAuthnContext decision matrix), `create_authn_response` /
+  `create_denial_response`, the pluggable `AttributeRelease` seam
+  (`ReleasePolicy`, `PassThroughRelease`, `ChainedRelease`), and a closed
+  `Denial` enum with a fixed SAML `Status` mapping. Denials are always signed
+  unconditionally. `example-idp` is rewritten onto this engine, replacing its
+  hand-rolled response-assembly and NameID/authn-context negotiation code.
+- Added `gamlastan-actix`'s `AuthnSubjectCallback`, a higher-level companion
+  to the existing `AuthnCallback`, returning an `AuthnSubjectResult` of
+  `Authenticated(AuthenticatedSubject) | Redirect(HttpResponse) |
+  Deny(Denial)` for handlers built on `idp::orchestrator`.
 - Added `ResponseOptions::authenticating_authorities` and an `impl Default`
   for `ResponseOptions`. `create_response` now writes the field into the
   `AuthnContext` instead of hardcoding an empty list, so proxying IdPs can

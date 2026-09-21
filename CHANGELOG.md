@@ -141,11 +141,15 @@ where needed to correct protocol handling.
   reverse-key mapping. Every forward-list mutation
   (`IdentDb::store`/`get_or_create_persistent`/`remove_remote`/
   `remove_local`) now goes through `compare_and_swap` against the same key,
-  with a retry loop. The
-  default implementation is a plain `get`+`set` and is **not** itself atomic;
-  `InMemoryIdentityStore` overrides it with a single mutex-guarded
-  compare-and-swap. A custom multi-instance backend (Redis/SQL) should
-  override it too, with a real atomic operation, to actually close the race.
+  with a retry loop. The default implementation serializes every
+  default-using caller, process-wide, behind one mutex around `get`+`set`,
+  so it genuinely closes the race for any single-process deployment
+  (including a third-party `IdentityStore` that never overrides this
+  method) rather than merely documenting that it doesn't;
+  `InMemoryIdentityStore` overrides it with its own per-instance
+  mutex-guarded compare-and-swap. A real multi-instance backend (Redis/SQL)
+  must still override it with a genuinely atomic storage-layer operation -
+  the default's process-wide lock cannot close a race across processes.
 - `idp::orchestrator`'s NameIDPolicy handling only honours
   `NameIDPolicy/@SPNameQualifier` when it equals the requester's own
   (verified) entity ID. Per saml-core-2.0-os 8.3.7, SPNameQualifier may

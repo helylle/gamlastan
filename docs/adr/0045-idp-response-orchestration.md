@@ -86,6 +86,12 @@ existing primitives into the profile flow, and move the semantics proven in
    through it with a retry loop, so two concurrent requests (for the same or
    different SPs) can no longer silently drop one writer's update or mint
    two different "stable" persistent identifiers for the same (user, SP).
+   `compare_and_swap`'s default implementation serializes every
+   default-using caller behind one process-wide mutex, so this closes the
+   race even for a third-party `IdentityStore` that never overrides the
+   method -- for any single-process deployment. A real multi-instance
+   backend still must override it with a genuinely atomic storage-layer
+   operation; the process-wide lock cannot close a race across processes.
 
    Attribute release is a seam, not a hardwired step, because deployments
    legitimately source the released set differently: an originating IdP
@@ -228,9 +234,11 @@ failure is a real protocol error rather than a silent per-integrator choice.
   proxy shape produces a compliant response without `ReleasePolicy::filter`
   ever running.
 - `idp/ident.rs`: concurrent persistent-NameID minting for the same
-  (user, SP) resolves to one identifier; concurrent persistent + transient
-  issuance don't clobber each other's forward-list entry; `remove_local`
-  racing a concurrent writer never leaves an orphaned reverse-key entry.
+  (user, SP) resolves to one identifier, including through
+  `compare_and_swap`'s *default* implementation for a store that does not
+  override it; concurrent persistent + transient issuance don't clobber
+  each other's forward-list entry; `remove_local` racing a concurrent
+  writer never leaves an orphaned reverse-key entry.
 - `idp/authn_broker.rs`: exact matching excludes a method registered at the
   same security level under a different, unrequested class ref by default;
   `allow_exact_level_matching` restores the old pysaml2-compatible

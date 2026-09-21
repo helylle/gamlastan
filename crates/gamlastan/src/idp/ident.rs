@@ -251,8 +251,16 @@ impl<S: IdentityStore> IdentDb<S> {
         self.store.get(&Self::reverse_key(&name_id.value))
     }
 
-    /// Find an existing non-transient NameID for (user, SP, IdP)
-    /// (pysaml2 `match_local_id()`).
+    /// Find an existing *persistent* NameID for (user, SP, IdP) (pysaml2
+    /// `IdentMDB.match_local_id()` — the production Mongo-backed store eduID
+    /// runs, which filters on `name_id.format == NAMEID_FORMAT_PERSISTENT`
+    /// explicitly, not pysaml2's looser shelve-backed base `IdentDB`, which
+    /// merely excludes transient).
+    ///
+    /// Matching on "not transient" instead of "is persistent" would return
+    /// any other previously-issued non-transient NameID for this (user, SP,
+    /// IdP) — e.g. an `email`-format one — labeled with *that* format, not
+    /// persistent, even though the caller asked for a persistent identifier.
     pub fn match_local_id(
         &self,
         user_id: &str,
@@ -260,7 +268,7 @@ impl<S: IdentityStore> IdentDb<S> {
         name_qualifier: Option<&str>,
     ) -> Option<NameId> {
         self.name_ids_for(user_id).into_iter().find(|nid| {
-            if nid.format.as_deref() == Some(constants::NAMEID_TRANSIENT) {
+            if nid.format.as_deref() != Some(constants::NAMEID_PERSISTENT) {
                 return false;
             }
             let sp_match = match sp_name_qualifier {
@@ -605,6 +613,43 @@ mod tests {
             .unwrap_err();
         // persistent + no policy => allow_create false => no new id
         assert!(matches!(nid, IdentError::CreateNotAllowed));
+    }
+
+    #[test]
+    fn test_persistent_lookup_is_format_aware() {
+        // Regression: a persistent request must not reuse an earlier
+        // non-transient NameID of a *different* format for the same (user,
+        // SP) pair. Sequential format requests against one shared store -
+        // the realistic production shape, unlike a fresh store per format.
+        let db = db();
+        let email = db.get_nameid("alice", constants::NAMEID_EMAIL, Some(SP), Some(IDP));
+        assert_eq!(email.format.as_deref(), Some(constants::NAMEID_EMAIL));
+
+        let create = NameIdPolicy {
+            format: Some(constants::NAMEID_PERSISTENT.to_string()),
+            sp_name_qualifier: None,
+            allow_create: true,
+        };
+        let persistent = db
+            .construct_nameid("alice", SP, Some(&create), None)
+            .expect("allow_create=true mints a fresh persistent id");
+        assert_eq!(
+            persistent.format.as_deref(),
+            Some(constants::NAMEID_PERSISTENT),
+            "a persistent request must not come back labeled with an earlier, \
+             unrelated format"
+        );
+        assert_ne!(
+            persistent.value, email.value,
+            "a persistent request must not reuse the email-format identifier's value"
+        );
+
+        // And it's genuinely stable: asking again returns the same persistent
+        // identifier, not a fresh one each time.
+        let again = db
+            .construct_nameid("alice", SP, Some(&create), None)
+            .unwrap();
+        assert_eq!(persistent.value, again.value);
     }
 
     #[test]

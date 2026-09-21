@@ -1651,12 +1651,13 @@ mod tests {
     /// IdP's privacy-preserving default), not the user's literal email.
     #[test]
     fn requested_name_id_format_is_honored() {
-        // A fresh IdentDb per format: `IdentDb::match_local_id` reuses any
-        // previously-stored non-transient NameID for (user, SP) regardless of
-        // its own format, so re-requesting a different format for the same
-        // subject against the same store would return the first format
-        // issued, not the one actually requested — sharing one store across
-        // formats would test that quirk, not format handling.
+        // One shared engine/store across every format in the loop - the
+        // realistic production shape (a single IdentDb instance, not one
+        // reset per request), and a regression check that a later format
+        // request doesn't reuse an earlier format's stored identifier
+        // (IdentDb::match_local_id is format-aware for persistent lookups).
+        let state = test_state(false, &["https://sp.example.se/metadata"]);
+        let engine = build_engine(&state);
         let mut processed = processed_request();
         let sp_sso = dummy_sp_sso(Some(false));
         let subject = AuthenticatedSubject {
@@ -1676,8 +1677,6 @@ mod tests {
             constants::NAMEID_PERSISTENT,
             constants::NAMEID_TRANSIENT,
         ] {
-            let state = test_state(false, &["https://sp.example.se/metadata"]);
-            let engine = build_engine(&state);
             processed.has_name_id_policy = true;
             processed.requested_name_id_format = Some(format.to_string());
             processed.allow_create = true;

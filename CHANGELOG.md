@@ -45,6 +45,18 @@ where needed to correct protocol handling.
   `requested_sp_name_qualifier`. The struct is only produced by
   `process_authn_request`, so hand-construction sites need one added line.
 
+### Fixed
+
+- `IdentDb::match_local_id` (persistent NameID lookup) now matches only a
+  stored identifier whose own format is also `persistent`, not any
+  non-transient format. Previously, a persistent-format request for a
+  (user, SP) pair that already had e.g. an `email`-format identifier stored
+  would return that identifier's value labeled as `persistent` instead of
+  minting/reusing an actual persistent one - matching pysaml2's production
+  Mongo-backed `IdentMDB.match_local_id`, which filters on
+  `name_id.format == NAMEID_FORMAT_PERSISTENT` explicitly, rather than
+  pysaml2's looser shelve-backed base `IdentDB`.
+
 ## [0.9.0] - 2026-09-03
 
 ### Added

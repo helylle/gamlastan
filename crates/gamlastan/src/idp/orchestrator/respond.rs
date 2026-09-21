@@ -124,9 +124,19 @@ fn session_satisfies(
     session: &EstablishedSession,
 ) -> bool {
     let (class_ref, _authority) = session.authn_method.resolve(broker);
+    class_ref_satisfies(broker, requested, &class_ref)
+}
+
+/// Whether a resolved authn context class ref satisfies the requested
+/// context. With no constraint (or nothing registered), any class ref is
+/// acceptable only when nothing was requested.
+fn class_ref_satisfies(
+    broker: &AuthnBroker,
+    requested: Option<&crate::core::protocol::request::RequestedAuthnContext>,
+    class_ref: &str,
+) -> bool {
     let picked = broker.pick(requested);
     if picked.is_empty() {
-        // No constraint (or nothing registered): accept the session.
         return requested.is_none();
     }
     picked.iter().any(|m| m.class_ref == class_ref)
@@ -212,8 +222,20 @@ pub fn create_authn_response<S: IdentityStore>(
         Err(denial) => return denied(engine, params, &denial),
     };
 
-    // 5. Resolve the authn context from the subject's method.
+    // 5. Resolve the authn context from the subject's method, and verify it
+    //    actually satisfies what the SP requested. `check_request` only
+    //    offers methods that would satisfy the request via `Disposition`; it
+    //    cannot guarantee which method the application ultimately used to
+    //    authenticate the subject it hands back here, so that has to be
+    //    checked again at the point the response is actually assembled.
     let (class_ref, authority) = subject.authn_method.resolve(engine.broker);
+    if !class_ref_satisfies(
+        engine.broker,
+        params.requested_authn_context().as_ref(),
+        &class_ref,
+    ) {
+        return denied(engine, params, &Denial::NoAuthnContext);
+    }
 
     // 6. Build the response options.
     let now = Utc::now();

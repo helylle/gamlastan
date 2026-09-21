@@ -617,6 +617,72 @@ fn fail_on_missing_requested_disabled_omits_silently() {
     }
 }
 
+// ── Authn context revalidation through create_authn_response ───────────────
+
+#[test]
+fn create_authn_response_denies_a_method_that_does_not_satisfy_the_request() {
+    // check_request only offers methods that would satisfy the request; it
+    // cannot guarantee which method the application's callback ultimately
+    // used to authenticate the subject it hands to create_authn_response
+    // directly. A Password subject for an exact X509 request must not
+    // produce a successful assertion claiming a context that was never
+    // actually satisfied. Uses a fixture-backed signer since the denial path
+    // signs unconditionally.
+    let decisions = ReleasePolicy::new();
+    let engine = engine_with_decisions(&decisions);
+    let p = params(processed(
+        false,
+        false,
+        vec![X509],
+        Some(AuthnContextComparison::Exact),
+    ));
+    let subject = crate::idp::orchestrator::AuthenticatedSubject {
+        subject_id: "alice".to_string(),
+        attributes: vec![],
+        authn_method: AuthnMethodRef::Inline {
+            class_ref: PASSWORD.to_string(),
+            authn_authority: None,
+        },
+        authn_instant: None,
+        session_index: Some("_sess_1".to_string()),
+    };
+
+    let outcome = create_authn_response(&engine, &p, &subject).unwrap();
+    assert!(matches!(
+        outcome,
+        ResponseOutcome::Denied {
+            denial: crate::idp::orchestrator::Denial::NoAuthnContext,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn create_authn_response_issues_when_method_satisfies_the_request() {
+    // Positive control: a method that does satisfy the exact request must
+    // still succeed - the revalidation must not be overly strict.
+    let engine = engine();
+    let p = params(processed(
+        false,
+        false,
+        vec![X509],
+        Some(AuthnContextComparison::Exact),
+    ));
+    let subject = crate::idp::orchestrator::AuthenticatedSubject {
+        subject_id: "alice".to_string(),
+        attributes: vec![],
+        authn_method: AuthnMethodRef::Inline {
+            class_ref: X509.to_string(),
+            authn_authority: None,
+        },
+        authn_instant: None,
+        session_index: Some("_sess_1".to_string()),
+    };
+
+    let outcome = create_authn_response(&engine, &p, &subject).unwrap();
+    assert!(matches!(outcome, ResponseOutcome::Issued(_)));
+}
+
 // ── NameID construction through create_authn_response ──────────────────────
 
 #[test]

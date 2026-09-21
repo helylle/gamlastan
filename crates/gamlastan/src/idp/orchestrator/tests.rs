@@ -15,7 +15,7 @@ use crate::core::protocol::request::AuthnContextComparison;
 use crate::crypto::keys::loader;
 use crate::crypto::{KeyUsage, KeysManager, SamlSigner};
 use crate::idp::authn_broker::AuthnBroker;
-use crate::idp::ident::IdentDb;
+use crate::idp::ident::{IdentDb, IdentityStore};
 use crate::idp::orchestrator::release::PassThroughRelease;
 use crate::idp::orchestrator::{
     check_request, create_authn_response, AuthnMethodRef, Disposition, EstablishedSession,
@@ -680,6 +680,48 @@ fn create_authn_response_issues_when_method_satisfies_the_request() {
     };
 
     let outcome = create_authn_response(&engine, &p, &subject).unwrap();
+    assert!(matches!(outcome, ResponseOutcome::Issued(_)));
+}
+
+// ── ResponseEngine over a non-default IdentityStore ─────────────────────────
+
+/// A distinct `IdentityStore` impl (not `InMemoryIdentityStore`) — stands in
+/// for a Redis/SQL-backed store. Proves `ResponseEngine::idents` (`dyn
+/// NameIdConstructor`) actually accepts an `IdentDb` over any store, not
+/// just the default.
+#[derive(Default)]
+struct CustomStore(std::sync::Mutex<std::collections::HashMap<String, String>>);
+
+impl IdentityStore for CustomStore {
+    fn get(&self, key: &str) -> Option<String> {
+        self.0.lock().unwrap().get(key).cloned()
+    }
+    fn set(&self, key: &str, value: String) {
+        self.0.lock().unwrap().insert(key.to_string(), value);
+    }
+    fn remove(&self, key: &str) {
+        self.0.lock().unwrap().remove(key);
+    }
+}
+
+#[test]
+fn response_engine_accepts_a_non_default_identity_store() {
+    let idents = IdentDb::new(CustomStore::default(), IDP);
+    let broker = broker();
+    let decisions = ReleasePolicy::new();
+    let engine = ResponseEngine {
+        idp_entity_id: IDP,
+        decisions: &decisions,
+        release: &decisions,
+        idents: &idents, // &IdentDb<CustomStore> coerces to &dyn NameIdConstructor
+        broker: &broker,
+        assertions: None,
+        signer: &SamlSigner::new(KeysManager::new()),
+        cert_der_b64: "",
+    };
+
+    let p = params(processed(false, false, vec![], None));
+    let outcome = create_authn_response(&engine, &p, &subject_without_mail()).unwrap();
     assert!(matches!(outcome, ResponseOutcome::Issued(_)));
 }
 

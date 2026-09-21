@@ -12,7 +12,7 @@ use crate::core::assertion::name_id::NameId;
 use crate::core::protocol::response::Response;
 use crate::idp::assertion_store::AssertionStore;
 use crate::idp::authn_broker::AuthnBroker;
-use crate::idp::ident::{IdentDb, IdentityStore, InMemoryIdentityStore};
+use crate::idp::ident::NameIdConstructor;
 use crate::idp::policy::{sp_attribute_requirements, PolicyError, ReleasePolicy};
 use crate::profiles::error::ProfileError;
 use crate::profiles::sso::idp::{create_error_response, create_response, sign_response_xml};
@@ -32,7 +32,14 @@ use super::release::AttributeRelease;
 /// `ReleasePolicy`); a proxy passes a
 /// [`PassThroughRelease`](super::PassThroughRelease) or
 /// [`ChainedRelease`](super::ChainedRelease) instead.
-pub struct ResponseEngine<'a, S: IdentityStore = InMemoryIdentityStore> {
+///
+/// `idents` is `dyn NameIdConstructor` rather than a concrete
+/// `IdentDb<S: IdentityStore>` so this type carries no `IdentityStore`
+/// generic — a ready-made framework integration (a fixed function signature
+/// registered as a route handler) cannot parameterize that per-application;
+/// type-erasing it here means a Redis/SQL-backed `IdentDb` works there too,
+/// not just the default in-memory store.
+pub struct ResponseEngine<'a> {
     /// This IdP's entity ID (used as the response/assertion `Issuer`).
     pub idp_entity_id: &'a str,
     /// The per-SP decisions: lifetime, NameID format, signing targets, and
@@ -40,8 +47,9 @@ pub struct ResponseEngine<'a, S: IdentityStore = InMemoryIdentityStore> {
     pub decisions: &'a ReleasePolicy,
     /// The attribute-release seam. Often `decisions` again.
     pub release: &'a dyn AttributeRelease,
-    /// The identity database (NameID construction and storage).
-    pub idents: &'a IdentDb<S>,
+    /// The identity database (NameID construction), type-erased over its
+    /// `IdentityStore` backend.
+    pub idents: &'a dyn NameIdConstructor,
     /// The authn broker (RequestedAuthnContext matching).
     pub broker: &'a AuthnBroker,
     /// The assertion store, if back-channel queries must be answerable.
@@ -68,8 +76,8 @@ pub struct ResponseEngine<'a, S: IdentityStore = InMemoryIdentityStore> {
 ///    [`Disposition::Authenticate`] with those methods.
 /// 4. Otherwise (a context was requested and none is available), deny with
 ///    [`Denial::NoAuthnContext`].
-pub fn check_request<S: IdentityStore>(
-    engine: &ResponseEngine<S>,
+pub fn check_request(
+    engine: &ResponseEngine,
     params: &ResponseParams,
     session: Option<&EstablishedSession>,
 ) -> Disposition {
@@ -159,8 +167,8 @@ fn class_ref_satisfies(
 /// A protocol refusal is returned as
 /// [`ResponseOutcome::Denied`](super::ResponseOutcome::Denied) with a signed
 /// error response; only programming/configuration faults are `Err`.
-pub fn create_authn_response<S: IdentityStore>(
-    engine: &ResponseEngine<S>,
+pub fn create_authn_response(
+    engine: &ResponseEngine,
     params: &ResponseParams,
     subject: &AuthenticatedSubject,
 ) -> Result<super::ResponseOutcome, ProfileError> {
@@ -317,8 +325,8 @@ pub fn create_authn_response<S: IdentityStore>(
 ///
 /// The Response envelope is signed **unconditionally** — an unsigned denial is
 /// trivially forgeable — regardless of the per-SP `SignTargets`.
-pub fn create_denial_response<S: IdentityStore>(
-    engine: &ResponseEngine<S>,
+pub fn create_denial_response(
+    engine: &ResponseEngine,
     params: &ResponseParams,
     denial: &Denial,
 ) -> Result<IssuedResponse, ProfileError> {
@@ -366,8 +374,8 @@ pub fn create_denial_response<S: IdentityStore>(
 }
 
 /// Build a `ResponseOutcome::Denied` for the given denial.
-fn denied<S: IdentityStore>(
-    engine: &ResponseEngine<S>,
+fn denied(
+    engine: &ResponseEngine,
     params: &ResponseParams,
     denial: &Denial,
 ) -> Result<super::ResponseOutcome, ProfileError> {
@@ -380,8 +388,8 @@ fn denied<S: IdentityStore>(
 
 /// Construct the NameID for the subject, honouring the request's NameIDPolicy
 /// and the IdP's default format. Maps `IdentError` to the appropriate denial.
-fn construct_name_id<S: IdentityStore>(
-    engine: &ResponseEngine<S>,
+fn construct_name_id(
+    engine: &ResponseEngine,
     params: &ResponseParams,
     subject: &AuthenticatedSubject,
 ) -> Result<NameId, Denial> {

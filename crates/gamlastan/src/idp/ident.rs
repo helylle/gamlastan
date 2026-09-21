@@ -516,6 +516,40 @@ impl<S: IdentityStore> IdentDb<S> {
     }
 }
 
+/// Object-safe view of [`IdentDb::construct_nameid`], so a caller that only
+/// needs NameID construction can hold `dyn NameIdConstructor` instead of a
+/// concrete `IdentDb<S>` — freeing it from committing to one `IdentityStore`
+/// implementation at the type level.
+///
+/// [`idp::orchestrator::ResponseEngine`](crate::idp::orchestrator::ResponseEngine)
+/// uses this: without it, `ResponseEngine` would need to stay generic over
+/// `S: IdentityStore`, which a ready-made framework integration (a fixed
+/// function signature registered as a route handler) cannot parameterize
+/// per-application — hardcoding the default `InMemoryIdentityStore` would
+/// shut out a Redis/SQL-backed store, the documented multi-instance seam.
+pub trait NameIdConstructor: Send + Sync {
+    /// See [`IdentDb::construct_nameid`].
+    fn construct_nameid(
+        &self,
+        user_id: &str,
+        sp_entity_id: &str,
+        name_id_policy: Option<&NameIdPolicy>,
+        default_format: Option<&str>,
+    ) -> Result<NameId, IdentError>;
+}
+
+impl<S: IdentityStore> NameIdConstructor for IdentDb<S> {
+    fn construct_nameid(
+        &self,
+        user_id: &str,
+        sp_entity_id: &str,
+        name_id_policy: Option<&NameIdPolicy>,
+        default_format: Option<&str>,
+    ) -> Result<NameId, IdentError> {
+        IdentDb::construct_nameid(self, user_id, sp_entity_id, name_id_policy, default_format)
+    }
+}
+
 pub(crate) fn to_hex(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len() * 2);
     for b in bytes {

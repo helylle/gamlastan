@@ -98,7 +98,7 @@ pub mod policy;
 pub use assertion_store::{AssertionStore, InMemoryAssertionStore};
 pub use authn_broker::{AuthnBroker, AuthnMethod};
 pub use eptid::Eptid;
-pub use ident::{IdentDb, IdentError, IdentityStore, InMemoryIdentityStore};
+pub use ident::{IdentDb, IdentError, IdentityStore, InMemoryIdentityStore, NameIdConstructor};
 pub use orchestrator::{
     check_request, create_authn_response, create_denial_response, AttributeRelease,
     AuthenticatedSubject, AuthnMethodRef, ChainedRelease, Denial, Disposition, EstablishedSession,

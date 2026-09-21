@@ -45,6 +45,13 @@ where needed to correct protocol handling.
 - Added `IdpConfig::trusted_sp_entity`, returning a trusted SP's full entity
   descriptor (entity categories and other entity-level extensions), alongside
   the existing `trusted_sp` (SSO descriptor only).
+- Added `idp::NameIdConstructor`, an object-safe view of
+  `IdentDb::construct_nameid`, implemented for `IdentDb<S>` over any
+  `IdentityStore`. `ResponseEngine` is no longer generic over `S:
+  IdentityStore` — `idents` is `&dyn NameIdConstructor` — so a ready-made
+  framework integration with a fixed function signature (a route handler
+  registered once, not parameterized per application) can accept a
+  Redis/SQL-backed `IdentDb`, not just the default in-memory store.
 
 ### Changed
 

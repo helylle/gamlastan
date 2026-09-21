@@ -1782,6 +1782,105 @@ mod tests {
         }
     }
 
+    /// A distinct `IdentityStore` impl (not `InMemoryIdentityStore`) - stands
+    /// in for a Redis/SQL-backed store an application registers.
+    #[derive(Default)]
+    struct CustomStore(std::sync::Mutex<std::collections::HashMap<String, String>>);
+
+    impl gamlastan::idp::ident::IdentityStore for CustomStore {
+        fn get(&self, key: &str) -> Option<String> {
+            self.0.lock().unwrap().get(key).cloned()
+        }
+        fn set(&self, key: &str, value: String) {
+            self.0.lock().unwrap().insert(key.to_string(), value);
+        }
+        fn remove(&self, key: &str) {
+            self.0.lock().unwrap().remove(key);
+        }
+    }
+
+    #[actix_web::test]
+    async fn idp_sso_accepts_response_engine_over_a_non_default_identity_store() {
+        // Regression: ResponseEngine::idents is type-erased (dyn
+        // NameIdConstructor) precisely so a ready-made Actix route handler -
+        // whose signature is fixed, unlike a generic function an application
+        // could monomorphize itself - is not stuck with the default
+        // InMemoryIdentityStore. A Redis/SQL-backed store must work here too.
+        const SP: &str = "https://sp.example.com";
+        const ACS: &str = "https://sp.example.com/acs";
+
+        let idents: &'static gamlastan::idp::ident::IdentDb<CustomStore> = Box::leak(Box::new(
+            gamlastan::idp::ident::IdentDb::new(CustomStore::default(), "https://idp.example.com"),
+        ));
+        let broker: &'static gamlastan::idp::authn_broker::AuthnBroker =
+            Box::leak(Box::new(gamlastan::idp::authn_broker::AuthnBroker::new()));
+        let decisions: &'static gamlastan::idp::policy::ReleasePolicy =
+            Box::leak(Box::new(gamlastan::idp::policy::ReleasePolicy::new()));
+        let signer: &'static SamlSigner = Box::leak(Box::new(test_signer()));
+        let cert: &'static str = Box::leak(cert_b64(SIGN_CERT_PEM).into_boxed_str());
+        let engine = ResponseEngine {
+            idp_entity_id: "https://idp.example.com",
+            decisions,
+            release: decisions,
+            idents, // &IdentDb<CustomStore> coerces to &dyn NameIdConstructor
+            broker,
+            assertions: None,
+            signer,
+            cert_der_b64: cert,
+        };
+
+        let sp_sso = sp_sso_with_acs(ACS);
+        let entity =
+            gamlastan::metadata::types::entity_descriptor::EntityDescriptor::for_sp(SP, sp_sso);
+        let config = web::Data::new(
+            IdpConfig::new("https://idp.example.com", "https://idp.example.com/sso")
+                .with_trusted_sp(SP, entity),
+        );
+        let signing_ctx = web::Data::new(Arc::new(IdpSigningContext::new(
+            test_signer(),
+            cert_b64(SIGN_CERT_PEM),
+        )));
+        let authn_subject_callback: AuthnSubjectCallback =
+            Box::new(move |_processed, _disposition, _req| {
+                Ok(AuthnSubjectResult::Authenticated(AuthenticatedSubject {
+                    subject_id: "alice".to_string(),
+                    attributes: vec![],
+                    authn_method: gamlastan::idp::orchestrator::AuthnMethodRef::Inline {
+                        class_ref: "urn:oasis:names:tc:SAML:2.0:ac:classes:Password".to_string(),
+                        authn_authority: None,
+                    },
+                    authn_instant: None,
+                    session_index: Some("_sess1".to_string()),
+                }))
+            });
+
+        let mut request = passive_authn_request(SP);
+        request.is_passive = None;
+        let xml = request.to_xml_string().unwrap();
+        let msg = SamlMessage {
+            saml_xml: xml.into_bytes(),
+            relay_state: None,
+            is_request: true,
+            binding: crate::extractors::SamlBinding::HttpPost,
+            redirect_signature: None,
+        };
+
+        let response = idp_sso(
+            msg,
+            config,
+            Some(signing_ctx),
+            None,
+            Some(web::Data::new(authn_subject_callback)),
+            None,
+            Some(web::Data::new(Arc::new(engine))),
+            actix_web::test::TestRequest::default().to_http_request(),
+        )
+        .await
+        .expect("handler must not error");
+
+        assert_eq!(response.status(), actix_web::http::StatusCode::OK);
+    }
+
     #[actix_web::test]
     async fn idp_sso_denies_passive_request_without_calling_the_callback() {
         // Regression: the policy-driven Actix path must consult check_request

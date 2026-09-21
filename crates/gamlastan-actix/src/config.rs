@@ -25,10 +25,12 @@ use gamlastan::security::replay::{InMemoryReplayCache, ReplayCache};
 /// front-channel LogoutRequest messages before any state is mutated.
 #[derive(Clone)]
 pub struct TrustedSp {
-    /// The SP `entityID` (matched against the message `Issuer`).
-    pub entity_id: String,
     /// The SP's full entity descriptor (SSO descriptor plus entity
-    /// extensions such as `mdattr:EntityAttributes` entity categories).
+    /// extensions such as `mdattr:EntityAttributes` entity categories). Its
+    /// own `entity_id` field is the registration key (matched against the
+    /// message `Issuer`) — kept as the single source of truth so a
+    /// registration key can never disagree with the descriptor's own
+    /// identity.
     pub entity: EntityDescriptor,
 }
 
@@ -556,10 +558,13 @@ impl IdpConfig {
     ///   signing certificates before mutating session state or consuming an
     ///   artifact.
     ///
-    /// `entity_id` is matched against the message `Issuer`; `entity` is the
-    /// SP's full entity descriptor (typically parsed from the SP's metadata
-    /// document), so entity categories and other entity-level extensions
-    /// carry through to `idp::orchestrator`'s attribute-release policy. Use
+    /// `entity` is the SP's full entity descriptor (typically parsed from the
+    /// SP's metadata document); its own `entity_id` field is matched against
+    /// the message `Issuer` — there is deliberately no separate registration
+    /// key, so a mismatched call site cannot bind one issuer's authorization
+    /// to a different entity's ACS endpoints and release policy. Entity
+    /// categories and other entity-level extensions carry through to
+    /// `idp::orchestrator`'s attribute-release policy. Use
     /// [`EntityDescriptor::for_sp`](gamlastan::metadata::types::entity_descriptor::EntityDescriptor::for_sp)
     /// to wrap a bare `SpSsoDescriptor` when those aren't needed.
     ///
@@ -584,21 +589,11 @@ impl IdpConfig {
     /// #     attribute_consuming_services: vec![],
     /// # };
     /// let config = IdpConfig::new("https://idp.example.com", "https://idp.example.com/sso")
-    ///     .with_trusted_sp(
-    ///         "https://sp.example.com",
-    ///         EntityDescriptor::for_sp("https://sp.example.com", sp_sso),
-    ///     );
+    ///     .with_trusted_sp(EntityDescriptor::for_sp("https://sp.example.com", sp_sso));
     /// assert!(config.trusted_sp("https://sp.example.com").is_some());
     /// ```
-    pub fn with_trusted_sp(
-        mut self,
-        entity_id: impl Into<String>,
-        entity: EntityDescriptor,
-    ) -> Self {
-        self.trusted_sps.push(TrustedSp {
-            entity_id: entity_id.into(),
-            entity,
-        });
+    pub fn with_trusted_sp(mut self, entity: EntityDescriptor) -> Self {
+        self.trusted_sps.push(TrustedSp { entity });
         self
     }
 
@@ -639,7 +634,7 @@ impl IdpConfig {
     pub fn trusted_sp_entity(&self, entity_id: &str) -> Option<&EntityDescriptor> {
         self.trusted_sps
             .iter()
-            .find(|sp| sp.entity_id == entity_id)
+            .find(|sp| sp.entity.entity_id == entity_id)
             .map(|sp| &sp.entity)
     }
 

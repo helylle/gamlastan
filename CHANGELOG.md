@@ -64,14 +64,20 @@ where needed to correct protocol handling.
   produced by `process_authn_request`, so hand-construction sites need both
   fields added.
 - **Breaking:** `gamlastan-actix`'s `TrustedSp.sp_sso: SpSsoDescriptor` field
-  is now `entity: EntityDescriptor`; `IdpConfig::with_trusted_sp`'s second
-  parameter and `TrustedSpResolver::resolve_sp`'s return type changed from
-  `SpSsoDescriptor` to `EntityDescriptor` to match (wrap a bare
-  `SpSsoDescriptor` with `EntityDescriptor::for_sp` at call sites that don't
-  need entity-level extensions). Previously the SSO handler's policy-driven
-  path always passed `sp_entity: None` to `idp::orchestrator`, so entity-category
-  attribute-release policy could never engage through it; the full descriptor
-  is now threaded through from trusted-SP resolution.
+  is now `entity: EntityDescriptor`, with no separate registration-key field:
+  `IdpConfig::with_trusted_sp(entity_id, sp_sso)` is now
+  `with_trusted_sp(entity: EntityDescriptor)`, keyed by the descriptor's own
+  `entity_id` (wrap a bare `SpSsoDescriptor` with `EntityDescriptor::for_sp`
+  at call sites that don't need entity-level extensions), so a mismatched
+  call site can no longer register one issuer's authorization under a
+  different entity's ACS endpoints and release policy.
+  `TrustedSpResolver::resolve_sp`'s return type changed from
+  `SpSsoDescriptor` to `EntityDescriptor` to match, and the handler now
+  rejects a resolver response whose `entity_id` disagrees with the requested
+  one. Previously the SSO handler's policy-driven path also always passed
+  `sp_entity: None` to `idp::orchestrator`, so entity-category
+  attribute-release policy could never engage through it; the full
+  descriptor is now threaded through from trusted-SP resolution.
 - **Breaking:** `gamlastan-actix`'s `AuthnSubjectCallback` gains a
   `&Disposition` parameter (between the processed request and the
   `HttpRequest`). The SSO handler now calls

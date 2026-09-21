@@ -950,7 +950,15 @@ async fn resolve_trusted_sp_entity(
         return Some(entity.clone());
     }
     if let Some(resolver) = &config.sp_resolver {
-        return resolver.resolve_sp(entity_id).await;
+        let entity = resolver.resolve_sp(entity_id).await?;
+        // A resolver that returns a descriptor for a different entity than
+        // requested must not be trusted for this lookup: accepting it would
+        // bind the requested issuer's authorization to a different entity's
+        // ACS endpoints and release policy.
+        if entity.entity_id != entity_id {
+            return None;
+        }
+        return Some(entity);
     }
     None
 }
@@ -1493,7 +1501,7 @@ mod tests {
             empty_sp_sso(),
         );
         let config = IdpConfig::new("https://idp.example.com", "https://idp.example.com/sso")
-            .with_trusted_sp("https://good-sp.example.com", sp);
+            .with_trusted_sp(sp);
         let req = logout_request(Some("https://evil-sp.example.com"));
         // `resolve_trusted_sp` would return None for the untrusted issuer.
         assert!(authorize_slo_request(&config, &req, "<LogoutRequest/>", None, None).is_err());
@@ -1601,6 +1609,36 @@ mod tests {
         );
     }
 
+    #[actix_web::test]
+    async fn test_resolve_trusted_sp_entity_rejects_resolver_mismatch() {
+        // Regression: a resolver returning a descriptor for a different
+        // entity than requested must not be trusted for that lookup - doing
+        // so would bind the requested issuer's authorization to a different
+        // entity's ACS endpoints and release policy.
+        struct MismatchedResolver;
+        impl TrustedSpResolver for MismatchedResolver {
+            fn resolve_sp<'a>(&'a self, _entity_id: &'a str) -> crate::config::ResolveSpFuture<'a> {
+                Box::pin(async move {
+                    Some(
+                        gamlastan::metadata::types::entity_descriptor::EntityDescriptor::for_sp(
+                            "https://other-entity.example.com",
+                            empty_sp_sso(),
+                        ),
+                    )
+                })
+            }
+        }
+
+        let config = IdpConfig::new("https://idp.example.com", "https://idp.example.com/sso")
+            .with_sp_resolver(std::sync::Arc::new(MismatchedResolver));
+        assert!(
+            resolve_trusted_sp_entity(&config, "https://requested-entity.example.com")
+                .await
+                .is_none(),
+            "a resolver returning a mismatched entity_id must not be trusted"
+        );
+    }
+
     #[test]
     fn test_trusted_sp_lookup() {
         // Finding #4 support: the SSO handler binds the request issuer to trusted
@@ -1610,7 +1648,7 @@ mod tests {
             empty_sp_sso(),
         );
         let config = IdpConfig::new("https://idp.example.com", "https://idp.example.com/sso")
-            .with_trusted_sp("https://sp.example.com", sp);
+            .with_trusted_sp(sp);
         assert!(config.trusted_sp("https://sp.example.com").is_some());
         assert!(config.trusted_sp("https://other.example.com").is_none());
     }
@@ -1834,7 +1872,7 @@ mod tests {
             gamlastan::metadata::types::entity_descriptor::EntityDescriptor::for_sp(SP, sp_sso);
         let config = web::Data::new(
             IdpConfig::new("https://idp.example.com", "https://idp.example.com/sso")
-                .with_trusted_sp(SP, entity),
+                .with_trusted_sp(entity),
         );
         let signing_ctx = web::Data::new(Arc::new(IdpSigningContext::new(
             test_signer(),
@@ -1897,7 +1935,7 @@ mod tests {
             gamlastan::metadata::types::entity_descriptor::EntityDescriptor::for_sp(SP, sp_sso);
         let config = web::Data::new(
             IdpConfig::new("https://idp.example.com", "https://idp.example.com/sso")
-                .with_trusted_sp(SP, entity),
+                .with_trusted_sp(entity),
         );
         let signing_ctx = web::Data::new(Arc::new(IdpSigningContext::new(
             test_signer(),
@@ -1972,7 +2010,7 @@ mod tests {
             gamlastan::metadata::types::entity_descriptor::EntityDescriptor::for_sp(SP, sp_sso);
         let config = web::Data::new(
             IdpConfig::new("https://idp.example.com", "https://idp.example.com/sso")
-                .with_trusted_sp(SP, entity),
+                .with_trusted_sp(entity),
         );
         let signing_ctx = web::Data::new(Arc::new(IdpSigningContext::new(
             test_signer(),
@@ -2076,7 +2114,7 @@ mod tests {
 
         let config = web::Data::new(
             IdpConfig::new("https://idp.example.com", "https://idp.example.com/sso")
-                .with_trusted_sp(SP, entity),
+                .with_trusted_sp(entity),
         );
         let signing_ctx = web::Data::new(Arc::new(IdpSigningContext::new(
             test_signer(),

@@ -58,9 +58,34 @@ existing primitives into the profile flow, and move the semantics proven in
    | Release decision | `ReleasePolicy` + `EntityCategoryPolicy` | Injected (see below) |
    | NameID construction / lookup | `IdentDb` (+ `Eptid`) behind `IdentityStore` | Injected store, fixed mechanics |
    | RequestedAuthnContext match | `AuthnBroker` | Injected broker, fixed comparison semantics |
-   | Request-constraint handling | `IsPassive`, `ForceAuthn`, requested NameID format | Fixed (`check_request`) |
+   | Request-constraint handling | `IsPassive`, `ForceAuthn`, requested NameID format, session expiry | Fixed (`check_request`) |
    | Assemble + sign | `ResponseOptions` -> `create_signed_response` (ADR 0033) | Fixed |
    | Record for back-channel queries | `AssertionStore` | Injected store |
+
+   `RequestedAuthnContext` matching for `Comparison="exact"` is a literal
+   match of one of the requested `AuthnContextClassRef` values
+   (saml-core-2.0-os 3.3.2.2.1), not "registered at the same security level
+   as the requested class" -- pysaml2's own `AuthnBroker` has that looser
+   behaviour, and gamlastan intentionally diverges from it for spec
+   conformance. `AuthnBroker::allow_exact_level_matching` restores the
+   pysaml2-compatible behaviour for integrators who need parity over strict
+   conformance.
+
+   NameID construction rejects a `NameIDPolicy/@SPNameQualifier` that names
+   an entity other than the verified requester: per saml-core-2.0-os 8.3.7
+   it may legitimately name an affiliation the requester belongs to, but
+   only when the IdP can verify that membership (`AffiliationDescriptor`),
+   which this crate does not implement. Honouring an arbitrary
+   requester-supplied value would let one SP request another SP's pairwise
+   persistent identifier for the same subject just by naming it in its own
+   request -- so a mismatched qualifier is denied (`InvalidNameIdPolicy`)
+   rather than passed through. Persistent NameID minting is also
+   concurrency-safe: `IdentityStore` gained a provided `compare_and_swap`
+   method, and every writer of a user's forward NameID list
+   (`store`/`get_or_create_persistent`/`remove_remote`/`remove_local`) goes
+   through it with a retry loop, so two concurrent requests (for the same or
+   different SPs) can no longer silently drop one writer's update or mint
+   two different "stable" persistent identifiers for the same (user, SP).
 
    Attribute release is a seam, not a hardwired step, because deployments
    legitimately source the released set differently: an originating IdP
@@ -162,6 +187,10 @@ failure is a real protocol error rather than a silent per-integrator choice.
   `saml2_frontend.rs`, `saml2_backend.rs`, `stepup.rs`, and four test
   files) need a one-line compat patch, prepared separately and offered to
   SUNET alongside this ADR rather than discovered via a failed build.
+- Breaking (pre-release): `AuthnBroker::pick` with `Comparison="exact"`
+  changed from level-based matching to literal class-ref matching (see
+  above). Any integrator relying on the old broadened behaviour must pass
+  `allow_exact_level_matching(true)` explicitly.
 
 ## Alternatives considered
 
@@ -190,11 +219,25 @@ failure is a real protocol error rather than a silent per-integrator choice.
 
 - `idp/orchestrator/tests.rs`: `Denial::status()` exhaustive; `AttributeRelease`
   impls incl. `ChainedRelease` ordering; the ForceAuthn/IsPassive/
-  RequestedAuthnContext matrix (13 scenarios); NameID default-format
-  fallback, `SPNameQualifier` precedence, `AllowCreate=false` denial; and a
-  falsification test proving a `PassThroughRelease` + inline-authn-method
+  RequestedAuthnContext matrix, including refusing to reuse a session past
+  its own absolute expiry (`authn_instant + session_lifetime`); NameID
+  default-format fallback, `SPNameQualifier` precedence and cross-entity
+  rejection, `AllowCreate=false` denial; `SessionNotOnOrAfter` on a reused
+  session derived from the session's original `authn_instant`, not `now`;
+  and a falsification test proving a `PassThroughRelease` + inline-authn-method
   proxy shape produces a compliant response without `ReleasePolicy::filter`
   ever running.
+- `idp/ident.rs`: concurrent persistent-NameID minting for the same
+  (user, SP) resolves to one identifier; concurrent persistent + transient
+  issuance don't clobber each other's forward-list entry; `remove_local`
+  racing a concurrent writer never leaves an orphaned reverse-key entry.
+- `idp/authn_broker.rs`: exact matching excludes a method registered at the
+  same security level under a different, unrequested class ref by default;
+  `allow_exact_level_matching` restores the old pysaml2-compatible
+  broadening.
+- `metadata/types/entity_descriptor.rs`: `saml2_sp_sso_descriptor` selects
+  by `protocolSupportEnumeration`, skipping a non-SAML-2.0 role listed
+  first in a multi-role entity.
 - `tests/idp_orchestration_roundtrip.rs`: orchestrated XML through the real
   SP-side verification path, asserting `InResponseTo`, `NameID`, session
   index, `authenticating_authorities`, and `NotOnOrAfter` all survive, with
@@ -205,9 +248,11 @@ failure is a real protocol error rather than a silent per-integrator choice.
 - `tests/attack_corpus.rs` (`orchestrator_attacks`): an explicit, unrecognized
   `AttributeConsumingServiceIndex` is denied rather than silently falling
   through to "no requirements" (which would bypass that service's own
-  attribute scoping); an `SPNameQualifier` XML-injection payload comes back
-  escaped and inert; a denial's `StatusMessage` never echoes SP-supplied
-  text.
+  attribute scoping); an `SPNameQualifier` XML-injection payload equal to
+  the requester's own entity ID comes back escaped and inert (a qualifier
+  naming a *different* entity is rejected outright before response assembly
+  -- covered in `idp/orchestrator/tests.rs`); a denial's `StatusMessage`
+  never echoes SP-supplied text.
 - `example-idp` rewritten on the engine; all 12 of its tests pass against a
   real fixture signing key (denials now sign unconditionally, so a keyless
   test signer no longer suffices).

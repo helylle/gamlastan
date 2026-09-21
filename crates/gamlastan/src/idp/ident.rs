@@ -595,10 +595,29 @@ impl<S: IdentityStore> IdentDb<S> {
 
     /// Forget every NameID for a local user (pysaml2 `remove_local()`).
     pub fn remove_local(&self, user_id: &str) {
-        for nid in self.name_ids_for(user_id) {
-            self.store.remove(&Self::reverse_key(&nid.value));
+        let key = Self::forward_key(user_id);
+        loop {
+            let Some(current) = self.store.get(&key) else {
+                return;
+            };
+            // CAS the forward key to the empty sentinel (see
+            // Self::remove_forward_entry) rather than reading-then-removing:
+            // a plain remove here could discard an entry a concurrent
+            // store()/get_or_create_persistent() call just added for a
+            // *different* SP, in the window between our read and the
+            // removal, while leaving that entry's reverse-key mapping
+            // dangling forever (it was never cleaned up because it didn't
+            // exist yet when we read the forward list).
+            if self.store.compare_and_swap(&key, Some(&current), "") {
+                for coded in Self::forward_entries(&current) {
+                    let nid = decode_name_id(coded);
+                    self.store.remove(&Self::reverse_key(&nid.value));
+                }
+                return;
+            }
+            // Someone else wrote to `key` concurrently; retry against the
+            // now-current value instead of clobbering their write.
         }
-        self.store.remove(&Self::forward_key(user_id));
     }
 
     /// Apply a ManageNameIDRequest to the database (pysaml2
@@ -957,6 +976,61 @@ mod tests {
             8,
             "every transient issuance must survive: {entries:?}"
         );
+    }
+
+    #[test]
+    fn concurrent_remove_local_does_not_orphan_a_racing_writers_reverse_key() {
+        // Regression: remove_local read name_ids_for(user) (forward key),
+        // then unconditionally removed each entry's reverse key followed by
+        // the forward key itself - all as plain, non-CAS operations, unlike
+        // every other forward-key writer (store/get_or_create_persistent/
+        // remove_remote). A concurrent store() for a *different* SP could
+        // commit a brand-new forward-list entry (and its reverse key) in the
+        // window between remove_local's read and its final forward-key
+        // removal; remove_local's unconditional removal then wiped that
+        // fresh entry out of the forward list while its reverse-key mapping
+        // was never cleaned up (it didn't exist yet when remove_local read
+        // the list) - a permanently orphaned reverse-key entry, and a
+        // "stable" persistent identifier that silently stops being stable.
+        use std::sync::Arc;
+        use std::thread;
+
+        for round in 0..20 {
+            let db = Arc::new(db());
+            db.persistent_nameid("alice", Some(SP));
+
+            let remover = {
+                let db = Arc::clone(&db);
+                thread::spawn(move || db.remove_local("alice"))
+            };
+            let writers: Vec<_> = (0..4)
+                .map(|i| {
+                    let db = Arc::clone(&db);
+                    thread::spawn(move || {
+                        db.transient_nameid("alice", Some(&format!("{SP}/{round}/{i}")))
+                    })
+                })
+                .collect();
+
+            remover.join().unwrap();
+            let written: Vec<_> = writers.into_iter().map(|t| t.join().unwrap()).collect();
+
+            let present: Vec<String> = db
+                .name_ids_for("alice")
+                .into_iter()
+                .map(|nid| nid.value)
+                .collect();
+            for nid in &written {
+                let in_forward_list = present.contains(&nid.value);
+                let reverse_points_here = db.find_local_id(nid).as_deref() == Some("alice");
+                assert_eq!(
+                    in_forward_list, reverse_points_here,
+                    "round {round}: NameID {:?} must be either fully present (forward + \
+                     reverse) or fully absent, never a dangling reverse-key entry",
+                    nid.value
+                );
+            }
+        }
     }
 
     #[test]

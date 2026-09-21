@@ -126,9 +126,13 @@ where needed to correct protocol handling.
   and separately, any two concurrent writers of the same forward list (e.g.
   a persistent mint racing a transient/email issuance, or a removal) could
   silently drop one writer's update even if that writer's own operation was
-  individually atomic. Every forward-list mutation
-  (`IdentDb::store`/`get_or_create_persistent`/`remove_remote`) now goes
-  through `compare_and_swap` against the same key, with a retry loop. The
+  individually atomic - including `remove_local`, whose unconditional,
+  non-CAS forward-key removal could wipe out a concurrently-added entry
+  from a different writer while permanently orphaning that entry's
+  reverse-key mapping. Every forward-list mutation
+  (`IdentDb::store`/`get_or_create_persistent`/`remove_remote`/
+  `remove_local`) now goes through `compare_and_swap` against the same key,
+  with a retry loop. The
   default implementation is a plain `get`+`set` and is **not** itself atomic;
   `InMemoryIdentityStore` overrides it with a single mutex-guarded
   compare-and-swap. A custom multi-instance backend (Redis/SQL) should

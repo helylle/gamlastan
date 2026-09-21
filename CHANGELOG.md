@@ -19,6 +19,15 @@ where needed to correct protocol handling.
   `Denial` enum with a fixed SAML `Status` mapping. Denials are always signed
   unconditionally. `example-idp` is rewritten onto this engine, replacing its
   hand-rolled response-assembly and NameID/authn-context negotiation code.
+  With no `RequestedAuthnContext`, any session/method is accepted regardless
+  of what the `AuthnBroker` happens to have registered (an inline/ad-hoc
+  method never registered in the broker is not rejected just because the
+  broker also has an `unspecified` baseline). `AuthnMethodRef::resolve`
+  returns `Option<(String, Option<String>)>`: a `BrokerReference` naming no
+  registered method resolves to `None` rather than falling back to treating
+  the opaque reference string itself as the AuthnContext class ref, so a
+  stale or mistyped reference can no longer become a bogus
+  `AuthnContextClassRef` in a signed assertion.
 - Added `gamlastan-actix`'s `AuthnSubjectCallback`, a higher-level companion
   to the existing `AuthnCallback`, returning an `AuthnSubjectResult` of
   `Authenticated(AuthenticatedSubject) | Redirect(HttpResponse) |

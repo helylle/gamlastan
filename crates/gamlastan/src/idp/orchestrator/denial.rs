@@ -24,7 +24,10 @@ pub enum Denial {
     /// The requested `RequestedAuthnContext` cannot be satisfied by any
     /// registered authentication method.
     NoAuthnContext,
-    /// The requested `NameIDPolicy/@Format` is not one this IdP can issue.
+    /// The `NameIDPolicy` cannot be satisfied: either `@Format` is not one
+    /// this IdP can issue, or `@SPNameQualifier` names an entity other than
+    /// the verified requester (which this IdP cannot honor without
+    /// affiliation-membership verification it does not implement).
     InvalidNameIdPolicy,
     /// The `NameIDPolicy` forbids creating a new identifier (`AllowCreate=false`)
     /// and no existing identifier is available.
@@ -68,7 +71,7 @@ impl Denial {
             Denial::InvalidNameIdPolicy => Status::with_sub_status(
                 constants::STATUS_REQUESTER,
                 constants::STATUS_INVALID_NAMEID_POLICY,
-                Some("The requested NameID format is not supported".to_string()),
+                Some("The requested NameIDPolicy cannot be satisfied".to_string()),
             ),
             Denial::NameIdCreationNotAllowed => Status::with_sub_status(
                 constants::STATUS_REQUESTER,

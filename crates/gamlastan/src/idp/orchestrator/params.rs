@@ -44,24 +44,27 @@ pub enum AuthnMethodRef {
 impl AuthnMethodRef {
     /// Resolve this reference against the broker.
     ///
-    /// `Inline` is returned as-is. `BrokerReference` looks up the registration;
-    /// an unknown reference resolves to the class ref being the reference
-    /// itself with no authority (a defensive fallback, not an error — the
-    /// broker is the source of truth for level-based matching, which happens
-    /// separately in `check_request`).
+    /// `Inline` is returned as-is. `BrokerReference` looks up the
+    /// registration; `None` means the reference names no registered method
+    /// (a stale or mistyped reference — e.g. `BrokerReference` naming a
+    /// registration that was renamed or removed after a session was
+    /// established). A `BrokerReference` is an opaque registration ID, not
+    /// itself an AuthnContext class ref, so it must never be treated as one:
+    /// callers must fail rather than substitute the reference string as the
+    /// class ref, which would let a stale/mistyped reference silently
+    /// become a bogus AuthnContextClassRef in a signed assertion.
     pub fn resolve(
         &self,
         broker: &crate::idp::authn_broker::AuthnBroker,
-    ) -> (String, Option<String>) {
+    ) -> Option<(String, Option<String>)> {
         match self {
             AuthnMethodRef::Inline {
                 class_ref,
                 authn_authority,
-            } => (class_ref.clone(), authn_authority.clone()),
-            AuthnMethodRef::BrokerReference(reference) => match broker.get(reference) {
-                Some(method) => (method.class_ref.clone(), method.authn_authority.clone()),
-                None => (reference.clone(), None),
-            },
+            } => Some((class_ref.clone(), authn_authority.clone())),
+            AuthnMethodRef::BrokerReference(reference) => broker
+                .get(reference)
+                .map(|method| (method.class_ref.clone(), method.authn_authority.clone())),
         }
     }
 }

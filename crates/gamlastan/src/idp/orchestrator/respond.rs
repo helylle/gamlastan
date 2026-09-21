@@ -136,13 +136,18 @@ pub fn check_request(
 ///
 /// The session's method is resolved to a class ref and checked against the
 /// broker's picked set for the request. With no requested context, any session
-/// is acceptable.
+/// is acceptable. A session whose method reference no longer resolves against
+/// the broker (a stale or mistyped `BrokerReference`) is treated as not
+/// satisfying the request - failing closed into re-authentication rather than
+/// reusing a session whose actual class ref cannot be determined.
 fn session_satisfies(
     broker: &AuthnBroker,
     requested: Option<&crate::core::protocol::request::RequestedAuthnContext>,
     session: &EstablishedSession,
 ) -> bool {
-    let (class_ref, _authority) = session.authn_method.resolve(broker);
+    let Some((class_ref, _authority)) = session.authn_method.resolve(broker) else {
+        return false;
+    };
     class_ref_satisfies(broker, requested, &class_ref)
 }
 
@@ -154,11 +159,18 @@ fn class_ref_satisfies(
     requested: Option<&crate::core::protocol::request::RequestedAuthnContext>,
     class_ref: &str,
 ) -> bool {
-    let picked = broker.pick(requested);
-    if picked.is_empty() {
-        return requested.is_none();
-    }
-    picked.iter().any(|m| m.class_ref == class_ref)
+    // No RequestedAuthnContext means the SP imposed no constraint at all -
+    // any class ref is acceptable, regardless of what the broker happens to
+    // have registered (an inline/ad-hoc method never registered in the
+    // broker must not be rejected just because the broker also has an
+    // `unspecified` baseline).
+    let Some(requested) = requested else {
+        return true;
+    };
+    broker
+        .pick(Some(requested))
+        .iter()
+        .any(|m| m.class_ref == class_ref)
 }
 
 /// Assemble and sign a successful response for an authenticated subject.
@@ -267,7 +279,13 @@ pub fn create_authn_response(
     //    cannot guarantee which method the application ultimately used to
     //    authenticate the subject it hands back here, so that has to be
     //    checked again at the point the response is actually assembled.
-    let (class_ref, authority) = subject.authn_method.resolve(engine.broker);
+    let (class_ref, authority) = subject.authn_method.resolve(engine.broker).ok_or_else(|| {
+        ProfileError::Other(
+            "AuthenticatedSubject.authn_method names a BrokerReference that is not \
+             registered in this engine's AuthnBroker"
+                .to_string(),
+        )
+    })?;
     if !class_ref_satisfies(
         engine.broker,
         params.requested_authn_context().as_ref(),

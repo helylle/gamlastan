@@ -191,6 +191,44 @@ fn reusable_session_is_reused() {
 }
 
 #[test]
+fn session_with_unregistered_inline_class_ref_is_reused_when_nothing_requested() {
+    // Regression: class_ref_satisfies's doc says "with no constraint, any
+    // class ref is acceptable", but the code only took that path when the
+    // broker's own `pick(None)` (an `unspecified`/Minimum probe) happened to
+    // come back empty. Once a broker has an `unspecified` baseline
+    // registered, pick(None) is non-empty, so the old code fell through to
+    // requiring the session's class ref to be one of the *registered*
+    // methods - rejecting an otherwise-valid inline session/method that was
+    // never registered in the broker, even though the SP asked for nothing.
+    let decisions = ReleasePolicy::new();
+    let idents = IdentDb::in_memory(IDP);
+    let mut broker = AuthnBroker::new();
+    broker.add(constants::AUTHN_CONTEXT_UNSPECIFIED, "/login/any", 0, None);
+    let signer = SamlSigner::new(KeysManager::new());
+    let engine = ResponseEngine {
+        idp_entity_id: IDP,
+        decisions: &decisions,
+        release: &PassThroughRelease,
+        idents: &idents,
+        broker: &broker,
+        assertions: None,
+        signer: &signer,
+        cert_der_b64: "",
+    };
+
+    let p = params(processed(false, false, vec![], None));
+    let s = session(AuthnMethodRef::Inline {
+        class_ref: "urn:custom:inline-method-never-registered".to_string(),
+        authn_authority: None,
+    });
+    let d = check_request(&engine, &p, Some(&s));
+    assert!(
+        matches!(d, Disposition::ReuseSession { .. }),
+        "no RequestedAuthnContext means any session is acceptable: {d:?}"
+    );
+}
+
+#[test]
 fn expired_session_is_not_reused() {
     // Regression: check_request only checked ForceAuthn and method
     // satisfaction, never whether the session's own absolute expiry
@@ -439,7 +477,7 @@ fn inline_method_resolves_as_is() {
         class_ref: PPT.to_string(),
         authn_authority: Some("https://upstream.example.org".to_string()),
     };
-    let (class_ref, authority) = m.resolve(&b);
+    let (class_ref, authority) = m.resolve(&b).expect("Inline always resolves");
     assert_eq!(class_ref, PPT);
     assert_eq!(authority.as_deref(), Some("https://upstream.example.org"));
 }
@@ -449,20 +487,21 @@ fn broker_reference_resolves_from_registration() {
     let b = broker();
     // The broker assigns references "1", "2", "3" in registration order.
     let m = AuthnMethodRef::BrokerReference("2".to_string());
-    let (class_ref, authority) = m.resolve(&b);
+    let (class_ref, authority) = m.resolve(&b).expect("registered reference resolves");
     assert_eq!(class_ref, PPT);
     assert_eq!(authority, None);
 }
 
 #[test]
-fn unknown_broker_reference_falls_back_to_reference() {
+fn unknown_broker_reference_does_not_resolve() {
+    // Regression: a BrokerReference is an opaque registration ID, not an
+    // AuthnContext class ref. An unregistered reference must not silently
+    // become the class ref itself (a stale/mistyped reference could then
+    // reach a signed assertion as a bogus AuthnContextClassRef) - it must
+    // fail to resolve so callers can reject it instead.
     let b = broker();
-    // An unregistered reference resolves to itself with no authority (a
-    // defensive fallback, not an error).
     let m = AuthnMethodRef::BrokerReference("does-not-exist".to_string());
-    let (class_ref, authority) = m.resolve(&b);
-    assert_eq!(class_ref, "does-not-exist");
-    assert_eq!(authority, None);
+    assert_eq!(m.resolve(&b), None);
 }
 
 // ── fail_on_missing_requested through create_authn_response ─────────────────
@@ -761,6 +800,27 @@ fn create_authn_response_issues_when_method_satisfies_the_request() {
 
     let outcome = create_authn_response(&engine, &p, &subject).unwrap();
     assert!(matches!(outcome, ResponseOutcome::Issued(_)));
+}
+
+#[test]
+fn create_authn_response_errors_on_a_stale_broker_reference() {
+    // Regression: a BrokerReference the AuthnBroker no longer has registered
+    // (renamed, removed, or simply mistyped by the application) must not
+    // silently become the literal AuthnContextClassRef in a signed
+    // assertion - it's a configuration fault (ProfileError), not something
+    // that can be issued or denied as a protocol outcome.
+    let engine = engine();
+    let p = params(processed(false, false, vec![], None));
+    let subject = crate::idp::orchestrator::AuthenticatedSubject {
+        subject_id: "alice".to_string(),
+        attributes: vec![],
+        authn_method: AuthnMethodRef::BrokerReference("does-not-exist".to_string()),
+        authn_instant: None,
+        session_index: Some("_sess_1".to_string()),
+    };
+
+    let result = create_authn_response(&engine, &p, &subject);
+    assert!(result.is_err(), "expected a ProfileError, got {result:?}");
 }
 
 #[test]

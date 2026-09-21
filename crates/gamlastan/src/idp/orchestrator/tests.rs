@@ -312,6 +312,31 @@ fn minimum_picks_stronger_methods() {
 }
 
 #[test]
+fn authenticate_methods_are_strongest_first() {
+    // Regression: Disposition::Authenticate's own doc comment promises
+    // "strongest preference first", but AuthnBroker::pick preserves
+    // registration order (Password=1, PPT=2, X509=3 — weakest first in the
+    // test broker). A caller that just takes methods[0] must get the
+    // strongest, not the first-registered.
+    let engine = engine();
+    let p = params(processed(
+        false,
+        false,
+        vec![PASSWORD],
+        Some(AuthnContextComparison::Minimum),
+    ));
+    let Disposition::Authenticate { methods } = check_request(&engine, &p, None) else {
+        panic!("expected Authenticate");
+    };
+    let levels: Vec<u32> = methods.iter().map(|m| m.level).collect();
+    assert_eq!(methods[0].class_ref, X509, "strongest method must be first");
+    assert!(
+        levels.windows(2).all(|w| w[0] >= w[1]),
+        "methods must be sorted strongest-first, got levels {levels:?}"
+    );
+}
+
+#[test]
 fn better_excludes_requested_class() {
     let engine = engine();
     let p = params(processed(

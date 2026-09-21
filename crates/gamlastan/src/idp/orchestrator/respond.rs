@@ -116,9 +116,13 @@ pub fn check_request(
         };
     }
 
-    Disposition::Authenticate {
-        methods: picked.into_iter().cloned().collect(),
-    }
+    // `AuthnBroker::pick` preserves registration order, not strength; sort
+    // strongest-first so a caller that simply takes the first offered method
+    // gets the strongest one, matching this variant's documented contract.
+    let mut methods: Vec<_> = picked.into_iter().cloned().collect();
+    methods.sort_by_key(|m| std::cmp::Reverse(m.level));
+
+    Disposition::Authenticate { methods }
 }
 
 /// Whether an established session's method satisfies the requested context.

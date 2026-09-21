@@ -89,10 +89,37 @@ existing primitives into the profile flow, and move the semantics proven in
    (`Authenticated(AuthenticatedSubject) | Redirect(HttpResponse) |
    Deny(Denial)`) alongside it. This is additive; nothing existing breaks.
 
+   The SSO handler calls `check_request` itself, before invoking
+   `AuthnSubjectCallback`, and passes the resulting `Disposition` to the
+   callback (via a new optional `EstablishedSessionCallback` reporting local
+   session state, distinct from `SessionStore`, which tracks SP-participant
+   state for SLO). A `Deny` disposition is handled directly as a signed
+   protocol error -- the callback is never invoked for it. This is the part
+   that actually inverts the contract: the callback no longer has to
+   (mis)judge `ForceAuthn`/`IsPassive`/`RequestedAuthnContext` itself, it only
+   supplies attributes and performs the login `check_request` says is needed.
+
+   `gamlastan-actix` registers the engine's dependencies as an owned
+   `ResponseEngineParts` (`Arc<ReleasePolicy>`, `Arc<dyn AttributeRelease>`,
+   `Arc<dyn NameIdConstructor>`, `Arc<AuthnBroker>`, `Arc<SamlSigner>`, ...)
+   rather than a `ResponseEngine<'static>` directly: `ResponseEngine` borrows
+   by design (a zero-cost fit for one synchronous call), but a route
+   handler's signature is fixed and registered once, so requiring `'static`
+   on every borrowed dependency would force ordinary application-owned state
+   to be leaked. The handler builds a short-lived borrowed `ResponseEngine`
+   from `ResponseEngineParts` per request.
+
 3. Keep deployment specifics behind the seams ADR 0008 already defined --
    `IdentityStore`, `AssertionStore`, the `AuthnCallback` escape hatch, and
    `ReleasePolicy`/`EntityCategoryPolicy` configuration. No consumer identity
    model, userdb, or federation policy choice enters the crate.
+
+   `gamlastan-actix`'s trusted-SP registry (`IdpConfig`/`TrustedSp`/
+   `TrustedSpResolver`) stores the SP's full `EntityDescriptor`, not just its
+   SSO descriptor, keyed by the descriptor's own `entity_id` (no separate
+   registration-key field, so the two cannot drift apart) -- entity
+   categories and other entity-level extensions need to reach
+   `ResponseParams::sp_entity` for the attribute-release seam to see them.
 
 4. In-crate module, not a new crate, consistent with ADR 0008's reasoning: it
    depends only on `gamlastan` internals.
@@ -175,13 +202,22 @@ failure is a real protocol error rather than a silent per-integrator choice.
 - `tests/idp_release_through_engine.rs`: REFEDS entity-category release
   driven through `create_authn_response`, confirming only the released
   attributes reach the signed XML.
-- `tests/attack_corpus.rs` (`orchestrator_attacks`): an unknown
-  `AttributeConsumingServiceIndex` resolves to no requirements rather than
-  another service's; an `SPNameQualifier` XML-injection payload comes back
+- `tests/attack_corpus.rs` (`orchestrator_attacks`): an explicit, unrecognized
+  `AttributeConsumingServiceIndex` is denied rather than silently falling
+  through to "no requirements" (which would bypass that service's own
+  attribute scoping); an `SPNameQualifier` XML-injection payload comes back
   escaped and inert; a denial's `StatusMessage` never echoes SP-supplied
   text.
 - `example-idp` rewritten on the engine; all 12 of its tests pass against a
   real fixture signing key (denials now sign unconditionally, so a keyless
   test signer no longer suffices).
+- `gamlastan-actix`'s `idp_sso` policy-driven path, exercised end-to-end for
+  the first time (it had zero test coverage before this ADR): a callback is
+  skipped entirely and a signed denial returned when `check_request` says
+  `Deny`; the callback is invoked normally when authentication is needed;
+  entity-category release reaches the signed response through the real
+  handler (not just the core engine in isolation); a non-default
+  `IdentityStore` works through `ResponseEngineParts`; a `TrustedSpResolver`
+  returning a mismatched `entity_id` is rejected.
 - `cargo clippy -p gamlastan -p gamlastan-actix -p example-idp --tests -- -D
   warnings` and `cargo fmt --check` clean across all three crates.

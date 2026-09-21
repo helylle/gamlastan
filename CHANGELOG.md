@@ -118,6 +118,16 @@ where needed to correct protocol handling.
   own `AuthnBroker` has the same broadening; gamlastan diverges from it
   here). Added `AuthnBroker::allow_exact_level_matching` to opt back into the
   looser, pysaml2-compatible behavior.
+- `IdentityStore` gained a provided `compare_and_swap` method (not a breaking
+  addition - existing implementors compile unchanged), used by
+  `IdentDb::get_nameid`/`construct_nameid`'s persistent-format path to close
+  a check-then-create race: two concurrent requests for the same (user, SP)
+  could previously both observe no existing association and each mint a
+  *different* persistent identifier. The default implementation is a plain
+  `get`+`set` and is **not** itself atomic; `InMemoryIdentityStore` overrides
+  it with a single mutex-guarded compare-and-swap. A custom multi-instance
+  backend (Redis/SQL) should override it too, with a real atomic operation,
+  to actually close the race.
 
 ## [0.9.0] - 2026-09-03
 

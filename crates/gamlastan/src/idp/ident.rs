@@ -47,6 +47,29 @@ pub trait IdentityStore: Send + Sync {
     fn set(&self, key: &str, value: String);
     /// Remove a value.
     fn remove(&self, key: &str);
+
+    /// Atomically replace `key`'s value with `new`, but only if its current
+    /// value equals `expected` (`None` means "key must be absent"). Returns
+    /// whether the swap happened.
+    ///
+    /// `IdentDb` uses this to close a check-then-create race on persistent
+    /// NameID minting: two concurrent requests for the same (user, SP) that
+    /// both observe no existing association must not both succeed at
+    /// storing a *different* persistent identifier for it. The default
+    /// implementation is a plain `get` + `set` and does **not** close that
+    /// race - it exists only so adding this method isn't a breaking change
+    /// for existing `IdentityStore` implementors. A real multi-instance
+    /// backend (Redis `WATCH`/`MULTI`, a SQL `UPDATE ... WHERE current =
+    /// expected`, etc.) must override it with a genuinely atomic
+    /// compare-and-swap, or the same race this method exists to close is
+    /// still possible across instances.
+    fn compare_and_swap(&self, key: &str, expected: Option<&str>, new: &str) -> bool {
+        if self.get(key).as_deref() != expected {
+            return false;
+        }
+        self.set(key, new.to_string());
+        true
+    }
 }
 
 /// In-memory identity store.
@@ -73,6 +96,15 @@ impl IdentityStore for InMemoryIdentityStore {
 
     fn remove(&self, key: &str) {
         self.map.lock().unwrap().remove(key);
+    }
+
+    fn compare_and_swap(&self, key: &str, expected: Option<&str>, new: &str) -> bool {
+        let mut map = self.map.lock().unwrap();
+        if map.get(key).map(String::as_str) != expected {
+            return false;
+        }
+        map.insert(key.to_string(), new.to_string());
+        true
     }
 }
 
@@ -326,12 +358,12 @@ impl<S: IdentityStore> IdentDb<S> {
         name_qualifier: Option<&str>,
     ) -> NameId {
         // Persistent identifiers must stay stable per (user, SP): reuse an
-        // existing association instead of minting a new value (E78).
+        // existing association instead of minting a new value (E78), via an
+        // atomic get-or-create so two concurrent requests for the same
+        // (user, SP) can't both observe "none exists" and mint two
+        // different persistent identifiers.
         if format == constants::NAMEID_PERSISTENT {
-            if let Some(existing) = self.match_local_id(user_id, sp_name_qualifier, name_qualifier)
-            {
-                return existing;
-            }
+            return self.get_or_create_persistent(user_id, sp_name_qualifier, name_qualifier);
         }
 
         // `create_id` already applies the email-format `@domain` suffix and
@@ -347,6 +379,64 @@ impl<S: IdentityStore> IdentDb<S> {
         };
         self.store(user_id, &name_id);
         name_id
+    }
+
+    /// Atomic get-or-create for a persistent NameID (see [`IdentityStore::compare_and_swap`]).
+    ///
+    /// Loops: read the user's current forward entry, return an existing
+    /// persistent match if one is already there (possibly written by a
+    /// concurrent caller since the last read), otherwise mint a candidate
+    /// and try to CAS it in; on CAS failure someone else just wrote to this
+    /// key, so retry from the read.
+    fn get_or_create_persistent(
+        &self,
+        user_id: &str,
+        sp_name_qualifier: Option<&str>,
+        name_qualifier: Option<&str>,
+    ) -> NameId {
+        let key = Self::forward_key(user_id);
+        loop {
+            let current = self.store.get(&key);
+            let entries: Vec<String> = current
+                .as_deref()
+                .map(|joined| joined.split(' ').map(str::to_string).collect())
+                .unwrap_or_default();
+
+            if let Some(existing) = entries.iter().map(|e| decode_name_id(e)).find(|nid| {
+                nid.format.as_deref() == Some(constants::NAMEID_PERSISTENT)
+                    && nid.sp_name_qualifier.as_deref() == sp_name_qualifier
+                    && nid.name_qualifier.as_deref() == name_qualifier
+            }) {
+                return existing;
+            }
+
+            let value = self.create_id(
+                constants::NAMEID_PERSISTENT,
+                name_qualifier,
+                sp_name_qualifier,
+            );
+            let name_id = NameId {
+                value,
+                format: Some(constants::NAMEID_PERSISTENT.to_string()),
+                name_qualifier: name_qualifier.map(str::to_string),
+                sp_name_qualifier: sp_name_qualifier.map(str::to_string),
+                sp_provided_id: None,
+            };
+            let mut new_entries = entries.clone();
+            new_entries.push(code_name_id(&name_id));
+            let new_value = new_entries.join(" ");
+
+            if self
+                .store
+                .compare_and_swap(&key, current.as_deref(), &new_value)
+            {
+                self.store
+                    .set(&Self::reverse_key(&name_id.value), user_id.to_string());
+                return name_id;
+            }
+            // Someone else wrote to `key` concurrently; loop and re-check
+            // whether *their* write already satisfies this request.
+        }
     }
 
     /// Generate a transient NameID (pysaml2 `transient_nameid()`).
@@ -704,6 +794,48 @@ mod tests {
             .construct_nameid("alice", SP, Some(&policy), None)
             .expect("AllowCreate=false must not block a non-persistent format");
         assert_eq!(nid.format.as_deref(), Some(constants::NAMEID_EMAIL));
+    }
+
+    #[test]
+    fn concurrent_persistent_requests_for_the_same_user_and_sp_mint_only_one_identifier() {
+        // Regression: construct_nameid/get_nameid's persistent path used to
+        // be a plain check-then-create (match_local_id, then create_id +
+        // store), so two concurrent requests for the same (user, SP) could
+        // both observe "no existing association" and each mint a different
+        // persistent identifier - violating the "stable per (user, SP)"
+        // invariant (E78) the very first time it mattered. The
+        // IdentityStore::compare_and_swap-backed retry loop closes this.
+        use std::sync::Arc;
+        use std::thread;
+
+        let db = Arc::new(db());
+        let threads: Vec<_> = (0..16)
+            .map(|_| {
+                let db = Arc::clone(&db);
+                thread::spawn(move || db.persistent_nameid("alice", Some(SP)))
+            })
+            .collect();
+
+        let values: Vec<String> = threads
+            .into_iter()
+            .map(|t| t.join().unwrap().value)
+            .collect();
+
+        let first = &values[0];
+        assert!(
+            values.iter().all(|v| v == first),
+            "concurrent persistent requests for the same (user, SP) must all \
+             resolve to the same identifier, got: {values:?}"
+        );
+
+        // Exactly one persistent NameID was stored for (alice, SP), not one
+        // per thread that lost the race.
+        let persistent_entries: Vec<_> = db
+            .name_ids_for("alice")
+            .into_iter()
+            .filter(|nid| nid.format.as_deref() == Some(constants::NAMEID_PERSISTENT))
+            .collect();
+        assert_eq!(persistent_entries.len(), 1);
     }
 
     #[test]

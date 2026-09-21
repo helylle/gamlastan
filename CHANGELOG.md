@@ -52,6 +52,15 @@ where needed to correct protocol handling.
   framework integration with a fixed function signature (a route handler
   registered once, not parameterized per application) can accept a
   Redis/SQL-backed `IdentDb`, not just the default in-memory store.
+- Added `gamlastan-actix`'s `ResponseEngineParts`, an owned bundle of
+  `ResponseEngine`'s dependencies (`Arc<ReleasePolicy>`,
+  `Arc<dyn AttributeRelease>`, `Arc<dyn NameIdConstructor>`,
+  `Arc<AuthnBroker>`, `Arc<SamlSigner>`, etc.), registered once as
+  `web::Data<Arc<ResponseEngineParts>>`; the SSO handler builds a
+  short-lived borrowed `ResponseEngine` from it per request via
+  `ResponseEngineParts::engine`. Registering `ResponseEngine<'static>`
+  directly would force every dependency to independently satisfy `'static`,
+  which for ordinary application-owned state means leaking it.
 
 ### Changed
 

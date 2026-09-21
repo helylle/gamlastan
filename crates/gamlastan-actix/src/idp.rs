@@ -22,10 +22,15 @@ use gamlastan::profiles::logout;
 use gamlastan::profiles::sso::idp as idp_profile;
 // The canonical enveloped-signature template now lives in core gamlastan;
 // re-export it so existing call sites (and the doc links) keep resolving.
+use gamlastan::idp::assertion_store::AssertionStore;
+use gamlastan::idp::authn_broker::AuthnBroker;
+use gamlastan::idp::ident::NameIdConstructor;
 use gamlastan::idp::orchestrator::{
-    check_request, create_authn_response, create_denial_response, AuthenticatedSubject, Denial,
-    Disposition, EstablishedSession, ResponseEngine, ResponseOutcome, ResponseParams,
+    check_request, create_authn_response, create_denial_response, AttributeRelease,
+    AuthenticatedSubject, Denial, Disposition, EstablishedSession, ResponseEngine, ResponseOutcome,
+    ResponseParams,
 };
+use gamlastan::idp::policy::ReleasePolicy;
 pub use gamlastan::profiles::sso::idp::signature_template;
 use gamlastan::profiles::sso::web_browser::{ResponseOptions, ResponseTimes};
 use gamlastan::xml::serialize::SamlSerialize;
@@ -207,6 +212,95 @@ pub enum AuthnSubjectResult {
     Deny(Denial),
 }
 
+/// Owned dependencies for [`ResponseEngine`], registered once as
+/// `web::Data<Arc<ResponseEngineParts>>` and used to build a short-lived
+/// borrowed `ResponseEngine` for the duration of one request.
+///
+/// `idp::orchestrator::ResponseEngine` borrows everything by design (a
+/// zero-cost fit for a single synchronous call within one scope); requiring
+/// callers to register `web::Data<Arc<ResponseEngine<'static>>>` directly
+/// would force every dependency — policy, store, broker, signer — to
+/// independently satisfy `'static`, which for ordinary application-owned
+/// state (not already a global) means leaking it. `ResponseEngineParts`
+/// owns everything instead, so an application registers normal `Arc`s built
+/// at startup and the ready handler borrows from them per request via
+/// [`ResponseEngineParts::engine`].
+pub struct ResponseEngineParts {
+    /// This IdP's entity ID (used as the response/assertion `Issuer`).
+    pub idp_entity_id: String,
+    /// The per-SP decisions: lifetime, NameID format, signing targets, and
+    /// `fail_on_missing_requested`.
+    pub decisions: Arc<ReleasePolicy>,
+    /// The attribute-release seam. Defaults to `decisions` itself (an
+    /// originating IdP); override with
+    /// [`with_release`](Self::with_release) for a proxy shape.
+    pub release: Arc<dyn AttributeRelease>,
+    /// The identity database (NameID construction), type-erased over its
+    /// `IdentityStore` backend.
+    pub idents: Arc<dyn NameIdConstructor>,
+    /// The authn broker (RequestedAuthnContext matching).
+    pub broker: Arc<AuthnBroker>,
+    /// The assertion store, if back-channel queries must be answerable.
+    pub assertions: Option<Arc<dyn AssertionStore>>,
+    /// The signer for the response/assertion.
+    pub signer: Arc<SamlSigner>,
+    /// The base64 DER signing certificate for `<ds:KeyInfo>`.
+    pub cert_der_b64: String,
+}
+
+impl ResponseEngineParts {
+    /// Build for an originating IdP, whose own `decisions` also serves as
+    /// the release seam (the common case; see [`AttributeRelease`]).
+    pub fn new(
+        idp_entity_id: impl Into<String>,
+        decisions: Arc<ReleasePolicy>,
+        idents: Arc<dyn NameIdConstructor>,
+        broker: Arc<AuthnBroker>,
+        signer: Arc<SamlSigner>,
+        cert_der_b64: impl Into<String>,
+    ) -> Self {
+        let release: Arc<dyn AttributeRelease> = decisions.clone();
+        Self {
+            idp_entity_id: idp_entity_id.into(),
+            decisions,
+            release,
+            idents,
+            broker,
+            assertions: None,
+            signer,
+            cert_der_b64: cert_der_b64.into(),
+        }
+    }
+
+    /// Override the release seam — e.g. a `PassThroughRelease` or
+    /// `ChainedRelease` for a proxy whose attributes are already filtered
+    /// upstream.
+    pub fn with_release(mut self, release: Arc<dyn AttributeRelease>) -> Self {
+        self.release = release;
+        self
+    }
+
+    /// Register an assertion store for back-channel queries.
+    pub fn with_assertions(mut self, assertions: Arc<dyn AssertionStore>) -> Self {
+        self.assertions = Some(assertions);
+        self
+    }
+
+    /// Build a borrowed `ResponseEngine` for the duration of one request.
+    pub fn engine(&self) -> ResponseEngine<'_> {
+        ResponseEngine {
+            idp_entity_id: &self.idp_entity_id,
+            decisions: &self.decisions,
+            release: self.release.as_ref(),
+            idents: self.idents.as_ref(),
+            broker: &self.broker,
+            assertions: self.assertions.as_deref(),
+            signer: &self.signer,
+            cert_der_b64: &self.cert_der_b64,
+        }
+    }
+}
+
 /// Register all IdP routes on the given service configuration.
 ///
 /// Routes:
@@ -318,7 +412,7 @@ async fn idp_sso(
     authn_callback: Option<web::Data<AuthnCallback>>,
     authn_subject_callback: Option<web::Data<AuthnSubjectCallback>>,
     established_session_callback: Option<web::Data<EstablishedSessionCallback>>,
-    response_engine: Option<web::Data<Arc<ResponseEngine<'static>>>>,
+    response_engine: Option<web::Data<Arc<ResponseEngineParts>>>,
     req: HttpRequest,
 ) -> Result<HttpResponse, SamlActixError> {
     // Save relay state before msg is consumed
@@ -397,13 +491,14 @@ async fn idp_sso(
     // and a ResponseEngine are registered, the engine derives the NameID,
     // released attributes, and authn context, then assembles and signs the
     // response. This is preferred over the lower-level AuthnCallback.
-    if let (Some(callback), Some(engine)) = (&authn_subject_callback, &response_engine) {
+    if let (Some(callback), Some(parts)) = (&authn_subject_callback, &response_engine) {
         let params = ResponseParams {
             processed: processed.clone(),
             sp_sso: sp_sso.clone(),
             sp_entity: Some(sp_entity.clone()),
         };
-        let engine = engine.get_ref();
+        let engine = parts.engine();
+        let engine = &engine;
 
         // check_request decides ForceAuthn/IsPassive/RequestedAuthnContext
         // *before* the callback runs. A Deny is handled directly here — the
@@ -1798,26 +1893,19 @@ mod tests {
     /// `check_request` always denies with `NoPassive`/`NoAuthnContext` for a
     /// passive request with no session - enough to prove the handler
     /// actually consults `check_request` rather than trusting the callback.
-    fn leaked_engine() -> ResponseEngine<'static> {
-        let idents: &'static gamlastan::idp::ident::IdentDb = Box::leak(Box::new(
-            gamlastan::idp::ident::IdentDb::in_memory("https://idp.example.com"),
-        ));
-        let broker: &'static gamlastan::idp::authn_broker::AuthnBroker =
-            Box::leak(Box::new(gamlastan::idp::authn_broker::AuthnBroker::new()));
-        let decisions: &'static gamlastan::idp::policy::ReleasePolicy =
-            Box::leak(Box::new(gamlastan::idp::policy::ReleasePolicy::new()));
-        let signer: &'static SamlSigner = Box::leak(Box::new(test_signer()));
-        let cert: &'static str = Box::leak(cert_b64(SIGN_CERT_PEM).into_boxed_str());
-        ResponseEngine {
-            idp_entity_id: "https://idp.example.com",
-            decisions,
-            release: decisions,
-            idents,
-            broker,
-            assertions: None,
-            signer,
-            cert_der_b64: cert,
-        }
+    /// No `Box::leak` needed: `ResponseEngineParts` owns everything via
+    /// ordinary `Arc`s, exactly as an application would build it at startup.
+    fn response_engine_parts() -> ResponseEngineParts {
+        ResponseEngineParts::new(
+            "https://idp.example.com",
+            Arc::new(ReleasePolicy::new()),
+            Arc::new(gamlastan::idp::ident::IdentDb::in_memory(
+                "https://idp.example.com",
+            )),
+            Arc::new(AuthnBroker::new()),
+            Arc::new(test_signer()),
+            cert_b64(SIGN_CERT_PEM),
+        )
     }
 
     /// A distinct `IdentityStore` impl (not `InMemoryIdentityStore`) - stands
@@ -1844,28 +1932,22 @@ mod tests {
         // whose signature is fixed, unlike a generic function an application
         // could monomorphize itself - is not stuck with the default
         // InMemoryIdentityStore. A Redis/SQL-backed store must work here too.
+        // No Box::leak needed: ResponseEngineParts owns everything via Arc.
         const SP: &str = "https://sp.example.com";
         const ACS: &str = "https://sp.example.com/acs";
 
-        let idents: &'static gamlastan::idp::ident::IdentDb<CustomStore> = Box::leak(Box::new(
-            gamlastan::idp::ident::IdentDb::new(CustomStore::default(), "https://idp.example.com"),
-        ));
-        let broker: &'static gamlastan::idp::authn_broker::AuthnBroker =
-            Box::leak(Box::new(gamlastan::idp::authn_broker::AuthnBroker::new()));
-        let decisions: &'static gamlastan::idp::policy::ReleasePolicy =
-            Box::leak(Box::new(gamlastan::idp::policy::ReleasePolicy::new()));
-        let signer: &'static SamlSigner = Box::leak(Box::new(test_signer()));
-        let cert: &'static str = Box::leak(cert_b64(SIGN_CERT_PEM).into_boxed_str());
-        let engine = ResponseEngine {
-            idp_entity_id: "https://idp.example.com",
+        let decisions = Arc::new(ReleasePolicy::new());
+        let parts = ResponseEngineParts::new(
+            "https://idp.example.com",
             decisions,
-            release: decisions,
-            idents, // &IdentDb<CustomStore> coerces to &dyn NameIdConstructor
-            broker,
-            assertions: None,
-            signer,
-            cert_der_b64: cert,
-        };
+            Arc::new(gamlastan::idp::ident::IdentDb::new(
+                CustomStore::default(),
+                "https://idp.example.com",
+            )),
+            Arc::new(AuthnBroker::new()),
+            Arc::new(test_signer()),
+            cert_b64(SIGN_CERT_PEM),
+        );
 
         let sp_sso = sp_sso_with_acs(ACS);
         let entity =
@@ -1910,7 +1992,7 @@ mod tests {
             None,
             Some(web::Data::new(authn_subject_callback)),
             None,
-            Some(web::Data::new(Arc::new(engine))),
+            Some(web::Data::new(Arc::new(parts))),
             actix_web::test::TestRequest::default().to_http_request(),
         )
         .await
@@ -1976,7 +2058,7 @@ mod tests {
             None,
             Some(web::Data::new(authn_subject_callback)),
             None, // no EstablishedSessionCallback registered -> no session
-            Some(web::Data::new(Arc::new(leaked_engine()))),
+            Some(web::Data::new(Arc::new(response_engine_parts()))),
             actix_web::test::TestRequest::default().to_http_request(),
         )
         .await
@@ -2052,7 +2134,7 @@ mod tests {
             None,
             Some(web::Data::new(authn_subject_callback)),
             None,
-            Some(web::Data::new(Arc::new(leaked_engine()))),
+            Some(web::Data::new(Arc::new(response_engine_parts()))),
             actix_web::test::TestRequest::default().to_http_request(),
         )
         .await
@@ -2088,29 +2170,20 @@ mod tests {
                 .to_string(),
         ));
 
-        let idents: &'static gamlastan::idp::ident::IdentDb = Box::leak(Box::new(
-            gamlastan::idp::ident::IdentDb::in_memory("https://idp.example.com"),
+        let decisions = Arc::new(ReleasePolicy::with_default(
+            gamlastan::idp::policy::PolicyEntry::new()
+                .with_entity_categories(vec![&gamlastan::idp::entity_category::REFEDS]),
         ));
-        let broker: &'static gamlastan::idp::authn_broker::AuthnBroker =
-            Box::leak(Box::new(gamlastan::idp::authn_broker::AuthnBroker::new()));
-        let decisions: &'static gamlastan::idp::policy::ReleasePolicy = Box::leak(Box::new(
-            gamlastan::idp::policy::ReleasePolicy::with_default(
-                gamlastan::idp::policy::PolicyEntry::new()
-                    .with_entity_categories(vec![&gamlastan::idp::entity_category::REFEDS]),
-            ),
-        ));
-        let signer: &'static SamlSigner = Box::leak(Box::new(test_signer()));
-        let cert: &'static str = Box::leak(cert_b64(SIGN_CERT_PEM).into_boxed_str());
-        let engine = ResponseEngine {
-            idp_entity_id: "https://idp.example.com",
+        let parts = ResponseEngineParts::new(
+            "https://idp.example.com",
             decisions,
-            release: decisions,
-            idents,
-            broker,
-            assertions: None,
-            signer,
-            cert_der_b64: cert,
-        };
+            Arc::new(gamlastan::idp::ident::IdentDb::in_memory(
+                "https://idp.example.com",
+            )),
+            Arc::new(AuthnBroker::new()),
+            Arc::new(test_signer()),
+            cert_b64(SIGN_CERT_PEM),
+        );
 
         let config = web::Data::new(
             IdpConfig::new("https://idp.example.com", "https://idp.example.com/sso")
@@ -2177,7 +2250,7 @@ mod tests {
             None,
             Some(web::Data::new(authn_subject_callback)),
             None,
-            Some(web::Data::new(Arc::new(engine))),
+            Some(web::Data::new(Arc::new(parts))),
             actix_web::test::TestRequest::default().to_http_request(),
         )
         .await

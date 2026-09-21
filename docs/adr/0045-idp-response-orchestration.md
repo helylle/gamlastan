@@ -128,10 +128,11 @@ failure is a real protocol error rather than a silent per-integrator choice.
   low-level path.
 - Breaking (pre-release): `ResponseOptions` gained
   `authenticating_authorities: Vec<String>` (with a new `impl Default`), and
-  `ProcessedAuthnRequest` gained `requested_sp_name_qualifier`. Every
-  in-crate struct literal was fixed with `..Default::default()`. External
-  consumers with hand-built `ResponseOptions` literals (tunnelbana: 7 sites
-  across `saml2_frontend.rs`, `saml2_backend.rs`, `stepup.rs`, and four test
+  `ProcessedAuthnRequest` gained `requested_sp_name_qualifier` and
+  `has_name_id_policy`. Every in-crate struct literal was fixed with
+  `..Default::default()`. External consumers with hand-built
+  `ResponseOptions` literals (tunnelbana: 7 sites across
+  `saml2_frontend.rs`, `saml2_backend.rs`, `stepup.rs`, and four test
   files) need a one-line compat patch, prepared separately and offered to
   SUNET alongside this ADR rather than discovered via a failed build.
 

@@ -42,8 +42,9 @@ where needed to correct protocol handling.
   External consumers with hand-built literals (e.g. tunnelbana) need a
   one-line-per-site compat patch.
 - **Breaking:** `ProcessedAuthnRequest` gained
-  `requested_sp_name_qualifier`. The struct is only produced by
-  `process_authn_request`, so hand-construction sites need one added line.
+  `requested_sp_name_qualifier` and `has_name_id_policy`. The struct is only
+  produced by `process_authn_request`, so hand-construction sites need both
+  fields added.
 
 ### Fixed
 

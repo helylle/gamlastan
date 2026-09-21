@@ -23,8 +23,8 @@ use gamlastan::profiles::sso::idp as idp_profile;
 // The canonical enveloped-signature template now lives in core gamlastan;
 // re-export it so existing call sites (and the doc links) keep resolving.
 use gamlastan::idp::orchestrator::{
-    create_authn_response, create_denial_response, AuthenticatedSubject, Denial, ResponseEngine,
-    ResponseOutcome, ResponseParams,
+    check_request, create_authn_response, create_denial_response, AuthenticatedSubject, Denial,
+    Disposition, EstablishedSession, ResponseEngine, ResponseOutcome, ResponseParams,
 };
 pub use gamlastan::profiles::sso::idp::signature_template;
 use gamlastan::profiles::sso::web_browser::{ResponseOptions, ResponseTimes};
@@ -151,18 +151,42 @@ pub struct AuthnCallbackResult {
 /// response. This is the crate's policy-driven path; [`AuthnCallback`] remains
 /// the lower-level escape hatch for integrators who want to bypass crate policy.
 ///
+/// The handler calls [`check_request`](gamlastan::idp::orchestrator::check_request)
+/// (via the registered [`EstablishedSessionCallback`], if any) *before*
+/// invoking this callback, and passes the resulting [`Disposition`]: a `Deny`
+/// is handled directly (a signed protocol error — this callback is never
+/// invoked for it), so the callback only ever sees `ReuseSession` or
+/// `Authenticate`. This means the callback no longer has to (mis)judge
+/// ForceAuthn/IsPassive/RequestedAuthnContext itself — it only supplies real
+/// attributes and performs the actual login when one is needed.
+///
 /// Register both this callback and a `ResponseEngine` as application data to
 /// use it; the SSO handler prefers it over [`AuthnCallback`] when both are
 /// present.
 pub type AuthnSubjectCallback = Box<
     dyn Fn(
             &idp_profile::ProcessedAuthnRequest,
+            &Disposition,
             &HttpRequest,
         ) -> Result<AuthnSubjectResult, SamlActixError>
         + Send
         + Sync
         + 'static,
 >;
+
+/// Reports whether the current request already carries an established IdP
+/// session (e.g. by reading a session cookie the application recognizes),
+/// for [`check_request`](gamlastan::idp::orchestrator::check_request) to
+/// weigh against `ForceAuthn`/`IsPassive`/`RequestedAuthnContext`.
+///
+/// Distinct from [`SessionStore`](gamlastan::profiles::session::SessionStore):
+/// that tracks SP-participant state for Single Logout fan-out, not local
+/// login state, which only the application can read (its own cookie/session
+/// mechanism). Returns cheap identity facts only — no attributes, which the
+/// [`AuthnSubjectCallback`] still supplies when it handles the resulting
+/// `Disposition`.
+pub type EstablishedSessionCallback =
+    Box<dyn Fn(&HttpRequest) -> Option<EstablishedSession> + Send + Sync + 'static>;
 
 /// The outcome of the [`AuthnSubjectCallback`].
 ///
@@ -286,12 +310,14 @@ pub fn sign_response_xml(
 /// 5. Signs the Assertion and Response (if signing context is available)
 /// 6. Sends the Response back to the SP's ACS URL via POST binding
 /// 7. Forwards RelayState from the original request
+#[allow(clippy::too_many_arguments)]
 async fn idp_sso(
     msg: SamlMessage,
     config: web::Data<IdpConfig>,
     signing_ctx: Option<web::Data<Arc<IdpSigningContext>>>,
     authn_callback: Option<web::Data<AuthnCallback>>,
     authn_subject_callback: Option<web::Data<AuthnSubjectCallback>>,
+    established_session_callback: Option<web::Data<EstablishedSessionCallback>>,
     response_engine: Option<web::Data<Arc<ResponseEngine<'static>>>>,
     req: HttpRequest,
 ) -> Result<HttpResponse, SamlActixError> {
@@ -316,11 +342,11 @@ async fn idp_sso(
     // registered or fetched via the (MDQ-backed) resolver — and validate the ACS
     // URL against it; fail closed when no metadata is available.
     let issuer = authn_request.base.issuer.as_ref().map(|i| i.value.as_str());
-    let sp_sso = match issuer {
-        Some(id) => resolve_trusted_sp(&config, id).await,
+    let sp_entity = match issuer {
+        Some(id) => resolve_trusted_sp_entity(&config, id).await,
         None => None,
     };
-    let sp_sso = sp_sso.ok_or_else(|| {
+    let sp_entity = sp_entity.ok_or_else(|| {
         // Untrusted/unknown requester is an authorization failure on
         // attacker-controllable request input, not a server misconfiguration:
         // surface it as 403 rather than 500 so hostile traffic does not read as
@@ -334,6 +360,18 @@ async fn idp_sso(
             ),
         ))
     })?;
+    let sp_sso = sp_entity
+        .sp_sso_descriptors()
+        .first()
+        .cloned()
+        .ok_or_else(|| {
+            SamlActixError::Profile(gamlastan::profiles::ProfileError::AssertionValidation(
+                format!(
+                    "trusted entity {:?} has no SPSSODescriptor",
+                    sp_entity.entity_id
+                ),
+            ))
+        })?;
 
     // Process the AuthnRequest (validates and extracts parameters). With trusted
     // SP metadata, a request-supplied ACS URL not present in metadata is rejected.
@@ -363,10 +401,23 @@ async fn idp_sso(
         let params = ResponseParams {
             processed: processed.clone(),
             sp_sso: sp_sso.clone(),
-            sp_entity: None,
+            sp_entity: Some(sp_entity.clone()),
         };
         let engine = engine.get_ref();
-        let result = callback(&processed, &req)?;
+
+        // check_request decides ForceAuthn/IsPassive/RequestedAuthnContext
+        // *before* the callback runs. A Deny is handled directly here — the
+        // callback is never invoked for it, so it cannot redirect to a login
+        // form for IsPassive or reuse a session ForceAuthn defeated.
+        let established = established_session_callback.as_ref().and_then(|f| f(&req));
+        let disposition = check_request(engine, &params, established.as_ref());
+        if let Disposition::Deny { denial } = &disposition {
+            let issued =
+                create_denial_response(engine, &params, denial).map_err(SamlActixError::Profile)?;
+            return post_issued_response(&issued, &processed.acs_url, relay_state_str.as_deref());
+        }
+
+        let result = callback(&processed, &disposition, &req)?;
         return match result {
             AuthnSubjectResult::Authenticated(subject) => {
                 let outcome = create_authn_response(engine, &params, &subject)
@@ -880,8 +931,23 @@ async fn resolve_trusted_sp(
     config: &IdpConfig,
     entity_id: &str,
 ) -> Option<gamlastan::metadata::types::sp::SpSsoDescriptor> {
-    if let Some(sp) = config.trusted_sp(entity_id) {
-        return Some(sp.clone());
+    resolve_trusted_sp_entity(config, entity_id)
+        .await
+        .and_then(|entity| entity.sp_sso_descriptors().first().cloned())
+}
+
+/// Resolve the trusted SP's full entity descriptor by `entityID` — the static
+/// registry first, then the dynamic [`TrustedSpResolver`] if configured.
+///
+/// Unlike [`resolve_trusted_sp`], this carries entity-level extensions
+/// (entity categories, `subject-id:req`, etc.) needed for
+/// `idp::orchestrator`'s attribute-release policy.
+async fn resolve_trusted_sp_entity(
+    config: &IdpConfig,
+    entity_id: &str,
+) -> Option<gamlastan::metadata::types::entity_descriptor::EntityDescriptor> {
+    if let Some(entity) = config.trusted_sp_entity(entity_id) {
+        return Some(entity.clone());
     }
     if let Some(resolver) = &config.sp_resolver {
         return resolver.resolve_sp(entity_id).await;
@@ -1422,7 +1488,10 @@ mod tests {
     fn test_slo_rejected_for_untrusted_issuer() {
         // Finding #13 regression: an issuer that is not a configured trusted SP
         // resolves to no metadata (`None`) and is rejected.
-        let sp = empty_sp_sso();
+        let sp = gamlastan::metadata::types::entity_descriptor::EntityDescriptor::for_sp(
+            "https://good-sp.example.com",
+            empty_sp_sso(),
+        );
         let config = IdpConfig::new("https://idp.example.com", "https://idp.example.com/sso")
             .with_trusted_sp("https://good-sp.example.com", sp);
         let req = logout_request(Some("https://evil-sp.example.com"));
@@ -1502,9 +1571,14 @@ mod tests {
         struct StubResolver;
         impl TrustedSpResolver for StubResolver {
             fn resolve_sp<'a>(&'a self, entity_id: &'a str) -> crate::config::ResolveSpFuture<'a> {
-                Box::pin(
-                    async move { (entity_id == "https://mdq-sp.example.com").then(empty_sp_sso) },
-                )
+                Box::pin(async move {
+                    (entity_id == "https://mdq-sp.example.com").then(|| {
+                        gamlastan::metadata::types::entity_descriptor::EntityDescriptor::for_sp(
+                            entity_id,
+                            empty_sp_sso(),
+                        )
+                    })
+                })
             }
         }
 
@@ -1531,7 +1605,10 @@ mod tests {
     fn test_trusted_sp_lookup() {
         // Finding #4 support: the SSO handler binds the request issuer to trusted
         // SP metadata; lookups must only succeed for registered entityIDs.
-        let sp = empty_sp_sso();
+        let sp = gamlastan::metadata::types::entity_descriptor::EntityDescriptor::for_sp(
+            "https://sp.example.com",
+            empty_sp_sso(),
+        );
         let config = IdpConfig::new("https://idp.example.com", "https://idp.example.com/sso")
             .with_trusted_sp("https://sp.example.com", sp);
         assert!(config.trusted_sp("https://sp.example.com").is_some());
@@ -1632,6 +1709,362 @@ mod tests {
             AuthnSubjectResult::Deny(Denial::NoPassive),
             AuthnSubjectResult::Deny(_)
         ));
+    }
+
+    /// An `SpSsoDescriptor` with one default (index 0) ACS endpoint.
+    fn sp_sso_with_acs(acs_url: &str) -> SpSsoDescriptor {
+        let mut sp = empty_sp_sso();
+        sp.assertion_consumer_services = vec![
+            gamlastan::metadata::types::endpoint::IndexedEndpoint::new_default(
+                gamlastan::metadata::types::endpoint::Endpoint::new(
+                    "urn:oasis:names:tc:SAML:2.0:bindings:HTTP-POST",
+                    acs_url,
+                ),
+                0,
+            ),
+        ];
+        sp
+    }
+
+    /// An unsigned, `IsPassive` `AuthnRequest` from `sp_entity_id`.
+    fn passive_authn_request(
+        sp_entity_id: &str,
+    ) -> gamlastan::core::protocol::request::AuthnRequest {
+        gamlastan::core::protocol::request::AuthnRequest {
+            base: gamlastan::core::protocol::request::RequestBase {
+                id: "_req_1".to_string(),
+                version: SamlVersion::V2_0,
+                issue_instant: Utc::now(),
+                destination: None,
+                consent: None,
+                issuer: Some(Issuer::entity(sp_entity_id)),
+                has_signature: false,
+            },
+            subject: None,
+            name_id_policy: None,
+            conditions: None,
+            requested_authn_context: None,
+            scoping: None,
+            force_authn: None,
+            is_passive: Some(true),
+            assertion_consumer_service_index: Some(0),
+            assertion_consumer_service_url: None,
+            protocol_binding: None,
+            attribute_consuming_service_index: None,
+            provider_name: None,
+            extensions: None,
+        }
+    }
+
+    /// A `ResponseEngine<'static>` with no registered authn methods, so
+    /// `check_request` always denies with `NoPassive`/`NoAuthnContext` for a
+    /// passive request with no session - enough to prove the handler
+    /// actually consults `check_request` rather than trusting the callback.
+    fn leaked_engine() -> ResponseEngine<'static> {
+        let idents: &'static gamlastan::idp::ident::IdentDb = Box::leak(Box::new(
+            gamlastan::idp::ident::IdentDb::in_memory("https://idp.example.com"),
+        ));
+        let broker: &'static gamlastan::idp::authn_broker::AuthnBroker =
+            Box::leak(Box::new(gamlastan::idp::authn_broker::AuthnBroker::new()));
+        let decisions: &'static gamlastan::idp::policy::ReleasePolicy =
+            Box::leak(Box::new(gamlastan::idp::policy::ReleasePolicy::new()));
+        let signer: &'static SamlSigner = Box::leak(Box::new(test_signer()));
+        let cert: &'static str = Box::leak(cert_b64(SIGN_CERT_PEM).into_boxed_str());
+        ResponseEngine {
+            idp_entity_id: "https://idp.example.com",
+            decisions,
+            release: decisions,
+            idents,
+            broker,
+            assertions: None,
+            signer,
+            cert_der_b64: cert,
+        }
+    }
+
+    #[actix_web::test]
+    async fn idp_sso_denies_passive_request_without_calling_the_callback() {
+        // Regression: the policy-driven Actix path must consult check_request
+        // (via the ForceAuthn/IsPassive/RequestedAuthnContext matrix) before
+        // invoking the AuthnSubjectCallback. A callback that (incorrectly)
+        // authenticates unconditionally must never be given the chance to
+        // for an IsPassive request with no established session - the
+        // handler must deny with a signed NoPassive first.
+        const SP: &str = "https://sp.example.com";
+        const ACS: &str = "https://sp.example.com/acs";
+
+        let sp_sso = sp_sso_with_acs(ACS);
+        let entity =
+            gamlastan::metadata::types::entity_descriptor::EntityDescriptor::for_sp(SP, sp_sso);
+        let config = web::Data::new(
+            IdpConfig::new("https://idp.example.com", "https://idp.example.com/sso")
+                .with_trusted_sp(SP, entity),
+        );
+        let signing_ctx = web::Data::new(Arc::new(IdpSigningContext::new(
+            test_signer(),
+            cert_b64(SIGN_CERT_PEM),
+        )));
+
+        let callback_invoked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let callback_invoked_clone = callback_invoked.clone();
+        let authn_subject_callback: AuthnSubjectCallback =
+            Box::new(move |_processed, _disposition, _req| {
+                callback_invoked_clone.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(AuthnSubjectResult::Authenticated(AuthenticatedSubject {
+                    subject_id: "alice".to_string(),
+                    attributes: vec![],
+                    authn_method: gamlastan::idp::orchestrator::AuthnMethodRef::Inline {
+                        class_ref: "urn:oasis:names:tc:SAML:2.0:ac:classes:Password".to_string(),
+                        authn_authority: None,
+                    },
+                    authn_instant: None,
+                    session_index: Some("_sess1".to_string()),
+                }))
+            });
+
+        let request = passive_authn_request(SP);
+        let xml = request.to_xml_string().unwrap();
+        let msg = SamlMessage {
+            saml_xml: xml.into_bytes(),
+            relay_state: None,
+            is_request: true,
+            binding: crate::extractors::SamlBinding::HttpPost,
+            redirect_signature: None,
+        };
+
+        let response = idp_sso(
+            msg,
+            config,
+            Some(signing_ctx),
+            None,
+            Some(web::Data::new(authn_subject_callback)),
+            None, // no EstablishedSessionCallback registered -> no session
+            Some(web::Data::new(Arc::new(leaked_engine()))),
+            actix_web::test::TestRequest::default().to_http_request(),
+        )
+        .await
+        .expect("handler must not error");
+
+        assert!(
+            !callback_invoked.load(std::sync::atomic::Ordering::SeqCst),
+            "AuthnSubjectCallback must not be invoked when check_request denies the request"
+        );
+        assert_eq!(response.status(), actix_web::http::StatusCode::OK);
+        let body = actix_web::body::to_bytes(response.into_body())
+            .await
+            .unwrap();
+        let body = std::str::from_utf8(&body).unwrap();
+        // A signed protocol-error Response was POST-encoded, not the
+        // Authenticated subject the (never-invoked) callback would have
+        // produced.
+        assert!(body.contains("SAMLResponse"));
+    }
+
+    #[actix_web::test]
+    async fn idp_sso_invokes_callback_when_authentication_is_needed() {
+        // Positive control: a non-passive request with no session reaches
+        // Disposition::Authenticate, so the callback *is* invoked and its
+        // result is used - the check_request gate must not be overly strict.
+        const SP: &str = "https://sp.example.com";
+        const ACS: &str = "https://sp.example.com/acs";
+
+        let sp_sso = sp_sso_with_acs(ACS);
+        let entity =
+            gamlastan::metadata::types::entity_descriptor::EntityDescriptor::for_sp(SP, sp_sso);
+        let config = web::Data::new(
+            IdpConfig::new("https://idp.example.com", "https://idp.example.com/sso")
+                .with_trusted_sp(SP, entity),
+        );
+        let signing_ctx = web::Data::new(Arc::new(IdpSigningContext::new(
+            test_signer(),
+            cert_b64(SIGN_CERT_PEM),
+        )));
+
+        let callback_invoked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let callback_invoked_clone = callback_invoked.clone();
+        let authn_subject_callback: AuthnSubjectCallback =
+            Box::new(move |_processed, _disposition, _req| {
+                callback_invoked_clone.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(AuthnSubjectResult::Authenticated(AuthenticatedSubject {
+                    subject_id: "alice".to_string(),
+                    attributes: vec![],
+                    authn_method: gamlastan::idp::orchestrator::AuthnMethodRef::Inline {
+                        class_ref: "urn:oasis:names:tc:SAML:2.0:ac:classes:Password".to_string(),
+                        authn_authority: None,
+                    },
+                    authn_instant: None,
+                    session_index: Some("_sess1".to_string()),
+                }))
+            });
+
+        let mut request = passive_authn_request(SP);
+        request.is_passive = None; // not passive: authentication is allowed
+        let xml = request.to_xml_string().unwrap();
+        let msg = SamlMessage {
+            saml_xml: xml.into_bytes(),
+            relay_state: None,
+            is_request: true,
+            binding: crate::extractors::SamlBinding::HttpPost,
+            redirect_signature: None,
+        };
+
+        let response = idp_sso(
+            msg,
+            config,
+            Some(signing_ctx),
+            None,
+            Some(web::Data::new(authn_subject_callback)),
+            None,
+            Some(web::Data::new(Arc::new(leaked_engine()))),
+            actix_web::test::TestRequest::default().to_http_request(),
+        )
+        .await
+        .expect("handler must not error");
+
+        assert!(
+            callback_invoked.load(std::sync::atomic::Ordering::SeqCst),
+            "AuthnSubjectCallback must be invoked when authentication is needed"
+        );
+        assert_eq!(response.status(), actix_web::http::StatusCode::OK);
+    }
+
+    #[actix_web::test]
+    async fn idp_sso_applies_entity_category_release_from_trusted_metadata() {
+        // Regression: sp_entity must not be hardcoded to None on the
+        // policy-driven path, or ReleasePolicy's entity-category release
+        // (the feature this whole engine exists to provide) never engages.
+        const SP: &str = "https://sp.example.com";
+        const ACS: &str = "https://sp.example.com/acs";
+        const MAIL_OID: &str = "urn:oid:0.9.2342.19200300.100.1.3";
+
+        let sp_sso = sp_sso_with_acs(ACS);
+        let mut entity =
+            gamlastan::metadata::types::entity_descriptor::EntityDescriptor::for_sp(SP, sp_sso);
+        entity.extensions = Some(gamlastan::metadata::types::extensions::Extensions::new(
+            r#"<mdattr:EntityAttributes xmlns:mdattr="urn:oasis:names:tc:SAML:metadata:attribute"
+                xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion">
+              <saml:Attribute NameFormat="urn:oasis:names:tc:SAML:2.0:attrname-format:uri"
+                  Name="http://macedir.org/entity-category">
+                <saml:AttributeValue>http://refeds.org/category/research-and-scholarship</saml:AttributeValue>
+              </saml:Attribute>
+            </mdattr:EntityAttributes>"#
+                .to_string(),
+        ));
+
+        let idents: &'static gamlastan::idp::ident::IdentDb = Box::leak(Box::new(
+            gamlastan::idp::ident::IdentDb::in_memory("https://idp.example.com"),
+        ));
+        let broker: &'static gamlastan::idp::authn_broker::AuthnBroker =
+            Box::leak(Box::new(gamlastan::idp::authn_broker::AuthnBroker::new()));
+        let decisions: &'static gamlastan::idp::policy::ReleasePolicy = Box::leak(Box::new(
+            gamlastan::idp::policy::ReleasePolicy::with_default(
+                gamlastan::idp::policy::PolicyEntry::new()
+                    .with_entity_categories(vec![&gamlastan::idp::entity_category::REFEDS]),
+            ),
+        ));
+        let signer: &'static SamlSigner = Box::leak(Box::new(test_signer()));
+        let cert: &'static str = Box::leak(cert_b64(SIGN_CERT_PEM).into_boxed_str());
+        let engine = ResponseEngine {
+            idp_entity_id: "https://idp.example.com",
+            decisions,
+            release: decisions,
+            idents,
+            broker,
+            assertions: None,
+            signer,
+            cert_der_b64: cert,
+        };
+
+        let config = web::Data::new(
+            IdpConfig::new("https://idp.example.com", "https://idp.example.com/sso")
+                .with_trusted_sp(SP, entity),
+        );
+        let signing_ctx = web::Data::new(Arc::new(IdpSigningContext::new(
+            test_signer(),
+            cert_b64(SIGN_CERT_PEM),
+        )));
+        let authn_subject_callback: AuthnSubjectCallback =
+            Box::new(move |_processed, _disposition, _req| {
+                Ok(AuthnSubjectResult::Authenticated(AuthenticatedSubject {
+                    subject_id: "alice".to_string(),
+                    attributes: vec![
+                        gamlastan::core::assertion::attribute::Attribute {
+                            name: MAIL_OID.to_string(),
+                            name_format: Some(
+                                gamlastan::core::constants::ATTRNAME_FORMAT_URI.to_string(),
+                            ),
+                            friendly_name: Some("mail".to_string()),
+                            values: vec![
+                                gamlastan::core::assertion::attribute::AttributeValue::String(
+                                    "alice@example.org".to_string(),
+                                ),
+                            ],
+                        },
+                        gamlastan::core::assertion::attribute::Attribute {
+                            name: "urn:oid:2.5.4.3".to_string(),
+                            name_format: Some(
+                                gamlastan::core::constants::ATTRNAME_FORMAT_URI.to_string(),
+                            ),
+                            friendly_name: Some("cn".to_string()),
+                            values: vec![
+                                gamlastan::core::assertion::attribute::AttributeValue::String(
+                                    "Alice Example".to_string(),
+                                ),
+                            ],
+                        },
+                    ],
+                    authn_method: gamlastan::idp::orchestrator::AuthnMethodRef::Inline {
+                        class_ref: "urn:oasis:names:tc:SAML:2.0:ac:classes:Password".to_string(),
+                        authn_authority: None,
+                    },
+                    authn_instant: None,
+                    session_index: Some("_sess1".to_string()),
+                }))
+            });
+
+        let mut request = passive_authn_request(SP);
+        request.is_passive = None;
+        let xml = request.to_xml_string().unwrap();
+        let msg = SamlMessage {
+            saml_xml: xml.into_bytes(),
+            relay_state: None,
+            is_request: true,
+            binding: crate::extractors::SamlBinding::HttpPost,
+            redirect_signature: None,
+        };
+
+        let response = idp_sso(
+            msg,
+            config,
+            Some(signing_ctx),
+            None,
+            Some(web::Data::new(authn_subject_callback)),
+            None,
+            Some(web::Data::new(Arc::new(engine))),
+            actix_web::test::TestRequest::default().to_http_request(),
+        )
+        .await
+        .expect("handler must not error");
+
+        assert_eq!(response.status(), actix_web::http::StatusCode::OK);
+        let body = actix_web::body::to_bytes(response.into_body())
+            .await
+            .unwrap();
+        let body = std::str::from_utf8(&body).unwrap();
+        let marker = "name=\"SAMLResponse\" value=\"";
+        let start = body.find(marker).expect("SAMLResponse field") + marker.len();
+        let end = body[start..].find('"').expect("closing quote") + start;
+        let xml = String::from_utf8(
+            base64::engine::general_purpose::STANDARD
+                .decode(&body[start..end])
+                .expect("valid base64"),
+        )
+        .expect("valid UTF-8 XML");
+
+        // `mail` is in REFEDS R&S; `cn` is not, so it must not survive entity
+        // category release - proving sp_entity actually reached the engine.
+        assert!(xml.contains("alice@example.org"));
+        assert!(!xml.contains("Alice Example"));
     }
 
     #[actix_web::test]

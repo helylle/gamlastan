@@ -177,6 +177,34 @@ pub struct EntityDescriptor {
 }
 
 impl EntityDescriptor {
+    /// Build a minimal entity descriptor wrapping a single SP SSO descriptor,
+    /// with no extensions, organization, or contact persons.
+    ///
+    /// Convenience for callers (e.g. registering a statically-trusted SP)
+    /// that only have an `SpSsoDescriptor` in hand and don't need entity
+    /// categories or other entity-level extensions. Build the full struct
+    /// literal directly when those are needed.
+    pub fn for_sp(entity_id: impl Into<String>, sp_sso: SpSsoDescriptor) -> Self {
+        EntityDescriptor {
+            entity_id: entity_id.into(),
+            id: None,
+            valid_until: None,
+            cache_duration: None,
+            has_signature: false,
+            extensions: None,
+            roles: EntityRoles::Roles {
+                idp_sso: vec![],
+                sp_sso: vec![sp_sso],
+                authn_authority: vec![],
+                attr_authority: vec![],
+                pdp: vec![],
+            },
+            organization: None,
+            contact_persons: vec![],
+            additional_metadata_locations: vec![],
+        }
+    }
+
     /// Get IdP SSO descriptors.
     pub fn idp_sso_descriptors(&self) -> &[IdpSsoDescriptor] {
         self.roles.idp_sso_descriptors()

@@ -27,12 +27,13 @@ use gamlastan::security::replay::{InMemoryReplayCache, ReplayCache};
 pub struct TrustedSp {
     /// The SP `entityID` (matched against the message `Issuer`).
     pub entity_id: String,
-    /// The SP's SSO descriptor (ACS endpoints, signing certificates).
-    pub sp_sso: SpSsoDescriptor,
+    /// The SP's full entity descriptor (SSO descriptor plus entity
+    /// extensions such as `mdattr:EntityAttributes` entity categories).
+    pub entity: EntityDescriptor,
 }
 
 /// Future returned by [`TrustedSpResolver::resolve_sp`].
-pub type ResolveSpFuture<'a> = Pin<Box<dyn Future<Output = Option<SpSsoDescriptor>> + Send + 'a>>;
+pub type ResolveSpFuture<'a> = Pin<Box<dyn Future<Output = Option<EntityDescriptor>> + Send + 'a>>;
 
 /// Resolves trusted SP metadata by `entityID` at request time.
 ///
@@ -67,13 +68,7 @@ pub type ResolveSpFuture<'a> = Pin<Box<dyn Future<Output = Option<SpSsoDescripto
 ///
 /// impl TrustedSpResolver for MdqSpResolver {
 ///     fn resolve_sp<'a>(&'a self, entity_id: &'a str) -> ResolveSpFuture<'a> {
-///         Box::pin(async move {
-///             self.0
-///                 .get(entity_id)
-///                 .await
-///                 .ok()
-///                 .and_then(|ed| ed.sp_sso_descriptors().first().cloned())
-///         })
+///         Box::pin(async move { self.0.get(entity_id).await.ok() })
 ///     }
 /// }
 ///
@@ -82,7 +77,11 @@ pub type ResolveSpFuture<'a> = Pin<Box<dyn Future<Output = Option<SpSsoDescripto
 ///     .with_sp_resolver(resolver);
 /// ```
 pub trait TrustedSpResolver: Send + Sync {
-    /// Resolve the SP metadata for `entity_id`, or `None` if it is not trusted.
+    /// Resolve the SP's full entity descriptor for `entity_id`, or `None` if
+    /// it is not trusted. The full descriptor (not just the SSO role) is
+    /// needed so entity-category attribute-release policy
+    /// (`ReleasePolicy`/`EntityCategoryPolicy`) can be applied through
+    /// `idp::orchestrator`.
     fn resolve_sp<'a>(&'a self, entity_id: &'a str) -> ResolveSpFuture<'a>;
 }
 
@@ -557,27 +556,48 @@ impl IdpConfig {
     ///   signing certificates before mutating session state or consuming an
     ///   artifact.
     ///
-    /// `entity_id` is matched against the message `Issuer`; `sp_sso` is the SP's
-    /// SSO descriptor (typically parsed from the SP's metadata document).
+    /// `entity_id` is matched against the message `Issuer`; `entity` is the
+    /// SP's full entity descriptor (typically parsed from the SP's metadata
+    /// document), so entity categories and other entity-level extensions
+    /// carry through to `idp::orchestrator`'s attribute-release policy. Use
+    /// [`EntityDescriptor::for_sp`](gamlastan::metadata::types::entity_descriptor::EntityDescriptor::for_sp)
+    /// to wrap a bare `SpSsoDescriptor` when those aren't needed.
     ///
     /// # Examples
     ///
-    /// ```ignore
+    /// ```
     /// # use gamlastan_actix::IdpConfig;
+    /// # use gamlastan::metadata::types::entity_descriptor::EntityDescriptor;
+    /// # use gamlastan::metadata::types::role_descriptor::{RoleDescriptorBase, SsoDescriptorBase};
     /// # use gamlastan::metadata::types::sp::SpSsoDescriptor;
-    /// # let sp_sso: SpSsoDescriptor = unimplemented!("parsed from SP metadata");
+    /// # let sp_sso = SpSsoDescriptor {
+    /// #     sso_base: SsoDescriptorBase {
+    /// #         base: RoleDescriptorBase::new(vec!["urn:oasis:names:tc:SAML:2.0:protocol".to_string()]),
+    /// #         artifact_resolution_services: vec![],
+    /// #         single_logout_services: vec![],
+    /// #         manage_name_id_services: vec![],
+    /// #         name_id_formats: vec![],
+    /// #     },
+    /// #     authn_requests_signed: None,
+    /// #     want_assertions_signed: None,
+    /// #     assertion_consumer_services: vec![],
+    /// #     attribute_consuming_services: vec![],
+    /// # };
     /// let config = IdpConfig::new("https://idp.example.com", "https://idp.example.com/sso")
-    ///     .with_trusted_sp("https://sp.example.com", sp_sso);
+    ///     .with_trusted_sp(
+    ///         "https://sp.example.com",
+    ///         EntityDescriptor::for_sp("https://sp.example.com", sp_sso),
+    ///     );
     /// assert!(config.trusted_sp("https://sp.example.com").is_some());
     /// ```
     pub fn with_trusted_sp(
         mut self,
         entity_id: impl Into<String>,
-        sp_sso: SpSsoDescriptor,
+        entity: EntityDescriptor,
     ) -> Self {
         self.trusted_sps.push(TrustedSp {
             entity_id: entity_id.into(),
-            sp_sso,
+            entity,
         });
         self
     }
@@ -607,10 +627,20 @@ impl IdpConfig {
     /// assert!(config.trusted_sp("https://sp.example.com").is_none());
     /// ```
     pub fn trusted_sp(&self, entity_id: &str) -> Option<&SpSsoDescriptor> {
+        self.trusted_sp_entity(entity_id)
+            .and_then(|entity| entity.sp_sso_descriptors().first())
+    }
+
+    /// Look up a registered trusted SP's full entity descriptor by `entityID`.
+    ///
+    /// Unlike [`trusted_sp`](Self::trusted_sp), this carries entity-level
+    /// extensions (entity categories, `subject-id:req`, etc.) needed for
+    /// `idp::orchestrator`'s attribute-release policy.
+    pub fn trusted_sp_entity(&self, entity_id: &str) -> Option<&EntityDescriptor> {
         self.trusted_sps
             .iter()
             .find(|sp| sp.entity_id == entity_id)
-            .map(|sp| &sp.sp_sso)
+            .map(|sp| &sp.entity)
     }
 
     /// Build an XML-DSig verifier from the signing certificates of every
@@ -638,7 +668,9 @@ impl IdpConfig {
     pub fn trusted_sp_verifier(&self) -> Option<SamlVerifier> {
         let mut keys = KeysManager::new();
         for sp in &self.trusted_sps {
-            self.add_sp_keys(&mut keys, &sp.sp_sso);
+            for sp_sso in sp.entity.sp_sso_descriptors() {
+                self.add_sp_keys(&mut keys, sp_sso);
+            }
         }
         self.finish_verifier(keys)
     }

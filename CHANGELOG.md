@@ -34,6 +34,17 @@ where needed to correct protocol handling.
   separate from the existing assertion `lifetime`, so `AuthnStatement/@SessionNotOnOrAfter`
   no longer has to collapse to the (typically much shorter) assertion validity
   window. Falls back to the assertion lifetime when unset.
+- Added `EntityDescriptor::for_sp`, a convenience constructor wrapping a
+  single `SpSsoDescriptor` with no extensions/organization/contacts.
+- Added `gamlastan-actix`'s `EstablishedSessionCallback`, reporting whether
+  the current request already carries an established IdP session (read from
+  the application's own cookie/session mechanism) for
+  `idp::orchestrator::check_request` to weigh against
+  `ForceAuthn`/`IsPassive`/`RequestedAuthnContext` before the
+  `AuthnSubjectCallback` runs.
+- Added `IdpConfig::trusted_sp_entity`, returning a trusted SP's full entity
+  descriptor (entity categories and other entity-level extensions), alongside
+  the existing `trusted_sp` (SSO descriptor only).
 
 ### Changed
 
@@ -45,6 +56,23 @@ where needed to correct protocol handling.
   `requested_sp_name_qualifier` and `has_name_id_policy`. The struct is only
   produced by `process_authn_request`, so hand-construction sites need both
   fields added.
+- **Breaking:** `gamlastan-actix`'s `TrustedSp.sp_sso: SpSsoDescriptor` field
+  is now `entity: EntityDescriptor`; `IdpConfig::with_trusted_sp`'s second
+  parameter and `TrustedSpResolver::resolve_sp`'s return type changed from
+  `SpSsoDescriptor` to `EntityDescriptor` to match (wrap a bare
+  `SpSsoDescriptor` with `EntityDescriptor::for_sp` at call sites that don't
+  need entity-level extensions). Previously the SSO handler's policy-driven
+  path always passed `sp_entity: None` to `idp::orchestrator`, so entity-category
+  attribute-release policy could never engage through it; the full descriptor
+  is now threaded through from trusted-SP resolution.
+- **Breaking:** `gamlastan-actix`'s `AuthnSubjectCallback` gains a
+  `&Disposition` parameter (between the processed request and the
+  `HttpRequest`). The SSO handler now calls
+  `idp::orchestrator::check_request` before invoking the callback and handles
+  a `Deny` disposition directly (a signed protocol error; the callback is
+  never invoked for it) — previously the handler bypassed `check_request`
+  entirely, so a callback could redirect to a login form for `IsPassive` or
+  reuse a session `ForceAuthn` should have defeated.
 
 ### Fixed
 

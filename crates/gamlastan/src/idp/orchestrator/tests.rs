@@ -972,6 +972,14 @@ impl IdentityStore for CustomStore {
     fn remove(&self, key: &str) {
         self.0.lock().unwrap().remove(key);
     }
+    fn compare_and_swap(&self, key: &str, expected: Option<&str>, new: &str) -> bool {
+        let mut map = self.0.lock().unwrap();
+        if map.get(key).map(String::as_str) != expected {
+            return false;
+        }
+        map.insert(key.to_string(), new.to_string());
+        true
+    }
 }
 
 #[test]

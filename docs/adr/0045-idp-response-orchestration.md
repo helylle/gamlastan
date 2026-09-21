@@ -80,18 +80,20 @@ existing primitives into the profile flow, and move the semantics proven in
    persistent identifier for the same subject just by naming it in its own
    request -- so a mismatched qualifier is denied (`InvalidNameIdPolicy`)
    rather than passed through. Persistent NameID minting is also
-   concurrency-safe: `IdentityStore` gained a provided `compare_and_swap`
+   concurrency-safe: `IdentityStore` gained a required `compare_and_swap`
    method, and every writer of a user's forward NameID list
    (`store`/`get_or_create_persistent`/`remove_remote`/`remove_local`) goes
    through it with a retry loop, so two concurrent requests (for the same or
    different SPs) can no longer silently drop one writer's update or mint
    two different "stable" persistent identifiers for the same (user, SP).
-   `compare_and_swap`'s default implementation serializes every
-   default-using caller behind one process-wide mutex, so this closes the
-   race even for a third-party `IdentityStore` that never overrides the
-   method -- for any single-process deployment. A real multi-instance
-   backend still must override it with a genuinely atomic storage-layer
-   operation; the process-wide lock cannot close a race across processes.
+   `compare_and_swap` has no default implementation -- `IdentityStore` has no
+   implementors outside this crate yet, so requiring it costs nothing real,
+   and a plausible-looking non-atomic default (even a process-local mutex)
+   would silently leave the race open for any multi-instance backend that
+   didn't think to override it. `InMemoryIdentityStore` implements it with a
+   per-instance mutex; a Redis/SQL-backed store must implement a genuinely
+   atomic storage-layer operation (`WATCH`/`MULTI`, `UPDATE ... WHERE
+   current = expected`, etc.).
 
    Attribute release is a seam, not a hardwired step, because deployments
    legitimately source the released set differently: an originating IdP
@@ -197,6 +199,9 @@ failure is a real protocol error rather than a silent per-integrator choice.
   changed from level-based matching to literal class-ref matching (see
   above). Any integrator relying on the old broadened behaviour must pass
   `allow_exact_level_matching(true)` explicitly.
+- Breaking (pre-release): `IdentityStore` gained a required `compare_and_swap`
+  method with no default implementation (see above). A custom implementor
+  (there are none outside this crate yet) must add it.
 
 ## Alternatives considered
 
@@ -234,11 +239,9 @@ failure is a real protocol error rather than a silent per-integrator choice.
   proxy shape produces a compliant response without `ReleasePolicy::filter`
   ever running.
 - `idp/ident.rs`: concurrent persistent-NameID minting for the same
-  (user, SP) resolves to one identifier, including through
-  `compare_and_swap`'s *default* implementation for a store that does not
-  override it; concurrent persistent + transient issuance don't clobber
-  each other's forward-list entry; `remove_local` racing a concurrent
-  writer never leaves an orphaned reverse-key entry.
+  (user, SP) resolves to one identifier; concurrent persistent + transient
+  issuance don't clobber each other's forward-list entry; `remove_local`
+  racing a concurrent writer never leaves an orphaned reverse-key entry.
 - `idp/authn_broker.rs`: exact matching excludes a method registered at the
   same security level under a different, unrequested class ref by default;
   `allow_exact_level_matching` restores the old pysaml2-compatible

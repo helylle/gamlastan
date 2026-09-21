@@ -55,29 +55,20 @@ pub trait IdentityStore: Send + Sync {
     /// `IdentDb` uses this to close a check-then-create race on persistent
     /// NameID minting: two concurrent requests for the same (user, SP) that
     /// both observe no existing association must not both succeed at
-    /// storing a *different* persistent identifier for it.
-    ///
-    /// The default implementation serializes every default-using caller,
-    /// process-wide, behind one mutex around `get`+`set` - so it genuinely
-    /// closes the race for any single-process deployment (including a
-    /// custom `IdentityStore` that never overrides this method), without
-    /// requiring adding this method to be a breaking change for existing
-    /// implementors. It does **not** close the race across multiple
-    /// processes/instances sharing the same backing store: a real
-    /// multi-instance backend (Redis `WATCH`/`MULTI`, a SQL `UPDATE ...
-    /// WHERE current = expected`, etc.) must override it with a genuinely
-    /// atomic compare-and-swap at the storage layer, or the race is still
-    /// possible across instances even though this process's own calls are
-    /// serialized.
-    fn compare_and_swap(&self, key: &str, expected: Option<&str>, new: &str) -> bool {
-        static DEFAULT_CAS_LOCK: Mutex<()> = Mutex::new(());
-        let _guard = DEFAULT_CAS_LOCK.lock().unwrap();
-        if self.get(key).as_deref() != expected {
-            return false;
-        }
-        self.set(key, new.to_string());
-        true
-    }
+    /// storing a *different* persistent identifier for it. This must be a
+    /// real atomic operation at the storage layer for a multi-instance
+    /// backend (Redis `WATCH`/`MULTI`, a SQL `UPDATE ... WHERE current =
+    /// expected`, etc.) - a single process serializing its own calls (e.g.
+    /// behind a mutex) is not enough once more than one process shares the
+    /// same backing store. There is deliberately no default implementation:
+    /// a plausible-looking but non-atomic default (a plain `get`+`set`, or
+    /// even a process-local mutex) would silently leave the exact race this
+    /// method exists to close in place for any multi-instance deployment
+    /// that didn't happen to notice it needed to do something extra.
+    /// Implementing `IdentityStore` for a new backend is already the moment
+    /// to decide this deliberately, not a moment to inherit a default that
+    /// looks safe and isn't.
+    fn compare_and_swap(&self, key: &str, expected: Option<&str>, new: &str) -> bool;
 }
 
 /// In-memory identity store.
@@ -933,56 +924,6 @@ mod tests {
             .filter(|nid| nid.format.as_deref() == Some(constants::NAMEID_PERSISTENT))
             .collect();
         assert_eq!(persistent_entries.len(), 1);
-    }
-
-    /// A minimal `IdentityStore` that deliberately does not override
-    /// `compare_and_swap`, to exercise the trait's default implementation.
-    #[derive(Debug, Default)]
-    struct NaiveStore {
-        map: Mutex<HashMap<String, String>>,
-    }
-
-    impl IdentityStore for NaiveStore {
-        fn get(&self, key: &str) -> Option<String> {
-            self.map.lock().unwrap().get(key).cloned()
-        }
-        fn set(&self, key: &str, value: String) {
-            self.map.lock().unwrap().insert(key.to_string(), value);
-        }
-        fn remove(&self, key: &str) {
-            self.map.lock().unwrap().remove(key);
-        }
-    }
-
-    #[test]
-    fn default_compare_and_swap_still_closes_the_race_for_a_store_that_does_not_override_it() {
-        // A third-party IdentityStore that never overrides compare_and_swap
-        // (the common case for a simple single-process backend) must still
-        // get a genuinely race-free persistent-NameID mint via the trait's
-        // default implementation's process-wide lock, not just the
-        // InMemoryIdentityStore-specific override exercised by the sibling
-        // test above.
-        use std::sync::Arc;
-        use std::thread;
-
-        let db = Arc::new(IdentDb::new(NaiveStore::default(), IDP));
-        let threads: Vec<_> = (0..16)
-            .map(|_| {
-                let db = Arc::clone(&db);
-                thread::spawn(move || db.persistent_nameid("alice", Some(SP)))
-            })
-            .collect();
-
-        let values: Vec<String> = threads
-            .into_iter()
-            .map(|t| t.join().unwrap().value)
-            .collect();
-        let first = &values[0];
-        assert!(
-            values.iter().all(|v| v == first),
-            "concurrent persistent requests through the default compare_and_swap \
-             must all resolve to the same identifier, got: {values:?}"
-        );
     }
 
     #[test]

@@ -165,9 +165,9 @@ pub struct AuthnCallbackResult {
 /// ForceAuthn/IsPassive/RequestedAuthnContext itself — it only supplies real
 /// attributes and performs the actual login when one is needed.
 ///
-/// Register both this callback and a `ResponseEngine` as application data to
-/// use it; the SSO handler prefers it over [`AuthnCallback`] when both are
-/// present.
+/// Register both this callback and a [`ResponseEngineParts`] as application
+/// data to use it; the SSO handler prefers it over [`AuthnCallback`] when
+/// both are present.
 pub type AuthnSubjectCallback = Box<
     dyn Fn(
             &idp_profile::ProcessedAuthnRequest,
@@ -455,13 +455,12 @@ async fn idp_sso(
         ))
     })?;
     let sp_sso = sp_entity
-        .sp_sso_descriptors()
-        .first()
+        .saml2_sp_sso_descriptor()
         .cloned()
         .ok_or_else(|| {
             SamlActixError::Profile(gamlastan::profiles::ProfileError::AssertionValidation(
                 format!(
-                    "trusted entity {:?} has no SPSSODescriptor",
+                    "trusted entity {:?} has no SAML 2.0 SPSSODescriptor",
                     sp_entity.entity_id
                 ),
             ))
@@ -488,7 +487,7 @@ async fn idp_sso(
             .map_err(SamlActixError::Profile)?;
 
     // The higher-level, policy-driven path: when both an AuthnSubjectCallback
-    // and a ResponseEngine are registered, the engine derives the NameID,
+    // and ResponseEngineParts are registered, the engine derives the NameID,
     // released attributes, and authn context, then assembles and signs the
     // response. This is preferred over the lower-level AuthnCallback.
     if let (Some(callback), Some(parts)) = (&authn_subject_callback, &response_engine) {
@@ -1028,7 +1027,7 @@ async fn resolve_trusted_sp(
 ) -> Option<gamlastan::metadata::types::sp::SpSsoDescriptor> {
     resolve_trusted_sp_entity(config, entity_id)
         .await
-        .and_then(|entity| entity.sp_sso_descriptors().first().cloned())
+        .and_then(|entity| entity.saml2_sp_sso_descriptor().cloned())
 }
 
 /// Resolve the trusted SP's full entity descriptor by `entityID` — the static

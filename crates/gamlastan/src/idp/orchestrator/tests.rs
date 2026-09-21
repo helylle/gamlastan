@@ -7,7 +7,7 @@
 //! `fail_on_missing_requested` on/off behaviour through
 //! [`create_authn_response`].
 
-use chrono::Utc;
+use chrono::{TimeDelta, Utc};
 
 use crate::core::assertion::attribute::{Attribute, AttributeValue};
 use crate::core::constants;
@@ -706,6 +706,37 @@ fn create_authn_response_issues_when_method_satisfies_the_request() {
 
     let outcome = create_authn_response(&engine, &p, &subject).unwrap();
     assert!(matches!(outcome, ResponseOutcome::Issued(_)));
+}
+
+#[test]
+fn issued_not_on_or_after_matches_the_wire_assertion_lifetime() {
+    // Regression: the assertion's wire NotOnOrAfter is built from a
+    // normalized (whole-second, non-negative) lifetime
+    // (`lifetime.num_seconds().max(0)`), but IssuedResponse.not_on_or_after
+    // must be derived from that same normalized value, not the raw
+    // sub-second TimeDelta, or the two can disagree.
+    let decisions = ReleasePolicy::with_default(
+        crate::idp::policy::PolicyEntry::new().with_lifetime(TimeDelta::milliseconds(2_500)),
+    );
+    let engine = engine_with_decisions(&decisions);
+    let p = params(processed(false, false, vec![], None));
+    let subject = subject_with_mail();
+
+    let before = chrono::Utc::now();
+    let outcome = create_authn_response(&engine, &p, &subject).unwrap();
+    match outcome {
+        ResponseOutcome::Issued(issued) => {
+            // The normalized lifetime is 2 whole seconds, not 2.5.
+            let expected = before + TimeDelta::seconds(2);
+            let delta = (issued.not_on_or_after - expected).num_milliseconds().abs();
+            assert!(
+                delta < 500,
+                "not_on_or_after {} should be ~2s (normalized) after issuance, not 2.5s",
+                issued.not_on_or_after
+            );
+        }
+        other => panic!("expected Issued, got {other:?}"),
+    }
 }
 
 // ── ResponseParams metadata signals ──────────────────────────────────────────

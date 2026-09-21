@@ -86,7 +86,11 @@ where needed to correct protocol handling.
   one. Previously the SSO handler's policy-driven path also always passed
   `sp_entity: None` to `idp::orchestrator`, so entity-category
   attribute-release policy could never engage through it; the full
-  descriptor is now threaded through from trusted-SP resolution.
+  descriptor is now threaded through from trusted-SP resolution. Selecting
+  the SAML 2.0 role out of a registered entity's roles (added
+  `EntityDescriptor::saml2_sp_sso_descriptor`) is by `protocolSupportEnumeration`,
+  not descriptor order, so metadata carrying a non-SAML-2.0 `SPSSODescriptor`
+  before the SAML 2.0 one is resolved correctly.
 - **Breaking:** `gamlastan-actix`'s `AuthnSubjectCallback` gains a
   `&Disposition` parameter (between the processed request and the
   `HttpRequest`). The SSO handler now calls

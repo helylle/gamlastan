@@ -623,7 +623,7 @@ impl IdpConfig {
     /// ```
     pub fn trusted_sp(&self, entity_id: &str) -> Option<&SpSsoDescriptor> {
         self.trusted_sp_entity(entity_id)
-            .and_then(|entity| entity.sp_sso_descriptors().first())
+            .and_then(|entity| entity.saml2_sp_sso_descriptor())
     }
 
     /// Look up a registered trusted SP's full entity descriptor by `entityID`.

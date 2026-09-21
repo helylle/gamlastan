@@ -215,6 +215,21 @@ impl EntityDescriptor {
         self.roles.sp_sso_descriptors()
     }
 
+    /// Get the SP SSO descriptor that supports the SAML 2.0 protocol.
+    ///
+    /// An entity's metadata can declare multiple `SPSSODescriptor` roles,
+    /// each scoped to a different `protocolSupportEnumeration` (e.g. a
+    /// legacy SAML 1.1 role alongside a SAML 2.0 one). Callers that speak
+    /// only SAML 2.0 must select by protocol support rather than taking the
+    /// first descriptor, which may belong to a different protocol.
+    pub fn saml2_sp_sso_descriptor(&self) -> Option<&SpSsoDescriptor> {
+        self.sp_sso_descriptors().iter().find(|sp| {
+            sp.sso_base
+                .base
+                .supports_protocol(crate::core::constants::PROTOCOL_SAML2)
+        })
+    }
+
     /// Check if this entity is an IdP (has at least one IDPSSODescriptor).
     pub fn is_idp(&self) -> bool {
         !self.idp_sso_descriptors().is_empty()
@@ -607,5 +622,66 @@ mod tests {
         // Affiliation variant returns empty slices for SSO descriptors
         assert!(roles.idp_sso_descriptors().is_empty());
         assert!(roles.sp_sso_descriptors().is_empty());
+    }
+
+    #[test]
+    fn saml2_sp_sso_descriptor_skips_non_saml2_roles() {
+        use super::super::endpoint::{Endpoint, IndexedEndpoint};
+        use super::super::role_descriptor::{RoleDescriptorBase, SsoDescriptorBase};
+        use super::super::sp::SpSsoDescriptor;
+
+        fn sp_sso_for(protocol: &str) -> SpSsoDescriptor {
+            SpSsoDescriptor {
+                sso_base: SsoDescriptorBase {
+                    base: RoleDescriptorBase::new(vec![protocol.to_string()]),
+                    artifact_resolution_services: vec![],
+                    single_logout_services: vec![],
+                    manage_name_id_services: vec![],
+                    name_id_formats: vec![],
+                },
+                authn_requests_signed: None,
+                want_assertions_signed: None,
+                assertion_consumer_services: vec![IndexedEndpoint::new_default(
+                    Endpoint::new(
+                        "urn:oasis:names:tc:SAML:2.0:bindings:HTTP-POST",
+                        "https://sp.example.com/acs",
+                    ),
+                    0,
+                )],
+                attribute_consuming_services: vec![],
+            }
+        }
+
+        // A SAML 1.1 role listed before the SAML 2.0 one: taking `.first()`
+        // would silently pick the wrong protocol's role.
+        let mut entity = simple_sp_entity("https://sp.example.com");
+        entity.roles = EntityRoles::Roles {
+            idp_sso: vec![],
+            sp_sso: vec![
+                sp_sso_for("urn:oasis:names:tc:SAML:1.1:protocol"),
+                sp_sso_for("urn:oasis:names:tc:SAML:2.0:protocol"),
+            ],
+            authn_authority: vec![],
+            attr_authority: vec![],
+            pdp: vec![],
+        };
+        let picked = entity
+            .saml2_sp_sso_descriptor()
+            .expect("a SAML 2.0 role is present");
+        assert!(picked
+            .sso_base
+            .base
+            .supports_protocol("urn:oasis:names:tc:SAML:2.0:protocol"));
+
+        // No SAML 2.0 role at all: nothing to pick.
+        let mut saml1_only = simple_sp_entity("https://legacy-sp.example.com");
+        saml1_only.roles = EntityRoles::Roles {
+            idp_sso: vec![],
+            sp_sso: vec![sp_sso_for("urn:oasis:names:tc:SAML:1.1:protocol")],
+            authn_authority: vec![],
+            attr_authority: vec![],
+            pdp: vec![],
+        };
+        assert!(saml1_only.saml2_sp_sso_descriptor().is_none());
     }
 }

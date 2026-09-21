@@ -6,7 +6,7 @@
 //! test exhaustively. [`create_authn_response`] and
 //! [`create_denial_response`] perform the actual assembly in a fixed order.
 
-use chrono::Utc;
+use chrono::{TimeDelta, Utc};
 
 use crate::core::assertion::name_id::NameId;
 use crate::core::protocol::response::Response;
@@ -275,6 +275,7 @@ pub fn create_authn_response(
     //    outlive any one assertion (E79).
     let now = Utc::now();
     let lifetime = engine.decisions.lifetime(&processed.sp_entity_id);
+    let assertion_lifetime_seconds = lifetime.num_seconds().max(0) as u64;
     let session_lifetime = engine.decisions.session_lifetime(&processed.sp_entity_id);
     let session_not_on_or_after = Some(now + session_lifetime);
     let options = ResponseOptions {
@@ -282,7 +283,7 @@ pub fn create_authn_response(
         in_response_to: Some(processed.request_id.clone()),
         sp_entity_id: processed.sp_entity_id.clone(),
         acs_url: processed.acs_url.clone(),
-        assertion_lifetime_seconds: lifetime.num_seconds().max(0) as u64,
+        assertion_lifetime_seconds,
         session_index: subject.session_index.clone(),
         session_not_on_or_after,
         authn_context_class_ref: Some(class_ref),
@@ -331,8 +332,10 @@ pub fn create_authn_response(
         }
     }
 
-    // 9. Return the issued response with its audit identifiers.
-    let not_on_or_after = now + lifetime;
+    // 9. Return the issued response with its audit identifiers, using the
+    //    same normalized (whole-second, non-negative) lifetime that went
+    //    into the wire assertion so the two cannot disagree.
+    let not_on_or_after = now + TimeDelta::seconds(assertion_lifetime_seconds as i64);
     let released_attribute_names = released.iter().map(|a| a.name.clone()).collect();
     Ok(super::ResponseOutcome::Issued(IssuedResponse {
         xml: signed_xml,

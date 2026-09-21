@@ -430,12 +430,27 @@ mod orchestrator_attacks {
     /// must resolve to *no* requirements, never fall back to some other
     /// service's requirements.
     #[test]
-    fn unknown_attribute_consuming_service_index_yields_no_requirements() {
+    fn unknown_attribute_consuming_service_index_is_denied() {
+        // An explicit index naming no declared service is a protocol error,
+        // not silently "no requirements" - falling through would bypass that
+        // service's own attribute scoping and, for an SP with no entity
+        // categories configured (as here), release the subject's entire
+        // attribute set instead of failing closed. Denials sign
+        // unconditionally, so this needs a real fixture key.
         let idents = IdentDb::in_memory(IDP);
         let broker = AuthnBroker::new();
         let decisions = ReleasePolicy::new();
-        let signer = gamlastan::crypto::SamlSigner::new(gamlastan::crypto::KeysManager::new());
-        let engine = engine(&idents, &broker, &decisions, &signer);
+        let (signer, cert) = super::response_signing_fixture_signer();
+        let engine = ResponseEngine {
+            idp_entity_id: IDP,
+            decisions: &decisions,
+            release: &decisions,
+            idents: &idents,
+            broker: &broker,
+            assertions: None,
+            signer: &signer,
+            cert_der_b64: &cert,
+        };
 
         let mut request = processed(SP);
         request.attribute_consuming_service_index = Some(99); // not configured
@@ -460,12 +475,14 @@ mod orchestrator_attacks {
             session_index: Some("_sess1".to_string()),
         };
 
-        // `fail_on_missing_requested` defaults to true, but with no resolved
-        // requirements (unknown index) there is nothing to fail on: the
-        // request must not be denied, and it must not be silently satisfied by
-        // index 0's requirements either.
         let outcome = create_authn_response(&engine, &params, &subject).expect("no config fault");
-        assert!(matches!(outcome, ResponseOutcome::Issued(_)));
+        assert!(matches!(
+            outcome,
+            ResponseOutcome::Denied {
+                denial: gamlastan::idp::orchestrator::Denial::InvalidAttributeConsumingServiceIndex,
+                ..
+            }
+        ));
     }
 
     /// An attacker-controlled `SPNameQualifier` carrying XML metacharacters

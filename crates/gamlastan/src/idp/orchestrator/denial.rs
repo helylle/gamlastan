@@ -32,6 +32,13 @@ pub enum Denial {
     /// A required attribute (per the SP's `AttributeConsumingService` and
     /// `fail_on_missing_requested`) could not be released.
     MissingRequiredAttributes,
+    /// The request named an explicit `AttributeConsumingServiceIndex` that
+    /// does not correspond to any service declared in the SP's metadata.
+    /// Falling through silently would resolve to "no requirements" instead,
+    /// which — for an SP whose release policy has no entity categories
+    /// configured — bypasses that service's own declared attribute scoping
+    /// and releases the subject's entire attribute set.
+    InvalidAttributeConsumingServiceIndex,
 }
 
 impl Denial {
@@ -43,6 +50,7 @@ impl Denial {
     /// - `InvalidNameIdPolicy` / `NameIdCreationNotAllowed` →
     ///   `Requester/InvalidNameIDPolicy`
     /// - `MissingRequiredAttributes` → `Requester/InvalidAttrNameOrValue`
+    /// - `InvalidAttributeConsumingServiceIndex` → `Requester/ResourceNotRecognized`
     pub fn status(&self) -> Status {
         match self {
             Denial::NoPassive => Status::with_sub_status(
@@ -71,6 +79,15 @@ impl Denial {
                 constants::STATUS_REQUESTER,
                 constants::STATUS_INVALID_ATTR_NAME_OR_VALUE,
                 Some("A required attribute is missing".to_string()),
+            ),
+            Denial::InvalidAttributeConsumingServiceIndex => Status::with_sub_status(
+                constants::STATUS_REQUESTER,
+                constants::STATUS_RESOURCE_NOT_RECOGNIZED,
+                Some(
+                    "The requested AttributeConsumingServiceIndex does not correspond to any \
+                     declared service"
+                        .to_string(),
+                ),
             ),
         }
     }
@@ -109,6 +126,11 @@ mod tests {
                 Denial::MissingRequiredAttributes,
                 constants::STATUS_REQUESTER,
                 constants::STATUS_INVALID_ATTR_NAME_OR_VALUE,
+            ),
+            (
+                Denial::InvalidAttributeConsumingServiceIndex,
+                constants::STATUS_REQUESTER,
+                constants::STATUS_RESOURCE_NOT_RECOGNIZED,
             ),
         ];
 
@@ -178,6 +200,7 @@ mod tests {
             Denial::InvalidNameIdPolicy,
             Denial::NameIdCreationNotAllowed,
             Denial::MissingRequiredAttributes,
+            Denial::InvalidAttributeConsumingServiceIndex,
         ]
         .iter()
         .map(|d| d.status().status_message.clone().unwrap())

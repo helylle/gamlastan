@@ -157,7 +157,9 @@ fn class_ref_satisfies(
 /// Assemble and sign a successful response for an authenticated subject.
 ///
 /// Fixed order:
-/// 1. resolve the SP's required/optional attributes;
+/// 1. resolve the SP's required/optional attributes (→
+///    [`Denial::InvalidAttributeConsumingServiceIndex`] for an explicit,
+///    unrecognized index);
 /// 2. run the release seam;
 /// 3. check `fail_on_missing_requested` (→ [`Denial::MissingRequiredAttributes`]);
 /// 4. construct the NameID (→ [`Denial::InvalidNameIdPolicy`] /
@@ -179,7 +181,25 @@ pub fn create_authn_response(
     let processed = &params.processed;
     let sp = &params.sp_sso;
 
-    // 1. Resolve the SP's attribute requirements (indexed or default service).
+    // 1. Resolve the SP's attribute requirements (indexed or default
+    //    service). An explicit index naming no declared service is a
+    //    protocol error, not silently "no requirements" — falling through
+    //    would bypass that service's own attribute scoping and, for an SP
+    //    with no entity categories configured, release the subject's entire
+    //    attribute set instead.
+    if let Some(index) = processed.attribute_consuming_service_index {
+        if !sp
+            .attribute_consuming_services
+            .iter()
+            .any(|s| s.index == index)
+        {
+            return denied(
+                engine,
+                params,
+                &Denial::InvalidAttributeConsumingServiceIndex,
+            );
+        }
+    }
     let (required, optional) =
         sp_attribute_requirements(sp, processed.attribute_consuming_service_index);
 

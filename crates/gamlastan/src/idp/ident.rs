@@ -687,6 +687,26 @@ mod tests {
     }
 
     #[test]
+    fn test_allow_create_false_does_not_block_non_persistent_formats() {
+        // Decided behavior (not a bug): AllowCreate (E14) is only meaningful
+        // for the persistent format, matching pysaml2's own
+        // construct_nameid()/persistent_nameid() split - transient/email/
+        // unspecified/custom formats have no "existing identifier to reuse"
+        // concept in the same sense and are minted fresh regardless of
+        // AllowCreate. See ProcessedAuthnRequest::has_name_id_policy's doc.
+        let db = db();
+        let policy = NameIdPolicy {
+            format: Some(constants::NAMEID_EMAIL.to_string()),
+            sp_name_qualifier: None,
+            allow_create: false,
+        };
+        let nid = db
+            .construct_nameid("alice", SP, Some(&policy), None)
+            .expect("AllowCreate=false must not block a non-persistent format");
+        assert_eq!(nid.format.as_deref(), Some(constants::NAMEID_EMAIL));
+    }
+
+    #[test]
     fn test_construct_persistent_allow_create_e14() {
         let db = db();
         let no_create = NameIdPolicy {

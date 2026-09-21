@@ -75,8 +75,16 @@ pub struct ProcessedAuthnRequest {
 
     /// Whether the request carried a `NameIDPolicy` element at all. Needed to
     /// distinguish "no NameIDPolicy" (fall back to the IdP's default format)
-    /// from "NameIDPolicy with AllowCreate=false" (E14: no new identifier may
-    /// be created).
+    /// from "NameIDPolicy with AllowCreate=false" (E14: no new *persistent*
+    /// identifier may be created). Per SAML V2.0 Errata E14, `AllowCreate`
+    /// "MUST NOT be used and SHOULD be ignored" for the transient format, and
+    /// its behavior for any other format is explicitly left to the IdP's own
+    /// implementation ("these are details left to implementations or
+    /// deployments") — the spec does not mandate enforcing it universally.
+    /// `IdentDb::construct_nameid` (matching pysaml2's own
+    /// `construct_nameid`/`persistent_nameid` split) only consults
+    /// `allow_create` for the persistent format; transient, email,
+    /// unspecified, and custom formats are minted fresh regardless.
     pub has_name_id_policy: bool,
 
     /// Requested authentication context class refs.

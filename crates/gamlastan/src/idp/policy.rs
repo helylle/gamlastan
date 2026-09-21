@@ -469,7 +469,15 @@ impl ReleasePolicy {
         Some(released)
     }
 
-    fn validate_required_attributes(
+    /// Verify that every required attribute (and, when the request specified
+    /// values, at least one matching value) survived release.
+    ///
+    /// `pub(crate)` so `idp::orchestrator` can apply the same matching
+    /// semantics as a release-implementation-independent check, regardless of
+    /// which [`AttributeRelease`](crate::idp::orchestrator::release::AttributeRelease)
+    /// produced `attributes` — a pass-through or custom release may not
+    /// itself validate this.
+    pub(crate) fn validate_required_attributes(
         &self,
         attributes: &[Attribute],
         required: &[RequestedAttribute],

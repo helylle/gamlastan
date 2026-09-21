@@ -496,6 +496,107 @@ fn fail_on_missing_requested_issued_when_attribute_present() {
     assert!(matches!(outcome, ResponseOutcome::Issued(_)));
 }
 
+/// An engine whose release seam is the real `ReleasePolicy` (not
+/// `PassThroughRelease`) — the documented default for an originating IdP.
+fn engine_with_release_policy(decisions: &ReleasePolicy) -> ResponseEngine<'_> {
+    static BROKER: std::sync::OnceLock<AuthnBroker> = std::sync::OnceLock::new();
+    static IDENTS: std::sync::OnceLock<IdentDb> = std::sync::OnceLock::new();
+    static SIGNER: std::sync::OnceLock<SamlSigner> = std::sync::OnceLock::new();
+    static CERT: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
+
+    let broker = BROKER.get_or_init(broker);
+    let idents = IDENTS.get_or_init(|| IdentDb::in_memory(IDP));
+    let (signer, cert) = fixture_signer();
+    let signer = SIGNER.get_or_init(|| signer);
+    let cert = CERT.get_or_init(|| cert);
+
+    ResponseEngine {
+        idp_entity_id: IDP,
+        decisions,
+        release: decisions,
+        idents,
+        broker,
+        assertions: None,
+        signer,
+        cert_der_b64: cert,
+    }
+}
+
+#[test]
+fn release_policy_missing_required_attribute_denies_not_errors() {
+    // With the real ReleasePolicy as the release seam (an originating IdP,
+    // the documented common case), `ReleasePolicy::release` itself refuses a
+    // missing required attribute with `PolicyError::MissingRequiredAttribute`.
+    // That must surface as a signed `Denial::MissingRequiredAttributes`, not
+    // an `Err` (which the Actix/example-idp callers would otherwise turn into
+    // an HTTP 500 for what is actually a normal, expected SP-side condition).
+    let decisions = ReleasePolicy::new(); // fail_on_missing_requested defaults to true
+    let engine = engine_with_release_policy(&decisions);
+    let mut p = params(processed(false, false, vec![], None));
+    p.sp_sso = sp_sso_requiring_mail();
+
+    let outcome = create_authn_response(&engine, &p, &subject_without_mail())
+        .expect("a missing required attribute is a denial, not a ProfileError");
+    assert!(matches!(
+        outcome,
+        ResponseOutcome::Denied {
+            denial: crate::idp::orchestrator::Denial::MissingRequiredAttributes,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn release_policy_missing_required_value_denies_not_errors() {
+    // Same as above, but the attribute name is present while the specific
+    // required *value* is not - PolicyError::MissingRequiredValue, which must
+    // map to the same signed denial.
+    let decisions = ReleasePolicy::new();
+    let engine = engine_with_release_policy(&decisions);
+    let mut p = params(processed(false, false, vec![], None));
+    let mut sp = sp_sso_requiring_mail();
+    sp.attribute_consuming_services[0].requested_attributes[0]
+        .attribute
+        .values = vec![AttributeValue::String("required@example.org".to_string())];
+    p.sp_sso = sp;
+
+    // The subject holds `mail`, but with a different value than required.
+    let outcome = create_authn_response(&engine, &p, &subject_with_mail())
+        .expect("a missing required value is a denial, not a ProfileError");
+    assert!(matches!(
+        outcome,
+        ResponseOutcome::Denied {
+            denial: crate::idp::orchestrator::Denial::MissingRequiredAttributes,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn pass_through_release_missing_required_value_is_still_denied() {
+    // The value check (step 3) must not depend on which AttributeRelease
+    // implementation ran: PassThroughRelease never validates values itself,
+    // so this is the only safety net for a proxy shape.
+    let decisions = ReleasePolicy::new();
+    let engine = engine_with_decisions(&decisions); // release: &PassThroughRelease
+    let mut p = params(processed(false, false, vec![], None));
+    let mut sp = sp_sso_requiring_mail();
+    sp.attribute_consuming_services[0].requested_attributes[0]
+        .attribute
+        .values = vec![AttributeValue::String("required@example.org".to_string())];
+    p.sp_sso = sp;
+
+    let outcome = create_authn_response(&engine, &p, &subject_with_mail())
+        .expect("a missing required value is a denial, not a ProfileError");
+    assert!(matches!(
+        outcome,
+        ResponseOutcome::Denied {
+            denial: crate::idp::orchestrator::Denial::MissingRequiredAttributes,
+            ..
+        }
+    ));
+}
+
 #[test]
 fn fail_on_missing_requested_disabled_omits_silently() {
     let decisions = ReleasePolicy::with_default(

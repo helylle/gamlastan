@@ -13,7 +13,7 @@ use crate::core::protocol::response::Response;
 use crate::idp::assertion_store::AssertionStore;
 use crate::idp::authn_broker::AuthnBroker;
 use crate::idp::ident::{IdentDb, IdentityStore, InMemoryIdentityStore};
-use crate::idp::policy::{sp_attribute_requirements, ReleasePolicy};
+use crate::idp::policy::{sp_attribute_requirements, PolicyError, ReleasePolicy};
 use crate::profiles::error::ProfileError;
 use crate::profiles::sso::idp::{create_error_response, create_response, sign_response_xml};
 use crate::profiles::sso::web_browser::{ResponseOptions, ResponseTimes};
@@ -161,35 +161,48 @@ pub fn create_authn_response<S: IdentityStore>(
     let (required, optional) =
         sp_attribute_requirements(sp, processed.attribute_consuming_service_index);
 
-    // 2. Run the release seam.
-    let released = engine
-        .release
-        .release(
-            subject.attributes.clone(),
-            &processed.sp_entity_id,
-            &params.sp_entity_categories(),
-            &required,
-            &optional,
-            params.subject_id_req(),
-        )
-        .map_err(|e| ProfileError::Other(format!("attribute release failed: {e}")))?;
+    // 2. Run the release seam. A missing-required-attribute/value refusal is
+    //    the SP's own AttributeConsumingService being unsatisfiable — a
+    //    protocol denial, not a programming/configuration fault. Only a
+    //    genuine release misconfiguration (e.g. an invalid restriction
+    //    pattern) is a `ProfileError`.
+    let released = match engine.release.release(
+        subject.attributes.clone(),
+        &processed.sp_entity_id,
+        &params.sp_entity_categories(),
+        &required,
+        &optional,
+        params.subject_id_req(),
+    ) {
+        Ok(attrs) => attrs,
+        Err(
+            PolicyError::MissingRequiredAttribute(_) | PolicyError::MissingRequiredValue { .. },
+        ) => {
+            return denied(engine, params, &Denial::MissingRequiredAttributes);
+        }
+        Err(e) => {
+            return Err(ProfileError::Other(format!(
+                "attribute release failed: {e}"
+            )))
+        }
+    };
 
-    // 3. fail_on_missing_requested: a required attribute that was not released
-    //    is a protocol error, not a silent omission.
+    // 3. fail_on_missing_requested: verify required attributes/values
+    //    actually survived release, independent of which `AttributeRelease`
+    //    ran. `ReleasePolicy::release` already validates this internally (and
+    //    would have taken the branch above instead), but a pass-through or
+    //    custom release does not, so this check must not depend on which
+    //    implementation was injected.
     if engine
         .decisions
         .fail_on_missing_requested(&processed.sp_entity_id)
         && !required.is_empty()
+        && engine
+            .decisions
+            .validate_required_attributes(&released, &required)
+            .is_err()
     {
-        let released_names: Vec<String> = released.iter().map(|a| a.name.clone()).collect();
-        let missing = required.iter().any(|r| {
-            !released_names
-                .iter()
-                .any(|n| n.eq_ignore_ascii_case(&r.attribute.name))
-        });
-        if missing {
-            return denied(engine, params, &Denial::MissingRequiredAttributes);
-        }
+        return denied(engine, params, &Denial::MissingRequiredAttributes);
     }
 
     // 4. Construct the NameID, honouring the request's NameIDPolicy and the

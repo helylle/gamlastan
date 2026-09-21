@@ -94,6 +94,7 @@ type ValueRestriction = Option<Vec<Regex>>;
 pub struct PolicyEntry {
     attribute_restrictions: Option<HashMap<String, ValueRestriction>>,
     lifetime: Option<TimeDelta>,
+    session_lifetime: Option<TimeDelta>,
     nameid_format: Option<String>,
     name_form: Option<String>,
     sign: Option<SignTargets>,
@@ -139,9 +140,19 @@ impl PolicyEntry {
         Ok(self)
     }
 
-    /// Set the assertion lifetime.
+    /// Set the assertion lifetime (`Conditions`/`SubjectConfirmationData`
+    /// `NotOnOrAfter`).
     pub fn with_lifetime(mut self, lifetime: TimeDelta) -> Self {
         self.lifetime = Some(lifetime);
+        self
+    }
+
+    /// Set the SSO session lifetime (`AuthnStatement/@SessionNotOnOrAfter`),
+    /// independent of the assertion lifetime. When unset, falls back to the
+    /// assertion lifetime (see [`ReleasePolicy::session_lifetime`]) rather
+    /// than requiring every deployment to configure both.
+    pub fn with_session_lifetime(mut self, lifetime: TimeDelta) -> Self {
+        self.session_lifetime = Some(lifetime);
         self
     }
 
@@ -370,6 +381,19 @@ impl ReleasePolicy {
     pub fn lifetime(&self, sp_entity_id: &str) -> TimeDelta {
         self.get(sp_entity_id, |e| e.lifetime)
             .unwrap_or_else(|| TimeDelta::hours(1))
+    }
+
+    /// SSO session lifetime for the SP (`AuthnStatement/@SessionNotOnOrAfter`).
+    ///
+    /// Distinct from [`lifetime`](Self::lifetime): the assertion's own
+    /// validity window is typically short-lived, while the SSO session it
+    /// establishes is usually meant to outlive any one assertion (E79).
+    /// Falls back to [`lifetime`](Self::lifetime) when no session lifetime is
+    /// configured, so a deployment that hasn't set one keeps today's
+    /// behaviour rather than getting an unexpectedly short session.
+    pub fn session_lifetime(&self, sp_entity_id: &str) -> TimeDelta {
+        self.get(sp_entity_id, |e| e.session_lifetime)
+            .unwrap_or_else(|| self.lifetime(sp_entity_id))
     }
 
     /// Assertion NotOnOrAfter for the SP (pysaml2 `not_on_or_after`).
@@ -954,10 +978,32 @@ mod tests {
             policy.lifetime("https://sp.example.com"),
             TimeDelta::hours(1)
         );
+        // Unset session lifetime falls back to the assertion lifetime.
+        assert_eq!(
+            policy.session_lifetime("https://sp.example.com"),
+            TimeDelta::hours(1)
+        );
         assert!(policy.fail_on_missing_requested("https://sp.example.com"));
         assert_eq!(
             policy.sign("https://sp.example.com"),
             SignTargets::default()
+        );
+    }
+
+    #[test]
+    fn test_session_lifetime_independent_of_assertion_lifetime() {
+        let policy = ReleasePolicy::with_default(
+            PolicyEntry::new()
+                .with_lifetime(TimeDelta::minutes(5))
+                .with_session_lifetime(TimeDelta::hours(8)),
+        );
+        assert_eq!(
+            policy.lifetime("https://sp.example.com"),
+            TimeDelta::minutes(5)
+        );
+        assert_eq!(
+            policy.session_lifetime("https://sp.example.com"),
+            TimeDelta::hours(8)
         );
     }
 

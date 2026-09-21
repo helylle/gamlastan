@@ -254,6 +254,10 @@ fn response_decisions(config: &IdpConfig) -> ReleasePolicy {
                 TimeDelta::try_seconds(config.assertion_lifetime_seconds as i64)
                     .unwrap_or(TimeDelta::try_minutes(5).unwrap()),
             )
+            .with_session_lifetime(
+                TimeDelta::try_seconds(config.session_lifetime_seconds as i64)
+                    .unwrap_or(TimeDelta::try_hours(8).unwrap()),
+            )
             .with_fail_on_missing_requested(false),
     )
 }

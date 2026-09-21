@@ -222,3 +222,87 @@ fn orchestrated_response_is_accepted_by_the_sp_side() {
         Some(issued.not_on_or_after.timestamp())
     );
 }
+
+#[test]
+fn session_lifetime_is_independent_of_assertion_lifetime() {
+    // With distinct assertion/session lifetimes configured, the SSO session
+    // (AuthnStatement/@SessionNotOnOrAfter) must reflect the session
+    // lifetime, not the assertion's own (much shorter) validity window.
+    let (signer, cert_b64, _cert_der) = fixture_signer_and_certs();
+    let idents = IdentDb::in_memory(IDP);
+    let broker = AuthnBroker::new();
+    let decisions = ReleasePolicy::with_default(
+        PolicyEntry::new()
+            .with_sign(gamlastan::idp::policy::SignTargets {
+                response: true,
+                assertion: true,
+                on_demand: false,
+            })
+            .with_lifetime(chrono::TimeDelta::minutes(5))
+            .with_session_lifetime(chrono::TimeDelta::hours(8)),
+    );
+
+    let engine = ResponseEngine {
+        idp_entity_id: IDP,
+        decisions: &decisions,
+        release: &decisions,
+        idents: &idents,
+        broker: &broker,
+        assertions: None,
+        signer: &signer,
+        cert_der_b64: &cert_b64,
+    };
+    let params = ResponseParams {
+        processed: processed(),
+        sp_sso: sp_sso(),
+        sp_entity: None,
+    };
+
+    let outcome = create_authn_response(&engine, &params, &subject()).expect("no config fault");
+    let issued = match outcome {
+        ResponseOutcome::Issued(issued) => issued,
+        other => panic!("expected Issued, got {other:?}"),
+    };
+
+    let doc = parse_secure(&issued.xml).expect("orchestrated XML must be well-formed");
+    let response = parse_saml::<ResponseRef>(&doc)
+        .expect("orchestrated XML must deserialize as a Response")
+        .to_owned();
+    let verified_signed_ids: Vec<&str> = [
+        Some(issued.response_id.as_str()),
+        issued.assertion_id.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    let config = SecurityConfig {
+        require_signed_responses: true,
+        ..SecurityConfig::default()
+    };
+    let replay_cache = InMemoryReplayCache::default();
+    let result = process_response_with_verified_signatures(
+        &response,
+        &config,
+        &replay_cache,
+        SP,
+        ACS,
+        Some(REQUEST_ID),
+        IDP,
+        &verified_signed_ids,
+        Utc::now(),
+    )
+    .expect("the SP-side path must accept a response the engine itself issued");
+
+    let session_not_on_or_after = result
+        .session_not_on_or_after
+        .expect("session lifetime must be set");
+    // The assertion's own NotOnOrAfter (5 min) must be much shorter than the
+    // session's (8h) - specifically, the session must outlive the assertion
+    // by roughly the 8h - 5min difference between the two configured
+    // lifetimes, not be equal to it.
+    let delta = session_not_on_or_after - issued.not_on_or_after;
+    assert!(
+        delta > chrono::TimeDelta::hours(7),
+        "session lifetime did not outlive the assertion lifetime as configured: delta={delta:?}"
+    );
+}

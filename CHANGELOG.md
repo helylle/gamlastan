@@ -30,6 +30,10 @@ where needed to correct protocol handling.
 - Added `ProcessedAuthnRequest::requested_sp_name_qualifier`, extracted from
   the request's `NameIDPolicy/@SPNameQualifier`, so `IdentDb::construct_nameid`
   can honour it instead of always falling back to the SP entity ID.
+- Added `PolicyEntry::with_session_lifetime` / `ReleasePolicy::session_lifetime`,
+  separate from the existing assertion `lifetime`, so `AuthnStatement/@SessionNotOnOrAfter`
+  no longer has to collapse to the (typically much shorter) assertion validity
+  window. Falls back to the assertion lifetime when unset.
 
 ### Changed
 

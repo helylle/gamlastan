@@ -237,10 +237,14 @@ pub fn create_authn_response<S: IdentityStore>(
         return denied(engine, params, &Denial::NoAuthnContext);
     }
 
-    // 6. Build the response options.
+    // 6. Build the response options. Assertion and session lifetimes are
+    //    independent: the assertion's own validity window is typically
+    //    short, while the SSO session it establishes is usually meant to
+    //    outlive any one assertion (E79).
     let now = Utc::now();
     let lifetime = engine.decisions.lifetime(&processed.sp_entity_id);
-    let session_not_on_or_after = Some(now + lifetime);
+    let session_lifetime = engine.decisions.session_lifetime(&processed.sp_entity_id);
+    let session_not_on_or_after = Some(now + session_lifetime);
     let options = ResponseOptions {
         idp_entity_id: engine.idp_entity_id.to_string(),
         in_response_to: Some(processed.request_id.clone()),

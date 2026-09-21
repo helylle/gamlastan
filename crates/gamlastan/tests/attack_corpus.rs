@@ -485,8 +485,14 @@ mod orchestrator_attacks {
         ));
     }
 
-    /// An attacker-controlled `SPNameQualifier` carrying XML metacharacters
-    /// must be escaped in the signed response, never spliced in as raw markup.
+    /// An SPNameQualifier carrying XML metacharacters must be escaped in the
+    /// signed response, never spliced in as raw markup - covered here for
+    /// the one case such a value can still reach the response at all: it
+    /// equals the requester's own (verified) entity ID, which is otherwise
+    /// a free-form string. A qualifier naming a *different* entity is
+    /// rejected outright before response assembly (see
+    /// `sp_name_qualifier_for_a_different_entity_is_denied` in
+    /// `idp::orchestrator::tests`), so it's not this test's concern.
     #[test]
     fn sp_name_qualifier_injection_is_escaped_not_executed() {
         let idents = IdentDb::in_memory(IDP);
@@ -496,7 +502,7 @@ mod orchestrator_attacks {
         let engine = engine(&idents, &broker, &decisions, &signer);
 
         const PAYLOAD: &str = "evil\"><saml:Evil xmlns:saml=\"x\"/>";
-        let mut request = processed(SP);
+        let mut request = processed(PAYLOAD);
         request.has_name_id_policy = true;
         request.requested_name_id_format = Some(constants::NAMEID_TRANSIENT.to_string());
         request.requested_sp_name_qualifier = Some(PAYLOAD.to_string());

@@ -119,15 +119,37 @@ where needed to correct protocol handling.
   here). Added `AuthnBroker::allow_exact_level_matching` to opt back into the
   looser, pysaml2-compatible behavior.
 - `IdentityStore` gained a provided `compare_and_swap` method (not a breaking
-  addition - existing implementors compile unchanged), used by
-  `IdentDb::get_nameid`/`construct_nameid`'s persistent-format path to close
-  a check-then-create race: two concurrent requests for the same (user, SP)
-  could previously both observe no existing association and each mint a
-  *different* persistent identifier. The default implementation is a plain
-  `get`+`set` and is **not** itself atomic; `InMemoryIdentityStore` overrides
-  it with a single mutex-guarded compare-and-swap. A custom multi-instance
-  backend (Redis/SQL) should override it too, with a real atomic operation,
-  to actually close the race.
+  addition - existing implementors compile unchanged), used to close a
+  check-then-create race on a user's forward NameID list: two concurrent
+  requests for the same (user, SP) could previously both observe no existing
+  persistent association and each mint a *different* persistent identifier,
+  and separately, any two concurrent writers of the same forward list (e.g.
+  a persistent mint racing a transient/email issuance, or a removal) could
+  silently drop one writer's update even if that writer's own operation was
+  individually atomic. Every forward-list mutation
+  (`IdentDb::store`/`get_or_create_persistent`/`remove_remote`) now goes
+  through `compare_and_swap` against the same key, with a retry loop. The
+  default implementation is a plain `get`+`set` and is **not** itself atomic;
+  `InMemoryIdentityStore` overrides it with a single mutex-guarded
+  compare-and-swap. A custom multi-instance backend (Redis/SQL) should
+  override it too, with a real atomic operation, to actually close the race.
+- `idp::orchestrator`'s NameIDPolicy handling only honours
+  `NameIDPolicy/@SPNameQualifier` when it equals the requester's own
+  (verified) entity ID. Per saml-core-2.0-os 8.3.7, SPNameQualifier may
+  legitimately name an affiliation the requester belongs to, but only when
+  the IdP can verify that membership (`AffiliationDescriptor`), which this
+  crate does not implement; honouring an arbitrary requester-supplied value
+  would let one SP request another SP's persistent identifier for the same
+  subject just by naming it, defeating pairwise-identifier scoping. A
+  request naming a different entity is denied with `InvalidNameIdPolicy`.
+- `idp::orchestrator::check_request`/`create_authn_response` now treat a
+  session's `authn_instant + session_lifetime` as its real, absolute expiry:
+  `check_request` refuses to reuse a session past that point (previously it
+  only checked `ForceAuthn` and method satisfaction), and the assertion's
+  `AuthnStatement/@SessionNotOnOrAfter` on reuse is derived from the
+  session's original `authn_instant`, not `now` - otherwise every reused
+  session pushed its own absolute cap further out on each SSO hop, turning
+  it into an unbounded sliding window in practice.
 
 ## [0.9.0] - 2026-09-03
 

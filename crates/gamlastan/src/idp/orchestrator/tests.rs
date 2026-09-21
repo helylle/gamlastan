@@ -191,6 +191,61 @@ fn reusable_session_is_reused() {
 }
 
 #[test]
+fn expired_session_is_not_reused() {
+    // Regression: check_request only checked ForceAuthn and method
+    // satisfaction, never whether the session's own absolute expiry
+    // (authn_instant + session_lifetime) had already passed - so a session
+    // could be reused indefinitely regardless of how long ago it was
+    // actually established.
+    let decisions = ReleasePolicy::with_default(
+        crate::idp::policy::PolicyEntry::new().with_session_lifetime(TimeDelta::minutes(30)),
+    );
+    let engine = engine_with_decisions(&decisions);
+    let p = params(processed(
+        false,
+        false,
+        vec![PASSWORD],
+        Some(AuthnContextComparison::Exact),
+    ));
+    let mut s = session(AuthnMethodRef::Inline {
+        class_ref: PASSWORD.to_string(),
+        authn_authority: None,
+    });
+    s.authn_instant = Utc::now() - TimeDelta::hours(1);
+    let d = check_request(&engine, &p, Some(&s));
+    assert!(
+        matches!(d, Disposition::Authenticate { .. }),
+        "an expired session must not be reused: {d:?}"
+    );
+}
+
+#[test]
+fn expired_session_plus_passive_denies_no_passive() {
+    let decisions = ReleasePolicy::with_default(
+        crate::idp::policy::PolicyEntry::new().with_session_lifetime(TimeDelta::minutes(30)),
+    );
+    let engine = engine_with_decisions(&decisions);
+    let p = params(processed(
+        false,
+        true,
+        vec![PASSWORD],
+        Some(AuthnContextComparison::Exact),
+    ));
+    let mut s = session(AuthnMethodRef::Inline {
+        class_ref: PASSWORD.to_string(),
+        authn_authority: None,
+    });
+    s.authn_instant = Utc::now() - TimeDelta::hours(1);
+    let d = check_request(&engine, &p, Some(&s));
+    assert!(matches!(
+        d,
+        Disposition::Deny {
+            denial: crate::idp::orchestrator::Denial::NoPassive
+        }
+    ));
+}
+
+#[test]
 fn force_authn_defeats_session_reuse() {
     let engine = engine();
     // ForceAuthn set: the session must not be reused even though it satisfies
@@ -709,6 +764,59 @@ fn create_authn_response_issues_when_method_satisfies_the_request() {
 }
 
 #[test]
+fn reused_session_asserts_its_original_absolute_expiry_not_a_sliding_one() {
+    // Regression: SessionNotOnOrAfter was computed as `now + session_lifetime`
+    // unconditionally, so reusing an old session pushed its asserted expiry
+    // further out on every single-sign-on hop - an absolute cap on paper,
+    // but an indefinitely-renewable sliding window in practice. It must be
+    // derived from the subject's actual authn_instant (the original
+    // authentication time on reuse; "now" for a fresh login) instead.
+    use crate::xml::{parse_saml, parse_secure};
+
+    let decisions = ReleasePolicy::with_default(
+        crate::idp::policy::PolicyEntry::new().with_session_lifetime(TimeDelta::hours(8)),
+    );
+    let engine = engine_with_decisions(&decisions);
+    let p = params(processed(false, false, vec![], None));
+
+    let original_authn_instant = Utc::now() - TimeDelta::hours(7);
+    let subject = crate::idp::orchestrator::AuthenticatedSubject {
+        subject_id: "alice".to_string(),
+        attributes: vec![mail_attribute()],
+        authn_method: AuthnMethodRef::Inline {
+            class_ref: PASSWORD.to_string(),
+            authn_authority: None,
+        },
+        authn_instant: Some(original_authn_instant),
+        session_index: Some("_sess_1".to_string()),
+    };
+
+    let outcome = create_authn_response(&engine, &p, &subject).unwrap();
+    let issued = match outcome {
+        ResponseOutcome::Issued(issued) => issued,
+        other => panic!("expected Issued, got {other:?}"),
+    };
+
+    let doc = parse_secure(&issued.xml).unwrap();
+    let response = parse_saml::<crate::core::protocol::response::ResponseRef>(&doc)
+        .unwrap()
+        .to_owned();
+    let statement = &response.assertions[0].authn_statements[0];
+    let session_not_on_or_after = statement.session_not_on_or_after.expect("set");
+
+    // Expected: original_authn_instant + 8h, NOT now + 8h.
+    let expected = original_authn_instant + TimeDelta::hours(8);
+    let delta = (session_not_on_or_after - expected)
+        .num_milliseconds()
+        .abs();
+    assert!(
+        delta < 1000,
+        "session_not_on_or_after {session_not_on_or_after} should be ~{expected} \
+         (original authn_instant + session_lifetime), not derived from now"
+    );
+}
+
+#[test]
 fn issued_not_on_or_after_matches_the_wire_assertion_lifetime() {
     // Regression: the assertion's wire NotOnOrAfter is built from a
     // normalized (whole-second, non-negative) lifetime
@@ -862,22 +970,44 @@ fn processed_with_name_id_policy(
 }
 
 #[test]
-fn sp_name_qualifier_honoured_over_sp_entity_id() {
-    let engine = engine();
+fn sp_name_qualifier_for_a_different_entity_is_denied() {
+    // Regression: SPNameQualifier legitimately names an affiliation the
+    // requester belongs to (saml-core-2.0-os 8.3.7), but only when the IdP
+    // can verify that membership (AffiliationDescriptor), which this crate
+    // does not implement. Honouring an arbitrary SPNameQualifier would let
+    // SP A request SP B's persistent identifier for the same subject just
+    // by setting NameIDPolicy/@SPNameQualifier to SP B's entity ID.
+    let decisions = ReleasePolicy::new();
+    let engine = engine_with_decisions(&decisions);
     let p = params(processed_with_name_id_policy(
         Some(constants::NAMEID_TRANSIENT),
         Some("https://requester.example.org"),
         true,
     ));
     let outcome = create_authn_response(&engine, &p, &subject_without_mail()).unwrap();
+    assert!(matches!(
+        outcome,
+        ResponseOutcome::Denied {
+            denial: crate::idp::orchestrator::Denial::InvalidNameIdPolicy,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn sp_name_qualifier_matching_the_requester_is_honoured() {
+    // The spec-legal, harmless case: SPNameQualifier explicitly set to the
+    // requester's own entity ID (redundant, but not a cross-SP claim).
+    let engine = engine();
+    let p = params(processed_with_name_id_policy(
+        Some(constants::NAMEID_TRANSIENT),
+        Some(SP),
+        true,
+    ));
+    let outcome = create_authn_response(&engine, &p, &subject_without_mail()).unwrap();
     match outcome {
         ResponseOutcome::Issued(issued) => {
-            // The policy's explicit SPNameQualifier wins over the SP entity ID
-            // the request actually came from.
-            assert_eq!(
-                issued.name_id.sp_name_qualifier.as_deref(),
-                Some("https://requester.example.org")
-            );
+            assert_eq!(issued.name_id.sp_name_qualifier.as_deref(), Some(SP));
         }
         other => panic!("expected Issued, got {other:?}"),
     }

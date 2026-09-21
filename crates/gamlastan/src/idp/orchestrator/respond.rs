@@ -84,11 +84,18 @@ pub fn check_request(
     let processed = &params.processed;
     let requested = params.requested_authn_context();
     let picked = engine.broker.pick(requested.as_ref());
+    let session_lifetime = engine.decisions.session_lifetime(&processed.sp_entity_id);
+    let now = Utc::now();
 
-    // A reusable session is one that exists, is not defeated by ForceAuthn, and
-    // whose establishing method satisfies the requested context.
+    // A reusable session is one that exists, has not passed its own absolute
+    // expiry (authn_instant + session_lifetime - independent of whatever
+    // SessionNotOnOrAfter a *previous* response asserted, which must not
+    // extend this), is not defeated by ForceAuthn, and whose establishing
+    // method satisfies the requested context.
     let reusable = session.filter(|s| {
-        !processed.force_authn && session_satisfies(engine.broker, requested.as_ref(), s)
+        now < s.authn_instant + session_lifetime
+            && !processed.force_authn
+            && session_satisfies(engine.broker, requested.as_ref(), s)
     });
 
     if processed.is_passive {
@@ -277,7 +284,12 @@ pub fn create_authn_response(
     let lifetime = engine.decisions.lifetime(&processed.sp_entity_id);
     let assertion_lifetime_seconds = lifetime.num_seconds().max(0) as u64;
     let session_lifetime = engine.decisions.session_lifetime(&processed.sp_entity_id);
-    let session_not_on_or_after = Some(now + session_lifetime);
+    // Derived from the subject's actual authn_instant (the original
+    // authentication time for a reused session; "now" for a fresh one), not
+    // from "now" unconditionally - otherwise reusing a session pushes its
+    // absolute expiry further out on every response, turning a fixed cap
+    // into an indefinitely-sliding window.
+    let session_not_on_or_after = Some(subject.authn_instant.unwrap_or(now) + session_lifetime);
     let options = ResponseOptions {
         idp_entity_id: engine.idp_entity_id.to_string(),
         in_response_to: Some(processed.request_id.clone()),
@@ -421,6 +433,24 @@ fn construct_name_id(
     subject: &AuthenticatedSubject,
 ) -> Result<NameId, Denial> {
     let policy = params.name_id_policy();
+
+    // Per saml-core-2.0-os 8.3.7, SPNameQualifier names "the service
+    // provider or affiliation of providers for whom the identifier was
+    // generated" - it may legitimately differ from the requester only when
+    // the requester is a verified member of that affiliation
+    // (AffiliationDescriptor). This crate does not implement affiliation
+    // membership verification, so honouring an attacker-supplied qualifier
+    // for a *different* entity would let SP A request SP B's persistent
+    // identifier for the same subject by simply setting
+    // NameIDPolicy/@SPNameQualifier to SP B's entity ID - defeating
+    // pairwise-identifier scoping. Reject any qualifier other than the
+    // requester's own (verified) entity ID.
+    if let Some(spq) = policy.as_ref().and_then(|p| p.sp_name_qualifier.as_deref()) {
+        if spq != params.processed.sp_entity_id {
+            return Err(Denial::InvalidNameIdPolicy);
+        }
+    }
+
     let default_format = engine
         .decisions
         .nameid_format(&params.processed.sp_entity_id);

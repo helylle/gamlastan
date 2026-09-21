@@ -17,8 +17,16 @@
 // IdentDb — not the user's literal email address, even when the requested
 // format is "email address". A real, human-readable value (the released
 // `email`/`uid`/`givenName`/`sn` attributes) is always available separately
-// in the AttributeStatement; an SP that needs to recognize a returning user
-// should match on that attribute, not on the NameID value.
+// in the AttributeStatement.
+//
+// Which one an SP should match a returning user on depends on the NameID's
+// format: a `transient` NameID is a fresh, unlinkable value every session
+// and must never be used to recognize a returning user - match on an
+// attribute instead. A `persistent` NameID is the opposite: it is
+// deliberately *stable* per (user, SP) precisely so an SP can recognize a
+// returning subject without being handed a reassignable identifier like
+// email - matching on the persistent NameID is the safe choice there, since
+// a mutable attribute can later be reassigned to a different real person.
 //
 // SP_METADATA_PATH may point at a single SP metadata file or a directory of
 // *.xml files; in the directory case every file is loaded as a trusted SP, so

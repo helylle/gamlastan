@@ -250,11 +250,24 @@ impl<S: IdentityStore> IdentDb<S> {
         format!("{REVERSE_PREFIX}{value}")
     }
 
+    /// Split a forward entry's stored value into its coded NameID entries,
+    /// filtering out empty segments so the empty-string sentinel a CAS-based
+    /// removal can leave behind (see [`Self::remove_forward_entry`]) reads
+    /// back as "no entries", not a phantom entry.
+    fn forward_entries(joined: &str) -> Vec<&str> {
+        joined.split(' ').filter(|s| !s.is_empty()).collect()
+    }
+
     /// All NameIDs stored for a local user.
     pub fn name_ids_for(&self, user_id: &str) -> Vec<NameId> {
         self.store
             .get(&Self::forward_key(user_id))
-            .map(|joined| joined.split(' ').map(decode_name_id).collect())
+            .map(|joined| {
+                Self::forward_entries(&joined)
+                    .into_iter()
+                    .map(decode_name_id)
+                    .collect()
+            })
             .unwrap_or_default()
     }
 
@@ -264,18 +277,46 @@ impl<S: IdentityStore> IdentDb<S> {
     /// NameID value -> user (reverse, used by `find_local_id`).
     pub fn store(&self, user_id: &str, name_id: &NameId) {
         let coded = code_name_id(name_id);
-        let key = Self::forward_key(user_id);
-        let mut entries: Vec<String> = self
-            .store
-            .get(&key)
-            .map(|joined| joined.split(' ').map(str::to_string).collect())
-            .unwrap_or_default();
-        if !entries.contains(&coded) {
-            entries.push(coded);
-        }
-        self.store.set(&key, entries.join(" "));
+        self.append_forward_entry(user_id, &coded);
         self.store
             .set(&Self::reverse_key(&name_id.value), user_id.to_string());
+    }
+
+    /// Atomically append `coded` to a user's forward entry, retrying on CAS
+    /// conflict.
+    ///
+    /// Every writer of the forward key (this, and the persistent-NameID
+    /// get-or-create loop) must go through `compare_and_swap` against the
+    /// *same* key, or two writers can still race: one reads the old list,
+    /// the other's plain `get`+`set` (or CAS) commits first, and the first
+    /// then overwrites that committed entry with its own stale-based
+    /// value - silently dropping whichever entry lost the race, independent
+    /// of whether either individual writer was itself "atomic".
+    fn append_forward_entry(&self, user_id: &str, coded: &str) {
+        let key = Self::forward_key(user_id);
+        loop {
+            let current = self.store.get(&key);
+            let mut entries: Vec<String> = current
+                .as_deref()
+                .map(|joined| {
+                    Self::forward_entries(joined)
+                        .into_iter()
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default();
+            if entries.iter().any(|e| e == coded) {
+                return;
+            }
+            entries.push(coded.to_string());
+            let new_value = entries.join(" ");
+            if self
+                .store
+                .compare_and_swap(&key, current.as_deref(), &new_value)
+            {
+                return;
+            }
+        }
     }
 
     /// The local user a NameID was issued to (pysaml2 `find_local_id()`).
@@ -399,7 +440,12 @@ impl<S: IdentityStore> IdentDb<S> {
             let current = self.store.get(&key);
             let entries: Vec<String> = current
                 .as_deref()
-                .map(|joined| joined.split(' ').map(str::to_string).collect())
+                .map(|joined| {
+                    Self::forward_entries(joined)
+                        .into_iter()
+                        .map(str::to_string)
+                        .collect()
+                })
                 .unwrap_or_default();
 
             if let Some(existing) = entries.iter().map(|e| decode_name_id(e)).find(|nid| {
@@ -510,17 +556,41 @@ impl<S: IdentityStore> IdentDb<S> {
     pub fn remove_remote(&self, name_id: &NameId) {
         let coded = code_name_id(name_id);
         if let Some(user_id) = self.find_local_id(name_id) {
-            let key = Self::forward_key(&user_id);
-            if let Some(joined) = self.store.get(&key) {
-                let remaining: Vec<&str> = joined.split(' ').filter(|c| *c != coded).collect();
-                if remaining.is_empty() {
-                    self.store.remove(&key);
-                } else {
-                    self.store.set(&key, remaining.join(" "));
-                }
-            }
+            self.remove_forward_entry(&user_id, &coded);
         }
         self.store.remove(&Self::reverse_key(&name_id.value));
+    }
+
+    /// Atomically remove `coded` from a user's forward entry, retrying on
+    /// CAS conflict. See [`Self::append_forward_entry`] for why this must
+    /// go through `compare_and_swap` rather than a plain `get`+`set`.
+    ///
+    /// When removal empties the entry, this CASes to `""` rather than
+    /// removing the key outright - a separate, non-atomic `remove` call
+    /// would let a concurrent reader observe a half-updated state, and
+    /// [`Self::forward_entries`] treats `""` identically to an absent key.
+    fn remove_forward_entry(&self, user_id: &str, coded: &str) {
+        let key = Self::forward_key(user_id);
+        loop {
+            let Some(current) = self.store.get(&key) else {
+                return;
+            };
+            let remaining = Self::forward_entries(&current);
+            if !remaining.contains(&coded) {
+                return;
+            }
+            let new_value = remaining
+                .into_iter()
+                .filter(|c| *c != coded)
+                .collect::<Vec<_>>()
+                .join(" ");
+            if self
+                .store
+                .compare_and_swap(&key, Some(&current), &new_value)
+            {
+                return;
+            }
+        }
     }
 
     /// Forget every NameID for a local user (pysaml2 `remove_local()`).
@@ -836,6 +906,57 @@ mod tests {
             .filter(|nid| nid.format.as_deref() == Some(constants::NAMEID_PERSISTENT))
             .collect();
         assert_eq!(persistent_entries.len(), 1);
+    }
+
+    #[test]
+    fn concurrent_persistent_and_transient_issuance_do_not_clobber_each_other() {
+        // Regression: get_or_create_persistent's CAS loop only coordinated
+        // with other CAS writers on the forward key; store() (used for
+        // transient/email/etc.) still did a plain get-then-set on that same
+        // key. A store() write could read the list before the persistent
+        // CAS committed and then overwrite it with a stale value, silently
+        // dropping the persistent entry even though its own CAS "succeeded".
+        // Both paths now go through the same compare_and_swap-based retry.
+        use std::sync::Arc;
+        use std::thread;
+
+        let db = Arc::new(db());
+        let mut threads = Vec::new();
+        for _ in 0..8 {
+            let db = Arc::clone(&db);
+            threads.push(thread::spawn(move || {
+                db.persistent_nameid("alice", Some(SP));
+            }));
+        }
+        for i in 0..8 {
+            let db = Arc::clone(&db);
+            threads.push(thread::spawn(move || {
+                db.transient_nameid("alice", Some(&format!("{SP}/{i}")));
+            }));
+        }
+        for t in threads {
+            t.join().unwrap();
+        }
+
+        let entries = db.name_ids_for("alice");
+        let persistent: Vec<_> = entries
+            .iter()
+            .filter(|nid| nid.format.as_deref() == Some(constants::NAMEID_PERSISTENT))
+            .collect();
+        let transient: Vec<_> = entries
+            .iter()
+            .filter(|nid| nid.format.as_deref() == Some(constants::NAMEID_TRANSIENT))
+            .collect();
+        assert_eq!(
+            persistent.len(),
+            1,
+            "persistent entry must survive: {entries:?}"
+        );
+        assert_eq!(
+            transient.len(),
+            8,
+            "every transient issuance must survive: {entries:?}"
+        );
     }
 
     #[test]

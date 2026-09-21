@@ -133,11 +133,11 @@ impl ResponseParams {
 
     /// The SP's `subject-id:req` metadata signal.
     pub fn subject_id_req(&self) -> crate::idp::entity_category::SubjectIdReq {
-        use crate::idp::entity_category::SubjectIdReq;
+        use crate::idp::entity_category::{SubjectIdReq, SUBJECT_ID_REQ_ATTR};
         self.sp_entity
             .as_ref()
             .map(|e| {
-                SubjectIdReq::from_metadata_values(&e.entity_attribute_values("subject-id:req"))
+                SubjectIdReq::from_metadata_values(&e.entity_attribute_values(SUBJECT_ID_REQ_ATTR))
             })
             .unwrap_or_default()
     }

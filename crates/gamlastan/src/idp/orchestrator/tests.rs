@@ -683,6 +683,52 @@ fn create_authn_response_issues_when_method_satisfies_the_request() {
     assert!(matches!(outcome, ResponseOutcome::Issued(_)));
 }
 
+// ── ResponseParams metadata signals ──────────────────────────────────────────
+
+#[test]
+fn subject_id_req_reads_the_full_metadata_attribute_name() {
+    // Regression: the SP metadata attribute Name is the full URI
+    // (SUBJECT_ID_REQ_ATTR), not the short label "subject-id:req". Looking
+    // up the short label can never match, so this signal would always read
+    // as SubjectIdReq::None regardless of what the SP actually published.
+    use crate::metadata::types::entity_descriptor::{EntityDescriptor, EntityRoles};
+    use crate::metadata::types::extensions::Extensions;
+
+    let entity = EntityDescriptor {
+        entity_id: SP.to_string(),
+        id: None,
+        valid_until: None,
+        cache_duration: None,
+        has_signature: false,
+        extensions: Some(Extensions::new(format!(
+            r#"<mdattr:EntityAttributes xmlns:mdattr="urn:oasis:names:tc:SAML:metadata:attribute"
+                xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion">
+              <saml:Attribute Name="{}">
+                <saml:AttributeValue>any</saml:AttributeValue>
+              </saml:Attribute>
+            </mdattr:EntityAttributes>"#,
+            crate::idp::entity_category::SUBJECT_ID_REQ_ATTR
+        ))),
+        roles: EntityRoles::Roles {
+            idp_sso: vec![],
+            sp_sso: vec![],
+            authn_authority: vec![],
+            attr_authority: vec![],
+            pdp: vec![],
+        },
+        organization: None,
+        contact_persons: vec![],
+        additional_metadata_locations: vec![],
+    };
+
+    let mut p = params(processed(false, false, vec![], None));
+    p.sp_entity = Some(entity);
+    assert_eq!(
+        p.subject_id_req(),
+        crate::idp::entity_category::SubjectIdReq::Any
+    );
+}
+
 // ── ResponseEngine over a non-default IdentityStore ─────────────────────────
 
 /// A distinct `IdentityStore` impl (not `InMemoryIdentityStore`) — stands in

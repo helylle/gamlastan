@@ -4,13 +4,17 @@
 // Methods are registered with an AuthnContext class ref, an opaque
 // method identifier (URL, handler name, ...) and a numeric security
 // level. `pick()` honors the request's Comparison attribute:
-// - exact:   methods at exactly the level of the requested class
+// - exact:   methods whose class ref is literally one of the requested
+//            ones (saml-core-2.0-os 3.3.2.2.1), unless
+//            `AuthnBroker::allow_exact_level_matching` restores pysaml2's looser,
+//            level-based "exact" (see that method's docs)
 // - minimum: methods at that level or higher
 // - maximum: methods at that level or lower
 // - better:  methods at a strictly higher level
 //
-// Matching is level-based across *all* registered methods, seeded by the
-// level registered for the requested class ref — pysaml2 semantics.
+// Minimum/maximum/better matching is level-based across *all* registered
+// methods, seeded by the level registered for the requested class ref —
+// pysaml2 semantics.
 
 use crate::core::constants;
 use crate::core::protocol::request::{AuthnContextComparison, RequestedAuthnContext};
@@ -36,12 +40,31 @@ pub struct AuthnMethod {
 pub struct AuthnBroker {
     methods: Vec<AuthnMethod>,
     next: usize,
+    /// pysaml2-compatibility switch for `exact` matching. Default `false`
+    /// (the secure, spec-compliant default): per saml-core-2.0-os
+    /// 3.3.2.2.1, `Comparison="exact"` requires the resulting AuthnContext
+    /// to be a literal match of one of the requested class refs, not just
+    /// registered at the same security level. pysaml2's own `AuthnBroker`
+    /// (and gamlastan's, before this switch) instead broadens "exact" to
+    /// every method at the same level as the requested class, which can
+    /// hand back — and let the orchestrator accept — a class ref the SP
+    /// never listed. Set `true` to restore that looser pysaml2 behaviour.
+    allow_exact_level_matching: bool,
 }
 
 impl AuthnBroker {
     /// Create an empty broker.
     pub fn new() -> Self {
         AuthnBroker::default()
+    }
+
+    /// Restore pysaml2's looser `exact` semantics (matching by security
+    /// level rather than literal class-ref membership). See
+    /// [`AuthnBroker`]'s field docs for why the default (`false`) differs
+    /// from pysaml2.
+    pub fn allow_exact_level_matching(mut self, enable: bool) -> Self {
+        self.allow_exact_level_matching = enable;
+        self
     }
 
     /// Register an authentication method; returns its unique reference.
@@ -120,6 +143,15 @@ impl AuthnBroker {
             .collect();
         if same_class.is_empty() {
             return vec![];
+        }
+
+        // Per saml-core-2.0-os 3.3.2.2.1, "exact" requires a literal match
+        // of one of the requested class refs - not "same security level as
+        // some method registered under that class ref", which is what the
+        // level-threshold walk below computes. Skip it entirely unless
+        // pysaml2 compat is requested.
+        if comparison == AuthnContextComparison::Exact && !self.allow_exact_level_matching {
+            return same_class;
         }
 
         // Seed level: the strongest level satisfying the comparison among
@@ -226,8 +258,24 @@ mod tests {
     }
 
     #[test]
-    fn test_exact_includes_same_level_other_class() {
+    fn test_exact_excludes_same_level_other_class_by_default() {
+        // Per saml-core-2.0-os 3.3.2.2.1, "exact" must be a literal match of
+        // a requested class ref: a method at the same security level but a
+        // different, unrequested class ref must not be offered.
         let mut b = broker();
+        b.add("urn:example:otp", "/login/otp", 2, None);
+        let picked = b.pick(Some(&requested(
+            &[constants::AUTHN_CONTEXT_PASSWORD_PROTECTED_TRANSPORT],
+            AuthnContextComparison::Exact,
+        )));
+        let methods: Vec<_> = picked.iter().map(|m| m.method.as_str()).collect();
+        assert_eq!(methods, vec!["/login/ppt"]);
+    }
+
+    #[test]
+    fn test_exact_includes_same_level_other_class_with_pysaml2_compat() {
+        // The opt-in restores pysaml2's own (spec-noncompliant) broadening.
+        let mut b = broker().allow_exact_level_matching(true);
         b.add("urn:example:otp", "/login/otp", 2, None);
         let picked = b.pick(Some(&requested(
             &[constants::AUTHN_CONTEXT_PASSWORD_PROTECTED_TRANSPORT],

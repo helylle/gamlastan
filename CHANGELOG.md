@@ -111,6 +111,13 @@ where needed to correct protocol handling.
   Mongo-backed `IdentMDB.match_local_id`, which filters on
   `name_id.format == NAMEID_FORMAT_PERSISTENT` explicitly, rather than
   pysaml2's looser shelve-backed base `IdentDB`.
+- **Breaking:** `AuthnBroker::pick` with `Comparison="exact"` now requires a
+  literal match of one of the requested `AuthnContextClassRef` values, per
+  saml-core-2.0-os 3.3.2.2.1, instead of broadening to every method
+  registered at the same security level as the requested class (pysaml2's
+  own `AuthnBroker` has the same broadening; gamlastan diverges from it
+  here). Added `AuthnBroker::allow_exact_level_matching` to opt back into the
+  looser, pysaml2-compatible behavior.
 
 ## [0.9.0] - 2026-09-03
 

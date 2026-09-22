@@ -167,6 +167,20 @@ fn class_ref_satisfies(
     let Some(requested) = requested else {
         return true;
     };
+    // For "exact", satisfaction is a literal match against the requested
+    // class refs (saml-core-2.0-os 3.3.2.2.1) - it does not depend on the
+    // broker having a registration for this class ref at all.
+    // AuthnMethodRef::Inline is documented as usable without any broker
+    // registration; consulting broker.pick() here would reject such a
+    // method purely because pick_by_class_ref's exact branch only considers
+    // methods registered under that class ref, incorrectly rejecting an
+    // otherwise-exact-matching inline method.
+    if requested.comparison == crate::core::protocol::request::AuthnContextComparison::Exact {
+        return requested
+            .authn_context_class_refs
+            .iter()
+            .any(|c| c == class_ref);
+    }
     broker
         .pick(Some(requested))
         .iter()

@@ -229,6 +229,48 @@ fn session_with_unregistered_inline_class_ref_is_reused_when_nothing_requested()
 }
 
 #[test]
+fn exact_request_for_an_unregistered_inline_class_ref_is_satisfied_by_literal_match() {
+    // Regression: AuthnMethodRef::Inline is documented as usable without any
+    // broker registration, but Exact satisfaction was checked via
+    // broker.pick(), and pick_by_class_ref's exact branch only considers
+    // methods registered under that exact class ref - an inline method
+    // whose class ref was never registered in the broker at all was
+    // rejected even when it was a literal, exact match for the request.
+    let decisions = ReleasePolicy::new();
+    let idents = IdentDb::in_memory(IDP);
+    let broker = AuthnBroker::new(); // deliberately empty - no registrations
+    let signer = SamlSigner::new(KeysManager::new());
+    let engine = ResponseEngine {
+        idp_entity_id: IDP,
+        decisions: &decisions,
+        release: &PassThroughRelease,
+        idents: &idents,
+        broker: &broker,
+        assertions: None,
+        signer: &signer,
+        cert_der_b64: "",
+    };
+
+    let unregistered = "urn:custom:inline-method-never-registered";
+    let p = params(processed(
+        false,
+        false,
+        vec![unregistered],
+        Some(AuthnContextComparison::Exact),
+    ));
+    let s = session(AuthnMethodRef::Inline {
+        class_ref: unregistered.to_string(),
+        authn_authority: None,
+    });
+    let d = check_request(&engine, &p, Some(&s));
+    assert!(
+        matches!(d, Disposition::ReuseSession { .. }),
+        "an unregistered inline class ref must satisfy an exact request for \
+         that same literal class ref: {d:?}"
+    );
+}
+
+#[test]
 fn expired_session_is_not_reused() {
     // Regression: check_request only checked ForceAuthn and method
     // satisfaction, never whether the session's own absolute expiry
@@ -792,6 +834,36 @@ fn create_authn_response_issues_when_method_satisfies_the_request() {
         attributes: vec![],
         authn_method: AuthnMethodRef::Inline {
             class_ref: X509.to_string(),
+            authn_authority: None,
+        },
+        authn_instant: None,
+        session_index: Some("_sess_1".to_string()),
+    };
+
+    let outcome = create_authn_response(&engine, &p, &subject).unwrap();
+    assert!(matches!(outcome, ResponseOutcome::Issued(_)));
+}
+
+#[test]
+fn create_authn_response_issues_for_an_unregistered_inline_exact_class_ref() {
+    // Regression: the revalidation step (class_ref_satisfies) must accept
+    // an Inline method whose class ref is a literal exact match, even
+    // though it was never registered with the broker - see
+    // exact_request_for_an_unregistered_inline_class_ref_is_satisfied_by_literal_match
+    // for the same fix exercised through check_request instead.
+    let engine = engine(); // broker only has PASSWORD/PPT/X509 registered
+    let unregistered = "urn:custom:inline-method-never-registered";
+    let p = params(processed(
+        false,
+        false,
+        vec![unregistered],
+        Some(AuthnContextComparison::Exact),
+    ));
+    let subject = crate::idp::orchestrator::AuthenticatedSubject {
+        subject_id: "alice".to_string(),
+        attributes: vec![],
+        authn_method: AuthnMethodRef::Inline {
+            class_ref: unregistered.to_string(),
             authn_authority: None,
         },
         authn_instant: None,

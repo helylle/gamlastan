@@ -664,7 +664,18 @@ impl IdpConfig {
         let mut keys = KeysManager::new();
         for sp in &self.trusted_sps {
             for sp_sso in sp.entity.sp_sso_descriptors() {
-                self.add_sp_keys(&mut keys, sp_sso);
+                // A key published only for a non-SAML-2.0 role (e.g. a
+                // legacy SAML 1.1 SPSSODescriptor) must not become trusted
+                // for SAML 2.0 messages - the same protocol scoping
+                // trusted_sp/resolve_trusted_sp already apply when selecting
+                // a single SP's descriptor.
+                if sp_sso
+                    .sso_base
+                    .base
+                    .supports_protocol(gamlastan::core::constants::PROTOCOL_SAML2)
+                {
+                    self.add_sp_keys(&mut keys, sp_sso);
+                }
             }
         }
         self.finish_verifier(keys)
@@ -915,5 +926,66 @@ mod tests {
         config.request_id_tracker.store("_test_id");
         assert!(config.request_id_tracker.consume("_test_id"));
         assert!(!config.request_id_tracker.consume("_test_id"));
+    }
+
+    #[test]
+    fn trusted_sp_verifier_excludes_certs_from_non_saml2_roles() {
+        // Regression: trusted_sp_verifier aggregated signing certificates
+        // from *every* SPSSODescriptor an entity has, including a role
+        // scoped to a different protocol. A key published only for a SAML
+        // 1.1 role must not become trusted for verifying SAML 2.0 messages.
+        use gamlastan::metadata::types::key_descriptor::KeyDescriptor;
+        use gamlastan::metadata::types::role_descriptor::{RoleDescriptorBase, SsoDescriptorBase};
+        use gamlastan::metadata::types::sp::SpSsoDescriptor;
+
+        const SIGN_CERT_PEM: &str =
+            include_str!("../../gamlastan-mdq/tests/fixtures/sign-cert.pem");
+        fn cert_b64(pem: &str) -> String {
+            pem.lines()
+                .filter(|line| !line.contains("CERTIFICATE"))
+                .collect::<String>()
+        }
+        fn sp_sso_for(protocol: &str, with_cert: bool) -> SpSsoDescriptor {
+            let mut base = RoleDescriptorBase::new(vec![protocol.to_string()]);
+            if with_cert {
+                let key_info = format!(
+                    r#"<ds:KeyInfo xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><ds:X509Data><ds:X509Certificate>{}</ds:X509Certificate></ds:X509Data></ds:KeyInfo>"#,
+                    cert_b64(SIGN_CERT_PEM)
+                );
+                base.key_descriptors.push(KeyDescriptor::signing(key_info));
+            }
+            SpSsoDescriptor {
+                sso_base: SsoDescriptorBase {
+                    base,
+                    artifact_resolution_services: vec![],
+                    single_logout_services: vec![],
+                    manage_name_id_services: vec![],
+                    name_id_formats: vec![],
+                },
+                authn_requests_signed: None,
+                want_assertions_signed: Some(true),
+                assertion_consumer_services: vec![],
+                attribute_consuming_services: vec![],
+            }
+        }
+
+        let mut entity = make_dummy_entity_descriptor();
+        entity.entity_id = "https://sp.example.com".to_string();
+        entity.roles = EntityRoles::Roles {
+            idp_sso: vec![],
+            sp_sso: vec![
+                sp_sso_for("urn:oasis:names:tc:SAML:1.1:protocol", true),
+                sp_sso_for("urn:oasis:names:tc:SAML:2.0:protocol", false),
+            ],
+            authn_authority: vec![],
+            attr_authority: vec![],
+            pdp: vec![],
+        };
+        let config = IdpConfig::new("https://idp.example.com", "https://idp.example.com/sso")
+            .with_trusted_sp(entity);
+        assert!(
+            config.trusted_sp_verifier().is_none(),
+            "a cert published only for a non-SAML-2.0 role must not be trusted"
+        );
     }
 }

@@ -27,7 +27,15 @@ where needed to correct protocol handling.
   registered method resolves to `None` rather than falling back to treating
   the opaque reference string itself as the AuthnContext class ref, so a
   stale or mistyped reference can no longer become a bogus
-  `AuthnContextClassRef` in a signed assertion.
+  `AuthnContextClassRef` in a signed assertion. An `AuthnMethodRef::Inline`
+  method (documented as usable without any broker registration) whose
+  class ref is a literal, exact match for the request is accepted even when
+  that class ref was never registered with the `AuthnBroker` -
+  `check_request`'s session-reuse check and `create_authn_response`'s
+  revalidation both check `Comparison="exact"` by literal match against the
+  requested class refs directly, rather than requiring the broker to have a
+  registration for it (which `AuthnBroker::pick`'s exact branch needs, but
+  satisfying an already-resolved method's literal class ref does not).
 - Added `gamlastan-actix`'s `AuthnSubjectCallback`, a higher-level companion
   to the existing `AuthnCallback`, returning an `AuthnSubjectResult` of
   `Authenticated(AuthenticatedSubject) | Redirect(HttpResponse) |
@@ -99,7 +107,11 @@ where needed to correct protocol handling.
   the SAML 2.0 role out of a registered entity's roles (added
   `EntityDescriptor::saml2_sp_sso_descriptor`) is by `protocolSupportEnumeration`,
   not descriptor order, so metadata carrying a non-SAML-2.0 `SPSSODescriptor`
-  before the SAML 2.0 one is resolved correctly.
+  before the SAML 2.0 one is resolved correctly. `IdpConfig::trusted_sp_verifier`
+  (the aggregate verifier built from every registered trusted SP) also now
+  filters each entity's roles by SAML 2.0 protocol support before collecting
+  signing certificates, so a certificate published only for a non-SAML-2.0
+  role can no longer become trusted for verifying SAML 2.0 messages.
 - **Breaking:** `gamlastan-actix`'s `AuthnSubjectCallback` gains a
   `&Disposition` parameter (between the processed request and the
   `HttpRequest`). The SSO handler now calls

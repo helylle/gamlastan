@@ -77,7 +77,14 @@ where needed to correct protocol handling.
   short-lived borrowed `ResponseEngine` from it per request via
   `ResponseEngineParts::engine`. Registering `ResponseEngine<'static>`
   directly would force every dependency to independently satisfy `'static`,
-  which for ordinary application-owned state means leaking it.
+  which for ordinary application-owned state means leaking it. The
+  `/saml/metadata` handler now also accepts `ResponseEngineParts` and
+  prefers its certificate over `IdpSigningContext`/`IdpConfig` when
+  present: previously the metadata handler had no idea `ResponseEngineParts`
+  existed, so registering only it (the documented policy-driven setup, with
+  no `IdpSigningContext`) produced signed responses while metadata
+  advertised no key at all - or a *different* key, if `IdpSigningContext`
+  also happened to be registered with its own certificate.
 
 ### Changed
 

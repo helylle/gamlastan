@@ -323,12 +323,23 @@ pub fn configure_idp(cfg: &mut web::ServiceConfig) {
     .service(web::resource("/saml/metadata").route(web::get().to(idp_metadata)));
 }
 
+/// Resolve the certificate metadata should advertise, from whichever
+/// signing source is actually registered - `ResponseEngineParts` first,
+/// since when it's present it's the source of truth for what the
+/// policy-driven SSO path actually signs responses with; independently
+/// registering `IdpSigningContext`/`IdpConfig` with a *different*
+/// certificate would otherwise let metadata advertise a key that never
+/// signs anything. Falls back to `IdpSigningContext`, then
+/// `IdpConfig::signing_cert_b64`, for deployments using only the low-level
+/// `AuthnCallback` path.
 fn metadata_signing_cert_b64<'a>(
     config: &'a IdpConfig,
     signing_ctx: Option<&'a IdpSigningContext>,
+    response_engine: Option<&'a ResponseEngineParts>,
 ) -> Option<&'a str> {
-    signing_ctx
-        .map(|ctx| ctx.cert_b64.as_str())
+    response_engine
+        .map(|parts| parts.cert_der_b64.as_str())
+        .or_else(|| signing_ctx.map(|ctx| ctx.cert_b64.as_str()))
         .or(config.signing_cert_b64.as_deref())
 }
 
@@ -1241,6 +1252,7 @@ fn authorize_artifact_resolve(
 async fn idp_metadata(
     config: web::Data<IdpConfig>,
     signing_ctx: Option<web::Data<Arc<IdpSigningContext>>>,
+    response_engine: Option<web::Data<Arc<ResponseEngineParts>>>,
 ) -> Result<MetadataXml, SamlActixError> {
     use gamlastan::core::identifiers::SamlId;
     use gamlastan::metadata::types::endpoint::Endpoint;
@@ -1249,11 +1261,15 @@ async fn idp_metadata(
     use gamlastan::metadata::types::key_descriptor::KeyDescriptor;
     use gamlastan::metadata::types::role_descriptor::{RoleDescriptorBase, SsoDescriptorBase};
 
-    // Prefer the active signing context's certificate so metadata stays in sync
-    // with the key that actually signs responses and metadata.
+    // Prefer the active signing source's certificate so metadata stays in sync
+    // with the key that actually signs responses and metadata - see
+    // metadata_signing_cert_b64's doc for the precedence and why it matters.
     let metadata_cert_b64 = metadata_signing_cert_b64(
         config.get_ref(),
         signing_ctx.as_ref().map(|ctx| ctx.get_ref().as_ref()),
+        response_engine
+            .as_ref()
+            .map(|parts| parts.get_ref().as_ref()),
     );
 
     let key_descriptors = if let Some(cert_b64) = metadata_cert_b64 {
@@ -1800,7 +1816,7 @@ mod tests {
         );
 
         assert_eq!(
-            metadata_signing_cert_b64(&config, Some(&signing_ctx)),
+            metadata_signing_cert_b64(&config, Some(&signing_ctx), None),
             Some("CTX_CERT")
         );
     }
@@ -1811,8 +1827,48 @@ mod tests {
             .with_signing_cert("CONFIG_CERT");
 
         assert_eq!(
-            metadata_signing_cert_b64(&config, None),
+            metadata_signing_cert_b64(&config, None, None),
             Some("CONFIG_CERT")
+        );
+    }
+
+    #[test]
+    fn test_metadata_signing_cert_prefers_response_engine_parts() {
+        // Regression: the policy-driven SSO path signs with whatever signer
+        // ResponseEngineParts carries, but the metadata handler never
+        // consulted it at all - reading only IdpSigningContext/IdpConfig
+        // instead. Registering only AuthnSubjectCallback + ResponseEngineParts
+        // (the documented policy-driven setup) produced signed responses
+        // while metadata advertised no key, or the wrong one if
+        // IdpSigningContext also happened to be registered with a different
+        // certificate. ResponseEngineParts must win when present, since it's
+        // the actual source of truth for what signs responses on that path.
+        let config = IdpConfig::new("https://idp.example.com", "https://idp.example.com/sso")
+            .with_signing_cert("CONFIG_CERT");
+        let signing_ctx = IdpSigningContext::new(
+            SamlSigner::new(gamlastan::crypto::KeysManager::new()),
+            "CTX_CERT",
+        );
+        let parts = response_engine_parts();
+
+        assert_eq!(
+            metadata_signing_cert_b64(&config, Some(&signing_ctx), Some(&parts)),
+            Some(parts.cert_der_b64.as_str())
+        );
+    }
+
+    #[test]
+    fn test_metadata_signing_cert_uses_response_engine_parts_alone() {
+        // The exact scenario from the finding: only ResponseEngineParts is
+        // registered (no IdpSigningContext, no config cert) - metadata must
+        // still advertise a key, not silently publish none while responses
+        // are in fact signed.
+        let config = IdpConfig::new("https://idp.example.com", "https://idp.example.com/sso");
+        let parts = response_engine_parts();
+
+        assert_eq!(
+            metadata_signing_cert_b64(&config, None, Some(&parts)),
+            Some(parts.cert_der_b64.as_str())
         );
     }
 

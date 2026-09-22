@@ -155,6 +155,15 @@ existing primitives into the profile flow, and move the semantics proven in
    to be leaked. The handler builds a short-lived borrowed `ResponseEngine`
    from `ResponseEngineParts` per request.
 
+   The `/saml/metadata` handler resolves its published signing certificate
+   from `ResponseEngineParts` first, then `IdpSigningContext`, then
+   `IdpConfig::signing_cert_b64`: the metadata handler previously knew
+   nothing about `ResponseEngineParts` at all, so a deployment registering
+   only it (the documented policy-driven setup) signed real responses while
+   publishing no key in its own metadata, and a deployment registering both
+   with different certificates published a key that never actually signs
+   anything.
+
 3. Keep deployment specifics behind the seams ADR 0008 already defined --
    `IdentityStore`, `AssertionStore`, the `AuthnCallback` escape hatch, and
    `ReleasePolicy`/`EntityCategoryPolicy` configuration. No consumer identity
@@ -292,5 +301,9 @@ failure is a real protocol error rather than a silent per-integrator choice.
   handler (not just the core engine in isolation); a non-default
   `IdentityStore` works through `ResponseEngineParts`; a `TrustedSpResolver`
   returning a mismatched `entity_id` is rejected.
+- `/saml/metadata`'s certificate resolution: `ResponseEngineParts` wins over
+  `IdpSigningContext`/`IdpConfig` when present, and metadata still
+  advertises a key when `ResponseEngineParts` is the only signing source
+  registered (previously it advertised none).
 - `cargo clippy -p gamlastan -p gamlastan-actix -p example-idp --tests -- -D
   warnings` and `cargo fmt --check` clean across all three crates.

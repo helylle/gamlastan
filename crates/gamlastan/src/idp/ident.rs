@@ -274,11 +274,22 @@ impl<S: IdentityStore> IdentDb<S> {
     ///
     /// Maintains both directions: user -> issued NameIDs (forward) and
     /// NameID value -> user (reverse, used by `find_local_id`).
+    ///
+    /// Writes the reverse key *before* appending to the forward list, not
+    /// after: `remove_local`'s cleanup derives which reverse keys to remove
+    /// from what it reads in the forward list, so a concurrent `store()`
+    /// that becomes forward-list-visible before its reverse key exists lets
+    /// `remove_local` observe the new forward entry, find nothing to clean
+    /// up for it (a `remove` on an as-yet-absent key is a silent no-op), and
+    /// finish - after which this call's now-late reverse-key write creates
+    /// a mapping nothing will ever revisit. Writing reverse-then-forward
+    /// means any forward-visible entry already has its reverse key, which
+    /// is the invariant `remove_local`'s snapshot-based cleanup needs.
     pub fn store(&self, user_id: &str, name_id: &NameId) {
         let coded = code_name_id(name_id);
-        self.append_forward_entry(user_id, &coded);
         self.store
             .set(&Self::reverse_key(&name_id.value), user_id.to_string());
+        self.append_forward_entry(user_id, &coded);
     }
 
     /// Atomically append `coded` to a user's forward entry, retrying on CAS
@@ -428,6 +439,17 @@ impl<S: IdentityStore> IdentDb<S> {
     /// concurrent caller since the last read), otherwise mint a candidate
     /// and try to CAS it in; on CAS failure someone else just wrote to this
     /// key, so retry from the read.
+    ///
+    /// The candidate's reverse key is written *before* the forward CAS is
+    /// attempted, and reused (not regenerated) across retries, for the same
+    /// reason [`Self::store`] writes reverse-before-forward: once an entry
+    /// is visible in the forward list, its reverse key must already exist,
+    /// or a concurrent `remove_local` can observe the forward entry, find
+    /// nothing yet to clean up in the reverse index, and finish before this
+    /// call's reverse-key write lands - permanently orphaning it. If a
+    /// retry instead finds an existing match (someone else's write already
+    /// satisfies this request), the unused candidate's speculative reverse
+    /// key is rolled back rather than left dangling.
     fn get_or_create_persistent(
         &self,
         user_id: &str,
@@ -435,6 +457,7 @@ impl<S: IdentityStore> IdentDb<S> {
         name_qualifier: Option<&str>,
     ) -> NameId {
         let key = Self::forward_key(user_id);
+        let mut candidate: Option<NameId> = None;
         loop {
             let current = self.store.get(&key);
             let entries: Vec<String> = current
@@ -452,35 +475,44 @@ impl<S: IdentityStore> IdentDb<S> {
                     && nid.sp_name_qualifier.as_deref() == sp_name_qualifier
                     && nid.name_qualifier.as_deref() == name_qualifier
             }) {
+                if let Some(abandoned) = &candidate {
+                    self.store.remove(&Self::reverse_key(&abandoned.value));
+                }
                 return existing;
             }
 
-            let value = self.create_id(
-                constants::NAMEID_PERSISTENT,
-                name_qualifier,
-                sp_name_qualifier,
-            );
-            let name_id = NameId {
-                value,
-                format: Some(constants::NAMEID_PERSISTENT.to_string()),
-                name_qualifier: name_qualifier.map(str::to_string),
-                sp_name_qualifier: sp_name_qualifier.map(str::to_string),
-                sp_provided_id: None,
-            };
+            let name_id = candidate.get_or_insert_with(|| {
+                let value = self.create_id(
+                    constants::NAMEID_PERSISTENT,
+                    name_qualifier,
+                    sp_name_qualifier,
+                );
+                let name_id = NameId {
+                    value,
+                    format: Some(constants::NAMEID_PERSISTENT.to_string()),
+                    name_qualifier: name_qualifier.map(str::to_string),
+                    sp_name_qualifier: sp_name_qualifier.map(str::to_string),
+                    sp_provided_id: None,
+                };
+                self.store
+                    .set(&Self::reverse_key(&name_id.value), user_id.to_string());
+                name_id
+            });
+
             let mut new_entries = entries.clone();
-            new_entries.push(code_name_id(&name_id));
+            new_entries.push(code_name_id(name_id));
             let new_value = new_entries.join(" ");
 
             if self
                 .store
                 .compare_and_swap(&key, current.as_deref(), &new_value)
             {
-                self.store
-                    .set(&Self::reverse_key(&name_id.value), user_id.to_string());
-                return name_id;
+                return candidate.expect("just inserted above");
             }
             // Someone else wrote to `key` concurrently; loop and re-check
-            // whether *their* write already satisfies this request.
+            // whether *their* write already satisfies this request - reusing
+            // the same candidate (and its already-written reverse key) if we
+            // end up needing to append it after all.
         }
     }
 
@@ -1030,6 +1062,138 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// An `IdentityStore` that pauses the *first* `set()` call on a
+    /// reverse-index key (`nameid:...`) after it has landed, releasing only
+    /// when told to - used to deterministically force a `remove_local` to
+    /// interleave in the exact window a scheduling-dependent test can only
+    /// hit by luck.
+    struct SteppedStore {
+        inner: InMemoryIdentityStore,
+        reverse_written_tx: Mutex<Option<std::sync::mpsc::Sender<()>>>,
+        proceed_rx: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+    }
+
+    impl IdentityStore for SteppedStore {
+        fn get(&self, key: &str) -> Option<String> {
+            self.inner.get(key)
+        }
+        fn set(&self, key: &str, value: String) {
+            self.inner.set(key, value);
+            if key.starts_with(REVERSE_PREFIX) {
+                if let Some(tx) = self.reverse_written_tx.lock().unwrap().take() {
+                    let _ = tx.send(());
+                    if let Some(rx) = self.proceed_rx.lock().unwrap().take() {
+                        let _ = rx.recv();
+                    }
+                }
+            }
+        }
+        fn remove(&self, key: &str) {
+            self.inner.remove(key);
+        }
+        fn compare_and_swap(&self, key: &str, expected: Option<&str>, new: &str) -> bool {
+            self.inner.compare_and_swap(key, expected, new)
+        }
+    }
+
+    #[test]
+    fn get_or_create_persistent_reverse_key_survives_a_racing_remove_local() {
+        // Regression: get_or_create_persistent used to CAS the candidate
+        // into the forward list, THEN write its reverse key as a separate,
+        // later operation. A remove_local landing in that exact gap would
+        // see the new forward entry (post-CAS) with no reverse key yet,
+        // clean up based on that snapshot (a `remove` on the not-yet-present
+        // reverse key is a silent no-op), and finish - after which the
+        // writer's now-late reverse-key write created a mapping nothing
+        // would ever revisit. Writing the reverse key *before* the forward
+        // CAS (and reusing it across retries) closes this. Force the exact
+        // interleaving deterministically instead of relying on scheduling
+        // luck (see the sibling test above, which never caught this in
+        // practice despite exercising the same two operations concurrently).
+        use std::sync::{mpsc, Arc};
+        use std::thread;
+
+        let (reverse_written_tx, reverse_written_rx) = mpsc::channel();
+        let (proceed_tx, proceed_rx) = mpsc::channel();
+        let store = SteppedStore {
+            inner: InMemoryIdentityStore::new(),
+            reverse_written_tx: Mutex::new(Some(reverse_written_tx)),
+            proceed_rx: Mutex::new(Some(proceed_rx)),
+        };
+        let db = Arc::new(IdentDb::new(store, IDP));
+
+        let writer = {
+            let db = Arc::clone(&db);
+            thread::spawn(move || db.persistent_nameid("alice", Some(SP)))
+        };
+
+        // Wait until the writer has written its candidate's reverse key and
+        // is paused before attempting its forward CAS.
+        reverse_written_rx.recv().unwrap();
+
+        // The candidate isn't in the forward list yet (the writer's CAS
+        // hasn't run), so this must be a no-op with respect to it.
+        db.remove_local("alice");
+
+        // Let the writer proceed to its forward CAS.
+        proceed_tx.send(()).unwrap();
+        let minted = writer.join().unwrap();
+
+        let listed = db.name_ids_for("alice");
+        assert!(
+            listed.iter().any(|n| n.value == minted.value),
+            "the minted persistent NameID must end up in the forward list: {listed:?}"
+        );
+        assert_eq!(
+            db.find_local_id(&minted).as_deref(),
+            Some("alice"),
+            "and its reverse mapping must still resolve, not be orphaned"
+        );
+    }
+
+    #[test]
+    fn store_reverse_key_survives_a_racing_remove_local() {
+        // Same fix, same deterministic technique, for store() (the path
+        // transient/email/etc. NameIDs go through) rather than
+        // get_or_create_persistent. The scheduling-based sibling test above
+        // races transient_nameid (-> store()) against remove_local across
+        // 20 rounds and 4 threads without ever reproducing this - the
+        // window is only a few CPU instructions wide, so a real regression
+        // here would ship silently without a deterministic reproduction.
+        use std::sync::{mpsc, Arc};
+        use std::thread;
+
+        let (reverse_written_tx, reverse_written_rx) = mpsc::channel();
+        let (proceed_tx, proceed_rx) = mpsc::channel();
+        let store = SteppedStore {
+            inner: InMemoryIdentityStore::new(),
+            reverse_written_tx: Mutex::new(Some(reverse_written_tx)),
+            proceed_rx: Mutex::new(Some(proceed_rx)),
+        };
+        let db = Arc::new(IdentDb::new(store, IDP));
+
+        let writer = {
+            let db = Arc::clone(&db);
+            thread::spawn(move || db.transient_nameid("alice", Some(SP)))
+        };
+
+        reverse_written_rx.recv().unwrap();
+        db.remove_local("alice");
+        proceed_tx.send(()).unwrap();
+        let minted = writer.join().unwrap();
+
+        let listed = db.name_ids_for("alice");
+        assert!(
+            listed.iter().any(|n| n.value == minted.value),
+            "the minted transient NameID must end up in the forward list: {listed:?}"
+        );
+        assert_eq!(
+            db.find_local_id(&minted).as_deref(),
+            Some("alice"),
+            "and its reverse mapping must still resolve, not be orphaned"
+        );
     }
 
     #[test]

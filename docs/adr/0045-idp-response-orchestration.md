@@ -95,6 +95,19 @@ existing primitives into the profile flow, and move the semantics proven in
    atomic storage-layer operation (`WATCH`/`MULTI`, `UPDATE ... WHERE
    current = expected`, etc.).
 
+   The forward-list CAS alone was not sufficient: `store()` and
+   `get_or_create_persistent()` wrote a NameID's reverse-index entry as a
+   separate operation *after* committing it to the forward list, so a
+   `remove_local` landing in that window could see the entry already
+   forward-listed, find no reverse key yet (removing an absent key is a
+   no-op), and finish before the late reverse-key write landed -
+   permanently orphaning it, surviving an explicit "forget this user" call.
+   Both now write the reverse key before attempting the forward commit
+   (reusing the same candidate across `get_or_create_persistent`'s retries,
+   rolling its reverse key back only if a retry finds an existing match
+   instead), so a forward-list-visible entry always already has a working
+   reverse key.
+
    Attribute release is a seam, not a hardwired step, because deployments
    legitimately source the released set differently: an originating IdP
    applies federation policy (`ReleasePolicy` + entity categories); a proxy
@@ -241,7 +254,11 @@ failure is a real protocol error rather than a silent per-integrator choice.
 - `idp/ident.rs`: concurrent persistent-NameID minting for the same
   (user, SP) resolves to one identifier; concurrent persistent + transient
   issuance don't clobber each other's forward-list entry; `remove_local`
-  racing a concurrent writer never leaves an orphaned reverse-key entry.
+  racing a concurrent writer never leaves an orphaned reverse-key entry;
+  a deterministic (channel-synchronized, not scheduling-dependent) test
+  forces `remove_local` to run in the exact window between a concurrent
+  `get_or_create_persistent`'s reverse-key write and its forward commit,
+  proving the reverse mapping still resolves afterward.
 - `idp/authn_broker.rs`: exact matching excludes a method registered at the
   same security level under a different, unrequested class ref by default;
   `allow_exact_level_matching` restores the old pysaml2-compatible

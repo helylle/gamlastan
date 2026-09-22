@@ -163,6 +163,20 @@ where needed to correct protocol handling.
   backend (Redis/SQL) must implement a genuinely atomic storage-layer
   operation (Redis `WATCH`/`MULTI`, a SQL `UPDATE ... WHERE current =
   expected`, etc.).
+- Making the forward-list CAS atomic left one more gap: `store()` and
+  `get_or_create_persistent()` still wrote a NameID's reverse-index entry
+  as a separate operation *after* committing it to the forward list. A
+  `remove_local` racing in that exact window could see the new entry
+  already in the forward list (post-commit), find no reverse key yet to
+  clean up for it (a `remove` on an absent key is a silent no-op), and
+  finish - after which the late reverse-key write created a mapping
+  nothing would ever revisit: a permanent orphan surviving an explicit
+  "forget this user" call. Both now write the reverse key *before*
+  attempting the forward commit (reusing, not regenerating, the same
+  candidate across `get_or_create_persistent`'s CAS retries, and rolling
+  back an abandoned candidate's reverse key if a retry finds an existing
+  match instead), so a forward-list-visible entry always already has its
+  reverse key.
 - `idp::orchestrator`'s NameIDPolicy handling only honours
   `NameIDPolicy/@SPNameQualifier` when it equals the requester's own
   (verified) entity ID. Per saml-core-2.0-os 8.3.7, SPNameQualifier may

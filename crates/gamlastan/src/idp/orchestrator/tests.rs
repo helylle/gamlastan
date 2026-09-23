@@ -1174,6 +1174,44 @@ fn persistent_format_disallowed_create_denies_creation() {
     ));
 }
 
+#[test]
+fn persistent_default_without_name_id_policy_mints_the_default() {
+    // Regression for the review finding "Missing NameIDPolicy incorrectly
+    // disables persistent NameID creation": when the IdP's configured default
+    // NameID format is persistent and the request carries no NameIDPolicy at
+    // all, a first-time subject must be minted the default persistent
+    // identifier - not denied with NameIdCreationNotAllowed. Only an explicit
+    // NameIDPolicy with AllowCreate=false imposes that constraint (see the
+    // sibling test above). A fresh IdentDb is used so the subject is genuinely
+    // first-time for this (user, SP) pair.
+    let decisions = ReleasePolicy::with_default(
+        crate::idp::policy::PolicyEntry::new().with_nameid_format(constants::NAMEID_PERSISTENT),
+    );
+    let idents = IdentDb::in_memory(IDP);
+    let (signer, cert) = fixture_signer();
+    let engine = ResponseEngine {
+        idp_entity_id: IDP,
+        decisions: &decisions,
+        release: &PassThroughRelease,
+        idents: &idents,
+        broker: &broker(),
+        assertions: None,
+        signer: &signer,
+        cert_der_b64: cert,
+    };
+    // No NameIDPolicy: has_name_id_policy stays false, format is None.
+    let p = params(processed(false, false, vec![], None));
+    let outcome = create_authn_response(&engine, &p, &subject_without_mail()).unwrap();
+    match outcome {
+        ResponseOutcome::Issued(issued) => assert_eq!(
+            issued.name_id.format.as_deref(),
+            Some(constants::NAMEID_PERSISTENT),
+            "the IdP's configured persistent default must be minted, not denied"
+        ),
+        other => panic!("expected Issued with the persistent default, got {other:?}"),
+    }
+}
+
 // ── Two-consumer falsification test (ADR's own condition) ──────────────────
 
 #[test]

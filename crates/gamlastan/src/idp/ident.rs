@@ -576,8 +576,11 @@ impl<S: IdentityStore> IdentDb<S> {
     /// - SPNameQualifier: `NameIDPolicy/@SPNameQualifier`, else the SP
     ///   entity ID.
     /// - NameQualifier: this IdP's entity ID.
-    /// - AllowCreate (E14): when false, only an existing identifier may be
-    ///   returned for the persistent format.
+    /// - AllowCreate (E14): when an explicit `NameIDPolicy` sets it to false,
+    ///   only an existing identifier may be returned for the persistent
+    ///   format. A request with *no* `NameIDPolicy` at all does not impose
+    ///   that constraint - the IdP's configured default format applies and the
+    ///   IdP is permitted to mint it.
     pub fn construct_nameid(
         &self,
         user_id: &str,
@@ -594,7 +597,14 @@ impl<S: IdentityStore> IdentDb<S> {
             .unwrap_or(sp_entity_id);
 
         if format == constants::NAMEID_PERSISTENT {
-            let allow_create = name_id_policy.map(|p| p.allow_create).unwrap_or(false);
+            // Only an explicit NameIDPolicy with AllowCreate=false forbids
+            // creating a new identifier. A request with no NameIDPolicy at all
+            // (name_id_policy is None) means the IdP's configured default
+            // format applies, and the IdP is permitted to mint that default -
+            // it must not be treated as AllowCreate=false, or a persistent
+            // default would deny every first-time subject whose request omits
+            // NameIDPolicy.
+            let allow_create = name_id_policy.map(|p| p.allow_create).unwrap_or(true);
             let existing = self.match_local_id(
                 user_id,
                 Some(sp_name_qualifier),
@@ -918,12 +928,25 @@ mod tests {
 
     #[test]
     fn test_construct_nameid_default_format() {
+        // Regression for the review finding "Missing NameIDPolicy incorrectly
+        // disables persistent NameID creation": a request with no NameIDPolicy
+        // at all must not be treated as AllowCreate=false. When the IdP's
+        // configured default format is persistent, a first-time subject whose
+        // request omits NameIDPolicy must be minted the default, not denied.
         let db = db();
         let nid = db
             .construct_nameid("alice", SP, None, Some(constants::NAMEID_PERSISTENT))
-            .unwrap_err();
-        // persistent + no policy => allow_create false => no new id
-        assert!(matches!(nid, IdentError::CreateNotAllowed));
+            .expect("no NameIDPolicy + persistent default must mint the default");
+        assert_eq!(
+            nid.format.as_deref(),
+            Some(constants::NAMEID_PERSISTENT),
+            "the IdP's configured default format must be honored"
+        );
+        // And it is stable: a second request for the same (user, SP) reuses it.
+        let again = db
+            .construct_nameid("alice", SP, None, Some(constants::NAMEID_PERSISTENT))
+            .unwrap();
+        assert_eq!(nid.value, again.value);
     }
 
     #[test]

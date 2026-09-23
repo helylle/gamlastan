@@ -6,6 +6,13 @@
 // NameIDs honoring an incoming `NameIDPolicy`, and implements the server
 // side of the ManageNameID and NameIDMapping profiles on top of it.
 //
+// Transient NameIDs are minted fresh on every issuance and are *not*
+// persisted to the store: per SAML Core §8.3.7 a transient identifier is
+// one-time-use and MUST NOT be reused, so it has no reverse-lookup need.
+// Persisting them would grow the identity store without bound (the default
+// per-SP format is transient, so every response would add an entry that is
+// never read back). Persistent and other durable formats are stored.
+//
 // The storage backend is pluggable via `IdentityStore`; the in-memory
 // implementation suits single-instance deployments and tests.
 
@@ -398,9 +405,15 @@ impl<S: IdentityStore> IdentDb<S> {
         }
     }
 
-    /// Create and store a new NameID of the given format
-    /// (pysaml2 `get_nameid()`); persistent format reuses an existing
-    /// association when one exists.
+    /// Create a new NameID of the given format (pysaml2 `get_nameid()`);
+    /// persistent format reuses an existing association when one exists.
+    ///
+    /// Transient identifiers are minted fresh and returned *without* being
+    /// stored: they are one-time-use (SAML Core §8.3.7) and never need a
+    /// reverse lookup, so persisting them would only grow the store without
+    /// bound (the default per-SP format is transient, so every response
+    /// would otherwise add an entry that is never read back). All other
+    /// formats are stored so they can be looked up and reused.
     pub fn get_nameid(
         &self,
         user_id: &str,
@@ -428,7 +441,26 @@ impl<S: IdentityStore> IdentDb<S> {
             sp_name_qualifier: sp_name_qualifier.map(str::to_string),
             sp_provided_id: None,
         };
-        self.store(user_id, &name_id);
+        // Transient identifiers are one-time-use and never reverse-looked-up,
+        // so they are not persisted (see the method doc). Every other format
+        // is stored so it can be found and reused later.
+        //
+        // This is deliberately targeted at the transient format only, not all
+        // non-persistent formats. The rule is "persist iff the identifier is
+        // ever reverse-looked-up or reused": transient is the one format the
+        // spec (SAML Core §8.3.7) defines as one-time-use, and it is also the
+        // default per-SP format, so it is the one that accumulates on every
+        // response. The other non-persistent formats this crate mints (email,
+        // unspecified, custom) are durable per-user identifiers that *are*
+        // reverse-looked-up (find_local_id / name_ids_for) and reused, so they
+        // must stay stored. If a future one-time-use format is added (or a
+        // deployment wants to treat another format as non-durable), generalize
+        // this to a set of "non-persisted" formats rather than a single
+        // equality check - the invariant to preserve is that a format is
+        // persisted exactly when something later needs to look it back up.
+        if format != constants::NAMEID_TRANSIENT {
+            self.store(user_id, &name_id);
+        }
         name_id
     }
 
@@ -818,8 +850,43 @@ mod tests {
         let b = db.transient_nameid("alice", Some(SP));
         assert_ne!(a.value, b.value);
         assert_eq!(a.format.as_deref(), Some(constants::NAMEID_TRANSIENT));
-        assert_eq!(db.find_local_id(&a).as_deref(), Some("alice"));
-        assert_eq!(db.find_local_id(&b).as_deref(), Some("alice"));
+        // Transient identifiers are one-time-use and not persisted, so they
+        // must not be reverse-looked-up and must not accumulate in the store
+        // (the default per-SP format is transient, so every response would
+        // otherwise grow the identity store without bound).
+        assert_eq!(db.find_local_id(&a), None);
+        assert_eq!(db.find_local_id(&b), None);
+        assert!(db.name_ids_for("alice").is_empty());
+    }
+
+    #[test]
+    fn repeated_transient_issuance_does_not_grow_the_store() {
+        // Regression for the review finding "transient identifiers accumulate
+        // without cleanup": the default per-SP NameID format is transient, and
+        // every successful response (including repeated reuse of one session)
+        // mints a fresh transient. Because a transient is one-time-use and
+        // never reverse-looked-up, none of them may be persisted - otherwise
+        // the identity store grows without bound for the IdP's most common
+        // configuration. Drive construct_nameid (the orchestrator's path) with
+        // the transient default repeatedly and assert the store stays empty.
+        let db = db();
+        let policy = NameIdPolicy {
+            format: Some(constants::NAMEID_TRANSIENT.to_string()),
+            sp_name_qualifier: None,
+            allow_create: true,
+        };
+        let mut values = Vec::new();
+        for _ in 0..50 {
+            let nid = db
+                .construct_nameid("alice", SP, Some(&policy), None)
+                .unwrap();
+            values.push(nid.value.clone());
+        }
+        // Each issuance is still a fresh, unique value...
+        let unique = values.iter().collect::<std::collections::HashSet<_>>();
+        assert_eq!(values.len(), unique.len());
+        // ...and none of them accumulated in either index.
+        assert!(db.name_ids_for("alice").is_empty());
     }
 
     #[test]
@@ -959,14 +1026,19 @@ mod tests {
     }
 
     #[test]
-    fn concurrent_persistent_and_transient_issuance_do_not_clobber_each_other() {
+    fn concurrent_persistent_and_durable_issuance_do_not_clobber_each_other() {
         // Regression: get_or_create_persistent's CAS loop only coordinated
         // with other CAS writers on the forward key; store() (used for
-        // transient/email/etc.) still did a plain get-then-set on that same
-        // key. A store() write could read the list before the persistent
-        // CAS committed and then overwrite it with a stale value, silently
-        // dropping the persistent entry even though its own CAS "succeeded".
-        // Both paths now go through the same compare_and_swap-based retry.
+        // durable non-persistent formats like email) still did a plain
+        // get-then-set on that same key. A store() write could read the list
+        // before the persistent CAS committed and then overwrite it with a
+        // stale value, silently dropping the persistent entry even though its
+        // own CAS "succeeded". Both paths now go through the same
+        // compare_and_swap-based retry.
+        //
+        // (Transient identifiers are not stored at all, so they no longer
+        // exercise this path; email is a durable non-persistent format that
+        // does.)
         use std::sync::Arc;
         use std::thread;
 
@@ -981,7 +1053,12 @@ mod tests {
         for i in 0..8 {
             let db = Arc::clone(&db);
             threads.push(thread::spawn(move || {
-                db.transient_nameid("alice", Some(&format!("{SP}/{i}")));
+                db.get_nameid(
+                    "alice",
+                    constants::NAMEID_EMAIL,
+                    Some(&format!("{SP}/{i}")),
+                    Some(IDP),
+                );
             }));
         }
         for t in threads {
@@ -993,9 +1070,9 @@ mod tests {
             .iter()
             .filter(|nid| nid.format.as_deref() == Some(constants::NAMEID_PERSISTENT))
             .collect();
-        let transient: Vec<_> = entries
+        let email: Vec<_> = entries
             .iter()
-            .filter(|nid| nid.format.as_deref() == Some(constants::NAMEID_TRANSIENT))
+            .filter(|nid| nid.format.as_deref() == Some(constants::NAMEID_EMAIL))
             .collect();
         assert_eq!(
             persistent.len(),
@@ -1003,9 +1080,9 @@ mod tests {
             "persistent entry must survive: {entries:?}"
         );
         assert_eq!(
-            transient.len(),
+            email.len(),
             8,
-            "every transient issuance must survive: {entries:?}"
+            "every durable non-persistent issuance must survive: {entries:?}"
         );
     }
 
@@ -1038,7 +1115,12 @@ mod tests {
                 .map(|i| {
                     let db = Arc::clone(&db);
                     thread::spawn(move || {
-                        db.transient_nameid("alice", Some(&format!("{SP}/{round}/{i}")))
+                        db.get_nameid(
+                            "alice",
+                            constants::NAMEID_EMAIL,
+                            Some(&format!("{SP}/{round}/{i}")),
+                            Some(IDP),
+                        )
                     })
                 })
                 .collect();
@@ -1156,9 +1238,9 @@ mod tests {
     #[test]
     fn store_reverse_key_survives_a_racing_remove_local() {
         // Same fix, same deterministic technique, for store() (the path
-        // transient/email/etc. NameIDs go through) rather than
+        // durable non-persistent NameIDs like email go through) rather than
         // get_or_create_persistent. The scheduling-based sibling test above
-        // races transient_nameid (-> store()) against remove_local across
+        // races a durable get_nameid (-> store()) against remove_local across
         // 20 rounds and 4 threads without ever reproducing this - the
         // window is only a few CPU instructions wide, so a real regression
         // here would ship silently without a deterministic reproduction.
@@ -1176,7 +1258,9 @@ mod tests {
 
         let writer = {
             let db = Arc::clone(&db);
-            thread::spawn(move || db.transient_nameid("alice", Some(SP)))
+            thread::spawn(move || {
+                db.get_nameid("alice", constants::NAMEID_EMAIL, Some(SP), Some(IDP))
+            })
         };
 
         reverse_written_rx.recv().unwrap();
@@ -1187,7 +1271,7 @@ mod tests {
         let listed = db.name_ids_for("alice");
         assert!(
             listed.iter().any(|n| n.value == minted.value),
-            "the minted transient NameID must end up in the forward list: {listed:?}"
+            "the minted email NameID must end up in the forward list: {listed:?}"
         );
         assert_eq!(
             db.find_local_id(&minted).as_deref(),
@@ -1242,7 +1326,7 @@ mod tests {
         assert!(db.name_ids_for("alice").is_empty());
 
         let n1 = db.persistent_nameid("alice", Some(SP));
-        let n2 = db.transient_nameid("alice", Some(SP));
+        let n2 = db.get_nameid("alice", constants::NAMEID_EMAIL, Some(SP), Some(IDP));
         db.remove_local("alice");
         assert!(db.find_local_id(&n1).is_none());
         assert!(db.find_local_id(&n2).is_none());

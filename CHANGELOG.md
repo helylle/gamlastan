@@ -5,6 +5,24 @@ All notable changes to this repository will be documented in this file.
 The project is still pre-1.0, so minor releases may include behavior changes
 where needed to correct protocol handling.
 
+## [0.9.1] - 2026-09-29
+
+### Changed
+
+- Updated the coordinated `bergshamra` stack to 0.9.2 and `kryptering` to
+  0.6.0, keeping the public signing backend aligned with the XML-security stack.
+- Updated `base64` to 0.23.1, `md-5` to 0.11.0, and `reqwest` to 0.13.5.
+- Refreshed compatible direct and transitive dependencies through `sfw`, while
+  retaining Rust 1.88 support (`aes` remains at 0.9.2).
+
+### Upgrade Notes
+
+- Custom clients passed to `ReqwestFetcher::from_client` or
+  `from_client_with_limits` must use reqwest 0.13. The default Rustls transport
+  now uses platform certificate verification, following reqwest 0.13 defaults.
+- Code supplying HSM signers should use the re-exported
+  `gamlastan::crypto::kryptering` types or depend on kryptering 0.6 directly.
+
 ## [0.9.0] - 2026-09-03
 
 ### Added
@@ -578,6 +596,7 @@ Historical release recorded before changelog adoption.
 
 Historical release recorded before changelog adoption.
 
+[0.9.1]: https://github.com/kushaldas/gamlastan/compare/v0.9.0...v0.9.1
 [0.9.0]: https://github.com/kushaldas/gamlastan/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/kushaldas/gamlastan/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/kushaldas/gamlastan/compare/v0.6.0...v0.7.0

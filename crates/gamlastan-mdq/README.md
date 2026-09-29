@@ -68,6 +68,9 @@ let from_url = MdqClient::new("")
 
 ## Design notes
 
+- The default transport uses reqwest 0.13 with Rustls and platform certificate
+  verification. Custom clients supplied to `ReqwestFetcher::from_client` or
+  `from_client_with_limits` must also use reqwest 0.13.
 - The pure parse/verify/cache logic lives in `gamlastan::metadata`; this crate
   only adds the async HTTP fetch, retry/backoff, transform, and orchestration.
   The core `gamlastan` crate stays free of `reqwest`/`tokio`.

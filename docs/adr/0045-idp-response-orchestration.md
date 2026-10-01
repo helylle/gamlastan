@@ -75,7 +75,11 @@ existing primitives into the profile flow, and move the semantics proven in
    `AuthnContextDeclRef`s is denied with `NoAuthnContext`: an `AuthnMethod`
    carries a class ref only, so a declaration constraint cannot be shown to be
    met, and treating it as no constraint would reuse any session or issue any
-   class ref.
+   class ref. The same goes for a `RequestedAuthnContext` element that names
+   nothing: the schema requires at least one ref, so `process_authn_request`
+   rejects it (`ProfileError::EmptyRequestedAuthnContext`) and the engine
+   denies it for hand-built parameters, instead of collapsing it into the same
+   state as an absent element.
 
    NameID construction rejects a `NameIDPolicy/@SPNameQualifier` that names
    an entity other than the verified requester: per saml-core-2.0-os 8.3.7
@@ -248,6 +252,15 @@ failure is a real protocol error rather than a silent per-integrator choice.
   `saml2_frontend.rs`, `saml2_backend.rs`, `stepup.rs`, and four test
   files) need a one-line compat patch, prepared separately and offered to
   SUNET alongside this ADR rather than discovered via a failed build.
+- Not handled by the engine: `Scoping` and the principal named by an
+  AuthnRequest `Subject`. An originating IdP can ignore `Scoping`, but a proxy
+  must enforce `ProxyCount` and `IDPList` itself (SAML Core 3.4.1.2), reading
+  them from the original request, since `ProcessedAuthnRequest` does not carry
+  them. A `Subject` is checked only for the forbidden `SubjectConfirmation`;
+  the assertion is issued for the authenticated subject whatever principal it
+  names. The request parser rejects what it used to repair: an `IDPEntry`
+  without `ProviderID`, and a repeated singleton child, so what a consumer
+  reads is what the SP sent.
 - Breaking (pre-release): `AuthnBroker::pick` with `Comparison="exact"`
   changed from level-based matching to literal class-ref matching (see
   above). Any integrator relying on the old broadened behaviour must pass
@@ -323,7 +336,7 @@ failure is a real protocol error rather than a silent per-integrator choice.
   `Denial::AuthnFailed` / `Cancelled` are signed `Responder/AuthnFailed`
   responses; a configured `SigningPreference` is used for an issued response
   and for a denial, and the signer's defaults apply without one; a
-  declaration-only `RequestedAuthnContext` is denied (never treated as
+  declaration-only or empty `RequestedAuthnContext` is denied (never treated as
   unconstrained); `allow_exact_level_matching` is consistent between
   `check_request` and the response; the advertised algorithms come from the
   entity and the requested role only; a descriptor for a different SP is

@@ -1135,6 +1135,53 @@ fn a_declaration_only_authn_context_request_is_denied_not_ignored() {
 }
 
 #[test]
+fn an_empty_requested_authn_context_is_denied_not_treated_as_unconstrained() {
+    use crate::idp::orchestrator::Denial;
+    let decisions = ReleasePolicy::new();
+    let engine = engine_with_decisions(&decisions);
+    // The element is present (a comparison is set) but names nothing. The
+    // schema requires at least one ref, so this is malformed; the engine must
+    // not read it as "no constraint" and reuse any session.
+    let p = params(processed(
+        false,
+        false,
+        vec![],
+        Some(AuthnContextComparison::Exact),
+    ));
+    let s = session(AuthnMethodRef::Inline {
+        class_ref: PASSWORD.to_string(),
+        authn_authority: None,
+    });
+    assert!(matches!(
+        check_request(&engine, &p, Some(&s)),
+        Disposition::Deny {
+            denial: Denial::NoAuthnContext
+        }
+    ));
+    assert!(matches!(
+        check_request(&engine, &p, None),
+        Disposition::Deny {
+            denial: Denial::NoAuthnContext
+        }
+    ));
+    let outcome = create_authn_response(&engine, &p, &subject_without_mail()).unwrap();
+    assert!(matches!(
+        outcome,
+        ResponseOutcome::Denied {
+            denial: Denial::NoAuthnContext,
+            ..
+        }
+    ));
+
+    // An absent element (no comparison, no refs) is still unconstrained.
+    let p = params(processed(false, false, vec![], None));
+    assert!(matches!(
+        check_request(&engine, &p, Some(&s)),
+        Disposition::ReuseSession { .. }
+    ));
+}
+
+#[test]
 fn exact_level_matching_opt_in_is_consistent_between_check_and_response() {
     // With `allow_exact_level_matching(true)`, check_request offers a method
     // registered at the same level as the requested class. The response must

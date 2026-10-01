@@ -156,6 +156,13 @@ pub enum ProfileError {
     #[error("{0}")]
     Other(String),
 
+    /// The AuthnRequest has a `RequestedAuthnContext` element that names no
+    /// `AuthnContextClassRef` and no `AuthnContextDeclRef`. The schema requires
+    /// at least one, and treating the empty element as "no constraint" would let
+    /// a malformed request reuse any session.
+    #[error("RequestedAuthnContext names no AuthnContextClassRef or AuthnContextDeclRef")]
+    EmptyRequestedAuthnContext,
+
     /// The SP descriptor handed to the response engine is not the SP the
     /// validated request came from. Its entity categories and `subject-id:req`
     /// control attribute release, so pairing one SP's request with another SP's

@@ -83,10 +83,10 @@ pub fn check_request(
 ) -> Disposition {
     let processed = &params.processed;
 
-    // A requested authn-context *declaration* cannot be matched (an
-    // `AuthnMethod` carries a class ref only). Treating the request as
-    // unconstrained would reuse any session or issue any class ref, so refuse it.
-    if !processed.requested_authn_context_decl_refs.is_empty() {
+    // A requested authn-context constraint that cannot be matched is refused,
+    // not treated as unconstrained, which would reuse any session or issue any
+    // class ref.
+    if unmatchable_authn_context(processed) {
         return Disposition::Deny {
             denial: Denial::NoAuthnContext,
         };
@@ -140,6 +140,21 @@ pub fn check_request(
     methods.sort_by_key(|m| std::cmp::Reverse(m.level));
 
     Disposition::Authenticate { methods }
+}
+
+/// Whether the request carries a `RequestedAuthnContext` the engine cannot
+/// match, so it must be refused rather than treated as unconstrained.
+///
+/// - It names an `AuthnContextDeclRef`: an `AuthnMethod` carries a class ref
+///   only, so a declaration cannot be shown to be met.
+/// - The element is present (`authn_context_comparison` is set whenever it is)
+///   but names no class or declaration ref at all. The schema requires at
+///   least one, so this is malformed; `process_authn_request` rejects it, and
+///   this covers parameters built by hand.
+fn unmatchable_authn_context(processed: &crate::profiles::sso::idp::ProcessedAuthnRequest) -> bool {
+    !processed.requested_authn_context_decl_refs.is_empty()
+        || (processed.requested_authn_context_class_refs.is_empty()
+            && processed.authn_context_comparison.is_some())
 }
 
 /// Whether an established session's method satisfies the requested context.
@@ -229,10 +244,10 @@ pub fn create_authn_response(
     let processed = &params.processed;
     let sp = &params.sp_sso;
 
-    // `check_request` already refuses a declaration-only authn-context
-    // constraint; refuse it here too, before anything is minted or stored,
-    // for a caller that skipped `check_request`.
-    if !processed.requested_authn_context_decl_refs.is_empty() {
+    // `check_request` already refuses an authn-context constraint that cannot
+    // be matched; refuse it here too, before anything is minted or stored, for
+    // a caller that skipped `check_request`.
+    if unmatchable_authn_context(processed) {
         return denied(engine, params, &Denial::NoAuthnContext);
     }
 

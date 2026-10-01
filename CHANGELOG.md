@@ -170,7 +170,12 @@ where needed to correct protocol handling.
   `AuthnMethod` carries a class ref only, so a declaration cannot be shown to be
   met: `check_request` and `create_authn_response` now deny such a request with
   `NoAuthnContext`, and `ResponseParams::requested_authn_context()` no longer
-  reports it as no constraint.
+  reports it as no constraint. A `RequestedAuthnContext` element that names no
+  class or declaration ref at all is malformed (the schema requires at least
+  one) and is no longer collapsed into "no constraint" either:
+  `process_authn_request` rejects it with
+  `ProfileError::EmptyRequestedAuthnContext`, and the engine denies it with
+  `NoAuthnContext` for parameters built by hand.
 - **Breaking:** `gamlastan-actix`'s `TrustedSp.sp_sso: SpSsoDescriptor` field
   is now `entity: EntityDescriptor`, with no separate registration-key field:
   `IdpConfig::with_trusted_sp(entity_id, sp_sso)` is now
@@ -229,6 +234,18 @@ where needed to correct protocol handling.
   `PyIdentityStore` is one) implements `KeyValueStore` for the `Eptid` cache
   and the new `IdentityStore` for `IdentDb`; code still implementing the old
   three methods as `IdentityStore` fails to compile rather than misbehaving.
+- **Behaviour change:** AuthnRequest parsing and processing no longer repair
+  malformed input into a more permissive request. An `IDPEntry` without the
+  required `ProviderID` is rejected, where it used to be dropped (shrinking a
+  restrictive `IDPList`, possibly to an empty one, which reads as no
+  restriction). A repeated `Subject`, `NameIDPolicy`, `Conditions`,
+  `RequestedAuthnContext`, `Scoping` or `IDPList` is rejected, where only the
+  first used to be read and the rest ignored. A `Subject` carrying a
+  `SubjectConfirmation` is rejected with
+  `ProfileError::SubjectConfirmationInAuthnRequest`, a variant that existed but
+  was never raised. `ProcessedAuthnRequest` documents what it does not carry:
+  `Scoping`, which a proxying IdP must read from the original request itself,
+  and the principal named by `Subject`.
 - **Breaking:** the store traits are fallible. `IdentityStore`, `KeyValueStore`
   and `AssertionStore` methods return `Result<_, StoreError>` (the two insert
   paths return `InsertError`, which separates a `ValueTaken` conflict from a

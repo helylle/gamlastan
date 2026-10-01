@@ -43,6 +43,26 @@ use crate::profiles::sso::web_browser::{ResponseOptions, ResponseTimes};
 use crate::xml::serialize::SamlSerialize;
 
 /// Result of processing an AuthnRequest on the IdP side.
+///
+/// # What this does not carry
+///
+/// Parts of the original [`AuthnRequest`] are deliberately not surfaced here,
+/// and the response orchestrator does not act on them:
+///
+/// - **`Scoping`** (`IDPList`, `ProxyCount`, `RequesterID`). An originating IdP
+///   can ignore it. A **proxying** IdP cannot: SAML Core 3.4.1.2 makes
+///   `ProxyCount` and `IDPList` constraints on whether and where the request
+///   may be forwarded, and a proxy that never reads them forwards requests it
+///   was told not to. Such a deployment must read `request.scoping` from the
+///   original `AuthnRequest` itself and enforce it. The request parser rejects a
+///   malformed `Scoping` (an `IDPEntry` without `ProviderID`, a repeated
+///   `IDPList`) instead of repairing it, so what a proxy reads is what the SP
+///   sent.
+/// - **`Subject`**. It is checked only for the forbidden `SubjectConfirmation`
+///   (see [`ProfileError::SubjectConfirmationInAuthnRequest`]); the principal it
+///   names is not compared with the authenticated subject, so an assertion is
+///   issued for whoever authenticated.
+/// - **`Conditions`**, which the responder may modify or supplement.
 #[derive(Debug, Clone)]
 pub struct ProcessedAuthnRequest {
     /// The request ID (for InResponseTo).
@@ -139,6 +159,16 @@ pub fn process_authn_request(
         .value
         .clone();
 
+    // The profile does not allow SubjectConfirmation in an AuthnRequest's
+    // Subject; the error variant existed but nothing raised it.
+    if request
+        .subject
+        .as_ref()
+        .is_some_and(|subject| !subject.subject_confirmations.is_empty())
+    {
+        return Err(ProfileError::SubjectConfirmationInAuthnRequest);
+    }
+
     // Determine ACS URL and binding
     if (request.base.has_signature || sp_metadata.authn_requests_signed == Some(true))
         && !request_signature_verified
@@ -170,6 +200,15 @@ pub fn process_authn_request(
         requested_authn_context_decl_refs,
         authn_context_comparison,
     ) = match &request.requested_authn_context {
+        // The schema requires at least one class or declaration ref. An empty
+        // element is malformed, not "no constraint": collapsing it into the
+        // same state as an absent element would let it reuse any session.
+        Some(ctx)
+            if ctx.authn_context_class_refs.is_empty()
+                && ctx.authn_context_decl_refs.is_empty() =>
+        {
+            return Err(ProfileError::EmptyRequestedAuthnContext);
+        }
         Some(ctx) => (
             ctx.authn_context_class_refs.clone(),
             ctx.authn_context_decl_refs.clone(),
@@ -874,6 +913,51 @@ mod tests {
         );
         assert!(result.allow_create);
         assert_eq!(result.requested_authn_context_class_refs.len(), 1);
+    }
+
+    #[test]
+    fn test_process_authn_request_rejects_subject_confirmation() {
+        let mut request = make_authn_request();
+        request.subject = Some(Subject {
+            name_id: None,
+            subject_confirmations: vec![SubjectConfirmation {
+                method: "urn:oasis:names:tc:SAML:2.0:cm:bearer".to_string(),
+                name_id: None,
+                subject_confirmation_data: None,
+            }],
+        });
+        assert!(matches!(
+            process_authn_request(&request, &make_sp_metadata(), false),
+            Err(ProfileError::SubjectConfirmationInAuthnRequest)
+        ));
+
+        // A Subject that carries no confirmation is not refused by this rule.
+        request.subject = Some(Subject {
+            name_id: None,
+            subject_confirmations: vec![],
+        });
+        assert!(process_authn_request(&request, &make_sp_metadata(), false).is_ok());
+    }
+
+    #[test]
+    fn test_process_authn_request_rejects_an_empty_requested_authn_context() {
+        let mut request = make_authn_request();
+        request.requested_authn_context = Some(RequestedAuthnContext {
+            authn_context_class_refs: vec![],
+            authn_context_decl_refs: vec![],
+            comparison: AuthnContextComparison::Exact,
+        });
+        assert!(matches!(
+            process_authn_request(&request, &make_sp_metadata(), false),
+            Err(ProfileError::EmptyRequestedAuthnContext)
+        ));
+
+        // An absent element is a different thing: no constraint.
+        request.requested_authn_context = None;
+        let result = process_authn_request(&request, &make_sp_metadata(), false).unwrap();
+        assert!(result.requested_authn_context_class_refs.is_empty());
+        assert!(result.requested_authn_context_decl_refs.is_empty());
+        assert!(result.authn_context_comparison.is_none());
     }
 
     #[test]

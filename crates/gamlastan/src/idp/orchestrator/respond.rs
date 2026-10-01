@@ -82,6 +82,16 @@ pub fn check_request(
     session: Option<&EstablishedSession>,
 ) -> Disposition {
     let processed = &params.processed;
+
+    // A requested authn-context *declaration* cannot be matched (an
+    // `AuthnMethod` carries a class ref only). Treating the request as
+    // unconstrained would reuse any session or issue any class ref, so refuse it.
+    if !processed.requested_authn_context_decl_refs.is_empty() {
+        return Disposition::Deny {
+            denial: Denial::NoAuthnContext,
+        };
+    }
+
     let requested = params.requested_authn_context();
     let picked = engine.broker.pick(requested.as_ref());
     let session_lifetime = engine.decisions.session_lifetime(&processed.sp_entity_id);
@@ -167,20 +177,24 @@ fn class_ref_satisfies(
     let Some(requested) = requested else {
         return true;
     };
-    // For "exact", satisfaction is a literal match against the requested
-    // class refs (saml-core-2.0-os 3.3.2.2.1) - it does not depend on the
-    // broker having a registration for this class ref at all.
-    // AuthnMethodRef::Inline is documented as usable without any broker
-    // registration; consulting broker.pick() here would reject such a
-    // method purely because pick_by_class_ref's exact branch only considers
-    // methods registered under that class ref, incorrectly rejecting an
-    // otherwise-exact-matching inline method.
-    if requested.comparison == crate::core::protocol::request::AuthnContextComparison::Exact {
-        return requested
+    // For "exact", a literal match against the requested class refs
+    // (saml-core-2.0-os 3.3.2.2.1) satisfies the request without the broker
+    // having a registration for the class ref at all: AuthnMethodRef::Inline
+    // is documented as usable without any broker registration, and
+    // pick_by_class_ref's exact branch only considers registered methods, so
+    // consulting the broker first would reject an otherwise-exact inline method.
+    if requested.comparison == crate::core::protocol::request::AuthnContextComparison::Exact
+        && requested
             .authn_context_class_refs
             .iter()
-            .any(|c| c == class_ref);
+            .any(|c| c == class_ref)
+    {
+        return true;
     }
+    // Anything else is the broker's call. For "exact" that is what honours
+    // `AuthnBroker::allow_exact_level_matching(true)`: `check_request` offers
+    // same-level methods in that mode, so the response must accept the method
+    // that was offered, not deny it after the user has authenticated.
     broker
         .pick(Some(requested))
         .iter()
@@ -213,6 +227,13 @@ pub fn create_authn_response(
 ) -> Result<super::ResponseOutcome, ProfileError> {
     let processed = &params.processed;
     let sp = &params.sp_sso;
+
+    // `check_request` already refuses a declaration-only authn-context
+    // constraint; refuse it here too, before anything is minted or stored,
+    // for a caller that skipped `check_request`.
+    if !processed.requested_authn_context_decl_refs.is_empty() {
+        return denied(engine, params, &Denial::NoAuthnContext);
+    }
 
     // 1. Resolve the SP's attribute requirements (indexed or default
     //    service). An explicit index naming no declared service is a
@@ -469,19 +490,41 @@ fn denied(
 /// The advertisement is an untrusted claim: it only chooses among the IdP's own
 /// configured entries (see [`SigningPreference`](crate::crypto::SigningPreference)).
 /// With no preference configured this is the signer's default.
-fn signing_algorithms(
+pub(super) fn signing_algorithms(
     engine: &ResponseEngine,
     params: &ResponseParams,
 ) -> crate::crypto::SigningAlgorithms {
-    let advertised = params
-        .sp_entity
-        .as_ref()
-        .map(|entity| entity.supported_algorithms())
-        .unwrap_or_default();
+    let advertised = sp_advertised_algorithms(params);
     engine
         .decisions
         .signing_preference(&params.processed.sp_entity_id)
         .resolve(&advertised)
+}
+
+/// The algorithm URIs the SP advertises for this response: the entity-level
+/// `Extensions` plus the SAML 2.0 SP role the request was bound to
+/// (`params.sp_sso`).
+///
+/// Not `EntityDescriptor::supported_algorithms`, which aggregates every IdP and
+/// SP role of the entity and says single-role callers must filter: an algorithm
+/// advertised only by an IdP role, or by another SP role (a SAML 1.1
+/// descriptor), would otherwise be selected for this SAML 2.0 SP.
+pub(super) fn sp_advertised_algorithms(params: &ResponseParams) -> Vec<String> {
+    use crate::metadata::types::md_extensions::MdExtensions;
+    let entity_ext = params
+        .sp_entity
+        .as_ref()
+        .and_then(|entity| entity.extensions.as_ref());
+    let role_ext = params.sp_sso.sso_base.base.extensions.as_ref();
+    let mut out: Vec<String> = Vec::new();
+    for ext in [entity_ext, role_ext].into_iter().flatten() {
+        for alg in MdExtensions::from_extensions(ext).supported_algorithms() {
+            if !out.contains(&alg) {
+                out.push(alg);
+            }
+        }
+    }
+    out
 }
 
 /// Why NameID construction did not produce a NameID.

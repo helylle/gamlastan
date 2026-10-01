@@ -23,7 +23,10 @@ pub enum Denial {
     /// defeated reuse). The IdP cannot authenticate without user interaction.
     NoPassive,
     /// The requested `RequestedAuthnContext` cannot be satisfied by any
-    /// registered authentication method.
+    /// registered authentication method. Also used for a request that names
+    /// only authentication context *declaration* refs: a method carries a
+    /// class ref only, so a declaration constraint cannot be shown to be met
+    /// and is refused rather than ignored.
     NoAuthnContext,
     /// The `NameIDPolicy` cannot be satisfied: either `@Format` is not one
     /// this IdP can issue, or `@SPNameQualifier` names an entity other than

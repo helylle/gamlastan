@@ -80,12 +80,16 @@ where needed to correct protocol handling.
   directly would force every dependency to independently satisfy `'static`,
   which for ordinary application-owned state means leaking it. The
   `/saml/metadata` handler now also accepts `ResponseEngineParts` and
-  prefers its certificate over `IdpSigningContext`/`IdpConfig` when
-  present: previously the metadata handler had no idea `ResponseEngineParts`
-  existed, so registering only it (the documented policy-driven setup, with
-  no `IdpSigningContext`) produced signed responses while metadata
-  advertised no key at all - or a *different* key, if `IdpSigningContext`
-  also happened to be registered with its own certificate.
+  prefers its certificate over `IdpSigningContext`/`IdpConfig` when an
+  `AuthnSubjectCallback` is registered too, which is the only case in which
+  the engine signs (`idp_sso` takes the policy-driven path only with both).
+  Previously the metadata handler had no idea `ResponseEngineParts` existed,
+  so registering only it (the documented policy-driven setup, with no
+  `IdpSigningContext`) produced signed responses while metadata advertised no
+  key at all - or a *different* key, if `IdpSigningContext` also happened to
+  be registered with its own certificate. With parts but only the low-level
+  `AuthnCallback`, responses are signed by `IdpSigningContext`, and that is the
+  certificate metadata advertises.
 - Added `IdentDb::with_persist_transient` (default off; see "Changed" for why
   transient NameIDs are no longer stored by default). Opting in stores each
   transient NameID so `find_local_id` resolves it, which a back-channel (SOAP)
@@ -111,7 +115,12 @@ where needed to correct protocol handling.
   defaults are unchanged (the signer's method, SHA-256). Lower level:
   `sign_response_xml_with`, `signature_template_with_digest` and
   `SamlSigner::signature_method_uri_for`. An HSM-backed signer can only use its
-  token's own signature algorithm, and asking for another is an error.
+  token's own signature algorithm, and asking for another is an error, but only
+  when something is actually signed: a response that signs nothing never
+  consults the signer. The SP's advertisement is read from the entity-level
+  extensions and the SAML 2.0 SP role the request was bound to, not from every
+  IdP and SP role of the entity (which `EntityDescriptor::supported_algorithms`
+  aggregates), so an algorithm advertised only by another role is not selected.
 - `ident::conformance` (the reusable `IdentityStore` backend check) gains
   non-panicking entry points for callers that are not Rust tests, such as a
   language binding: `check` / `check_with` return the first violation as a
@@ -144,9 +153,15 @@ where needed to correct protocol handling.
   External consumers with hand-built literals (e.g. tunnelbana) need a
   one-line-per-site compat patch.
 - **Breaking:** `ProcessedAuthnRequest` gained
-  `requested_sp_name_qualifier` and `has_name_id_policy`. The struct is only
-  produced by `process_authn_request`, so hand-construction sites need both
-  fields added.
+  `requested_sp_name_qualifier`, `has_name_id_policy` and
+  `requested_authn_context_decl_refs`. The struct is only produced by
+  `process_authn_request`, so hand-construction sites need all three fields
+  added. `process_authn_request` used to discard `AuthnContextDeclRef`s, so a
+  `RequestedAuthnContext` naming only declarations looked like no constraint at
+  all and the engine would reuse any session or issue any class ref. An
+  `AuthnMethod` carries a class ref only, so a declaration cannot be shown to be
+  met: `check_request` and `create_authn_response` now deny such a request with
+  `NoAuthnContext`.
 - **Breaking:** `gamlastan-actix`'s `TrustedSp.sp_sso: SpSsoDescriptor` field
   is now `entity: EntityDescriptor`, with no separate registration-key field:
   `IdpConfig::with_trusted_sp(entity_id, sp_sso)` is now
@@ -238,7 +253,11 @@ where needed to correct protocol handling.
   registered at the same security level as the requested class (pysaml2's
   own `AuthnBroker` has the same broadening; gamlastan diverges from it
   here). Added `AuthnBroker::allow_exact_level_matching` to opt back into the
-  looser, pysaml2-compatible behavior.
+  looser, pysaml2-compatible behavior. The orchestrator honours the opt-in
+  consistently: a same-level method that `check_request` offers is accepted by
+  `create_authn_response` once the user authenticates with it, and a session it
+  established is reusable, rather than being denied for not being a literal
+  match.
 - Closed a check-then-create race on persistent NameID minting: two concurrent
   first requests for the same (user, SP) could each find no existing
   association and mint two different "stable" persistent identifiers. The

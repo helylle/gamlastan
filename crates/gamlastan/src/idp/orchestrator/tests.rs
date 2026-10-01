@@ -84,6 +84,7 @@ fn processed(
         has_name_id_policy: false,
         requested_authn_context_class_refs: class_refs.into_iter().map(String::from).collect(),
         authn_context_comparison: comparison,
+        requested_authn_context_decl_refs: vec![],
         attribute_consuming_service_index: None,
         extensions: None,
     }
@@ -1082,6 +1083,180 @@ fn response_engine_accepts_a_non_default_identity_store() {
     let p = params(processed(false, false, vec![], None));
     let outcome = create_authn_response(&engine, &p, &subject_without_mail()).unwrap();
     assert!(matches!(outcome, ResponseOutcome::Issued(_)));
+}
+
+// ── Review findings: authn context, compatibility mode, advertised roles ─────
+
+#[test]
+fn a_declaration_only_authn_context_request_is_denied_not_ignored() {
+    use crate::idp::orchestrator::Denial;
+    let decisions = ReleasePolicy::new();
+    let engine = engine_with_decisions(&decisions);
+    let mut p = params(processed(false, false, vec![], None));
+    p.processed.requested_authn_context_decl_refs = vec!["urn:example:decl".to_string()];
+
+    // No session: a declaration cannot be met, so this is not "unconstrained".
+    assert!(matches!(
+        check_request(&engine, &p, None),
+        Disposition::Deny {
+            denial: Denial::NoAuthnContext
+        }
+    ));
+    // A perfectly good session must not be reused to answer a constraint it
+    // cannot be shown to meet.
+    let s = session(AuthnMethodRef::Inline {
+        class_ref: PASSWORD.to_string(),
+        authn_authority: None,
+    });
+    assert!(matches!(
+        check_request(&engine, &p, Some(&s)),
+        Disposition::Deny {
+            denial: Denial::NoAuthnContext
+        }
+    ));
+    // Same with IsPassive.
+    p.processed.is_passive = true;
+    assert!(matches!(
+        check_request(&engine, &p, Some(&s)),
+        Disposition::Deny {
+            denial: Denial::NoAuthnContext
+        }
+    ));
+    // And the response path refuses to issue for a caller that skipped
+    // check_request.
+    let outcome = create_authn_response(&engine, &p, &subject_without_mail()).unwrap();
+    assert!(matches!(
+        outcome,
+        ResponseOutcome::Denied {
+            denial: Denial::NoAuthnContext,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn exact_level_matching_opt_in_is_consistent_between_check_and_response() {
+    // With `allow_exact_level_matching(true)`, check_request offers a method
+    // registered at the same level as the requested class. The response must
+    // accept that method, not deny it after the user has authenticated, and an
+    // existing session established by it must be reusable.
+    let mut b = AuthnBroker::new();
+    b.add(PASSWORD, "/login/password", 1, None);
+    b.add(PPT, "/login/ppt", 1, None);
+    let broker = b.allow_exact_level_matching(true);
+    let idents = IdentDb::in_memory(IDP);
+    let decisions = ReleasePolicy::new();
+    let (signer, cert) = fixture_signer();
+    let engine = ResponseEngine {
+        idp_entity_id: IDP,
+        decisions: &decisions,
+        release: &decisions,
+        idents: &idents,
+        broker: &broker,
+        assertions: None,
+        signer: &signer,
+        cert_der_b64: cert,
+    };
+    let p = params(processed(
+        false,
+        false,
+        vec![PASSWORD],
+        Some(AuthnContextComparison::Exact),
+    ));
+
+    match check_request(&engine, &p, None) {
+        Disposition::Authenticate { methods } => assert!(
+            methods.iter().any(|m| m.class_ref == PPT),
+            "the same-level method is offered in compatibility mode"
+        ),
+        other => panic!("expected Authenticate, got {other:?}"),
+    }
+
+    let subject = crate::idp::orchestrator::AuthenticatedSubject {
+        subject_id: "alice".to_string(),
+        attributes: vec![],
+        authn_method: AuthnMethodRef::Inline {
+            class_ref: PPT.to_string(),
+            authn_authority: None,
+        },
+        authn_instant: None,
+        session_index: None,
+    };
+    let outcome = create_authn_response(&engine, &p, &subject).unwrap();
+    assert!(
+        matches!(outcome, ResponseOutcome::Issued(_)),
+        "the offered method must be accepted: {outcome:?}"
+    );
+
+    let s = session(AuthnMethodRef::Inline {
+        class_ref: PPT.to_string(),
+        authn_authority: None,
+    });
+    assert!(matches!(
+        check_request(&engine, &p, Some(&s)),
+        Disposition::ReuseSession { .. }
+    ));
+}
+
+#[test]
+fn signing_algorithms_come_from_the_entity_and_the_requested_role_only() {
+    use crate::crypto::{DigestMethod, SignatureMethod, SigningPreference};
+    use crate::idp::policy::PolicyEntry;
+    use crate::metadata::types::entity_descriptor::EntityDescriptor;
+    use crate::metadata::types::extensions::Extensions;
+
+    fn alg(kind: &str, uri: &str) -> String {
+        format!(
+            r#"<alg:{kind} xmlns:alg="urn:oasis:names:tc:SAML:metadata:algsupport" Algorithm="{uri}"/>"#
+        )
+    }
+
+    // The role the request was bound to advertises RSA-SHA384; the entity
+    // advertises a SHA-384 digest; a *different* SP role of the same entity
+    // advertises RSA-SHA512 and must not count.
+    let mut role = sp_sso();
+    role.sso_base.base.extensions = Some(Extensions::new(alg(
+        "SigningMethod",
+        SignatureMethod::RsaSha384.uri(),
+    )));
+    let mut other_role = sp_sso();
+    other_role.sso_base.base.extensions = Some(Extensions::new(alg(
+        "SigningMethod",
+        SignatureMethod::RsaSha512.uri(),
+    )));
+    let mut entity = EntityDescriptor::for_sp(SP, other_role);
+    entity.extensions = Some(Extensions::new(alg(
+        "DigestMethod",
+        DigestMethod::Sha384.uri(),
+    )));
+
+    let mut p = params(processed(false, false, vec![], None));
+    p.sp_sso = role;
+    p.sp_entity = Some(entity);
+
+    let advertised = crate::idp::orchestrator::respond::sp_advertised_algorithms(&p);
+    assert!(advertised.contains(&SignatureMethod::RsaSha384.uri().to_string()));
+    assert!(advertised.contains(&DigestMethod::Sha384.uri().to_string()));
+    assert!(
+        !advertised.contains(&SignatureMethod::RsaSha512.uri().to_string()),
+        "an algorithm advertised only by another role must not be selected: {advertised:?}"
+    );
+
+    // And the IdP's own preference resolves against that, not the aggregate.
+    let decisions = ReleasePolicy::with_default(
+        PolicyEntry::new().with_signing_preference(
+            SigningPreference::new()
+                .with_signature_methods(vec![
+                    SignatureMethod::RsaSha512,
+                    SignatureMethod::RsaSha384,
+                ])
+                .with_digest_methods(vec![DigestMethod::Sha512, DigestMethod::Sha384]),
+        ),
+    );
+    let engine = engine_with_decisions(&decisions);
+    let resolved = crate::idp::orchestrator::respond::signing_algorithms(&engine, &p);
+    assert_eq!(resolved.signature, Some(SignatureMethod::RsaSha384));
+    assert_eq!(resolved.digest, Some(DigestMethod::Sha384));
 }
 
 // ── Per-SP signing algorithms ───────────────────────────────────────────────

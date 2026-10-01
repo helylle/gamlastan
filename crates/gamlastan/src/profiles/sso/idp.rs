@@ -93,6 +93,12 @@ pub struct ProcessedAuthnRequest {
     /// Authentication context comparison type.
     pub authn_context_comparison: Option<crate::core::protocol::request::AuthnContextComparison>,
 
+    /// Requested authentication context *declaration* refs
+    /// (`AuthnContextDeclRef`). An `AuthnMethod` carries a class ref only, so
+    /// the orchestrator cannot match a declaration; a request that names any is
+    /// denied with `NoAuthnContext` rather than treated as unconstrained.
+    pub requested_authn_context_decl_refs: Vec<String>,
+
     /// AttributeConsumingServiceIndex.
     pub attribute_consuming_service_index: Option<u16>,
 
@@ -159,11 +165,18 @@ pub fn process_authn_request(
         };
 
     // Extract RequestedAuthnContext
-    let (requested_authn_context_class_refs, authn_context_comparison) =
-        match &request.requested_authn_context {
-            Some(ctx) => (ctx.authn_context_class_refs.clone(), Some(ctx.comparison)),
-            None => (vec![], None),
-        };
+    let (
+        requested_authn_context_class_refs,
+        requested_authn_context_decl_refs,
+        authn_context_comparison,
+    ) = match &request.requested_authn_context {
+        Some(ctx) => (
+            ctx.authn_context_class_refs.clone(),
+            ctx.authn_context_decl_refs.clone(),
+            Some(ctx.comparison),
+        ),
+        None => (vec![], vec![], None),
+    };
 
     Ok(ProcessedAuthnRequest {
         request_id: request.base.id.clone(),
@@ -178,6 +191,7 @@ pub fn process_authn_request(
         has_name_id_policy,
         requested_authn_context_class_refs,
         authn_context_comparison,
+        requested_authn_context_decl_refs,
         attribute_consuming_service_index: request.attribute_consuming_service_index,
         extensions: request.extensions.clone(),
     })
@@ -681,6 +695,12 @@ pub fn sign_response_xml_with(
     sign_responses: bool,
     algorithms: &SigningAlgorithms,
 ) -> Result<String, ProfileError> {
+    // Nothing to sign: do not consult the signer. An HSM-backed signer refuses a
+    // signature method other than its token's, and that must not fail a
+    // response that is intentionally unsigned.
+    if !sign_assertions && !sign_responses {
+        return Ok(response_xml.to_string());
+    }
     let signature_method = signer.signature_method_uri_for(algorithms.signature)?;
     let digest_method = algorithms
         .digest
@@ -854,6 +874,23 @@ mod tests {
         );
         assert!(result.allow_create);
         assert_eq!(result.requested_authn_context_class_refs.len(), 1);
+    }
+
+    #[test]
+    fn test_process_authn_request_keeps_declaration_refs() {
+        let mut request = make_authn_request();
+        request.requested_authn_context = Some(RequestedAuthnContext {
+            authn_context_class_refs: vec![],
+            authn_context_decl_refs: vec!["urn:example:decl".to_string()],
+            comparison: AuthnContextComparison::Exact,
+        });
+        let result = process_authn_request(&request, &make_sp_metadata(), false).unwrap();
+        assert!(result.requested_authn_context_class_refs.is_empty());
+        assert_eq!(
+            result.requested_authn_context_decl_refs,
+            vec!["urn:example:decl".to_string()],
+            "a declaration-only constraint must survive processing"
+        );
     }
 
     #[test]
@@ -1157,6 +1194,40 @@ mod tests {
         assert!(tmpl.contains("<ds:DigestValue/>"));
         assert!(tmpl.contains("<ds:SignatureValue/>"));
         assert!(tmpl.contains("<ds:X509Certificate>CERTB64</ds:X509Certificate>"));
+    }
+
+    #[test]
+    fn an_unsigned_response_does_not_consult_the_signer_for_algorithms() {
+        use std::sync::Arc;
+
+        struct Token;
+        impl kryptering::Signer for Token {
+            fn algorithm(&self) -> kryptering::SignatureAlgorithm {
+                kryptering::SignatureAlgorithm::RsaPkcs1v15(kryptering::HashAlgorithm::Sha256)
+            }
+            fn sign(&self, _data: &[u8]) -> kryptering::Result<Vec<u8>> {
+                unreachable!("not used by this test")
+            }
+        }
+        let signer =
+            SamlSigner::with_hsm_signer(crate::crypto::KeysManager::new(), Arc::new(Token));
+        let algorithms = SigningAlgorithms {
+            signature: Some(crate::crypto::SignatureMethod::RsaSha512),
+            digest: None,
+        };
+        let xml = "<r/>";
+
+        // Nothing to sign: a preference the token cannot honour is irrelevant.
+        assert_eq!(
+            sign_response_xml_with(xml, &signer, "CERT", "_r", None, false, false, &algorithms)
+                .unwrap(),
+            xml
+        );
+        // Asking for a signature does reach the mismatch.
+        assert!(
+            sign_response_xml_with(xml, &signer, "CERT", "_r", None, false, true, &algorithms)
+                .is_err()
+        );
     }
 
     #[test]

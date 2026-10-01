@@ -126,6 +126,7 @@ fn processed() -> ProcessedAuthnRequest {
         has_name_id_policy: false,
         requested_authn_context_class_refs: vec![],
         authn_context_comparison: None,
+        requested_authn_context_decl_refs: vec![],
         attribute_consuming_service_index: None,
         extensions: None,
     }

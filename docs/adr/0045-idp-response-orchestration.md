@@ -69,7 +69,13 @@ existing primitives into the profile flow, and move the semantics proven in
    behaviour, and gamlastan intentionally diverges from it for spec
    conformance. `AuthnBroker::allow_exact_level_matching` restores the
    pysaml2-compatible behaviour for integrators who need parity over strict
-   conformance.
+   conformance; the response and session-reuse checks honour it as well as
+   `check_request`, so a method that was offered is accepted once the user
+   authenticates with it. A request whose `RequestedAuthnContext` names only
+   `AuthnContextDeclRef`s is denied with `NoAuthnContext`: an `AuthnMethod`
+   carries a class ref only, so a declaration constraint cannot be shown to be
+   met, and treating it as no constraint would reuse any session or issue any
+   class ref.
 
    NameID construction rejects a `NameIDPolicy/@SPNameQualifier` that names
    an entity other than the verified requester: per saml-core-2.0-os 8.3.7
@@ -132,7 +138,10 @@ existing primitives into the profile flow, and move the semantics proven in
    Signature and digest algorithms follow the per-SP `SigningPreference`,
    resolved against the SP's metadata advertisement but only ever among the
    IdP's own entries (the advertisement is untrusted); with none configured
-   the signer's defaults (RSA-SHA256, SHA-256) apply.
+   the signer's defaults (RSA-SHA256, SHA-256) apply. The advertisement is
+   read from the entity-level extensions and the SAML 2.0 SP role the request
+   was bound to, not from every role of the entity, and a response that signs
+   nothing never consults the signer.
 
 2. Invert the application contract. The application supplies what only it
    knows -- subject identifier, raw attribute values, which authentication
@@ -165,8 +174,10 @@ existing primitives into the profile flow, and move the semantics proven in
    from `ResponseEngineParts` per request.
 
    The `/saml/metadata` handler resolves its published signing certificate
-   from `ResponseEngineParts` first, then `IdpSigningContext`, then
-   `IdpConfig::signing_cert_b64`: the metadata handler previously knew
+   from `ResponseEngineParts` first (only when an `AuthnSubjectCallback` is
+   registered too, which is the only case in which the engine signs), then
+   `IdpSigningContext`, then `IdpConfig::signing_cert_b64`: the metadata
+   handler previously knew
    nothing about `ResponseEngineParts` at all, so a deployment registering
    only it (the documented policy-driven setup) signed real responses while
    publishing no key in its own metadata, and a deployment registering both
@@ -219,8 +230,9 @@ failure is a real protocol error rather than a silent per-integrator choice.
   low-level path.
 - Breaking (pre-release): `ResponseOptions` gained
   `authenticating_authorities: Vec<String>` (with a new `impl Default`), and
-  `ProcessedAuthnRequest` gained `requested_sp_name_qualifier` and
-  `has_name_id_policy`. Every in-crate struct literal was fixed with
+  `ProcessedAuthnRequest` gained `requested_sp_name_qualifier`,
+  `has_name_id_policy` and `requested_authn_context_decl_refs`. Every in-crate
+  struct literal was fixed with
   `..Default::default()`. External consumers with hand-built
   `ResponseOptions` literals (tunnelbana: 7 sites across
   `saml2_frontend.rs`, `saml2_backend.rs`, `stepup.rs`, and four test
@@ -299,7 +311,13 @@ failure is a real protocol error rather than a silent per-integrator choice.
   denial; an assertion store that cannot record is an error, not "issued";
   `Denial::AuthnFailed` / `Cancelled` are signed `Responder/AuthnFailed`
   responses; a configured `SigningPreference` is used for an issued response
-  and for a denial, and the signer's defaults apply without one.
+  and for a denial, and the signer's defaults apply without one; a
+  declaration-only `RequestedAuthnContext` is denied (never treated as
+  unconstrained); `allow_exact_level_matching` is consistent between
+  `check_request` and the response; the advertised algorithms come from the
+  entity and the requested role only. `gamlastan-actix`: `/saml/metadata`
+  advertises the certificate of the path that signs (the engine's only with an
+  `AuthnSubjectCallback`).
 - `crypto::algorithms` and `crypto::signer`: weak and unknown algorithm URIs
   are not representable; the first IdP preference the SP also advertises wins,
   an SP advertising nothing usable gets the IdP's first choice, and an SP

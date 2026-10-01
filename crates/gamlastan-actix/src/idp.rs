@@ -343,6 +343,18 @@ fn metadata_signing_cert_b64<'a>(
         .or(config.signing_cert_b64.as_deref())
 }
 
+/// The `ResponseEngineParts` that actually sign responses, if any.
+///
+/// `idp_sso` takes the policy-driven path only when both `ResponseEngineParts`
+/// and an `AuthnSubjectCallback` are registered. Parts registered alone do not
+/// sign anything, so they must not decide which certificate metadata advertises.
+fn policy_driven_parts(
+    parts: Option<&ResponseEngineParts>,
+    authn_subject_callback_registered: bool,
+) -> Option<&ResponseEngineParts> {
+    parts.filter(|_| authn_subject_callback_registered)
+}
+
 /// Insert a signature template as the FIRST child of a given element (right after
 /// its opening tag's `>`).
 ///
@@ -1253,6 +1265,7 @@ async fn idp_metadata(
     config: web::Data<IdpConfig>,
     signing_ctx: Option<web::Data<Arc<IdpSigningContext>>>,
     response_engine: Option<web::Data<Arc<ResponseEngineParts>>>,
+    authn_subject_callback: Option<web::Data<AuthnSubjectCallback>>,
 ) -> Result<MetadataXml, SamlActixError> {
     use gamlastan::core::identifiers::SamlId;
     use gamlastan::metadata::types::endpoint::Endpoint;
@@ -1264,12 +1277,21 @@ async fn idp_metadata(
     // Prefer the active signing source's certificate so metadata stays in sync
     // with the key that actually signs responses and metadata - see
     // metadata_signing_cert_b64's doc for the precedence and why it matters.
+    //
+    // `idp_sso` signs with `ResponseEngineParts` only when an
+    // `AuthnSubjectCallback` is registered too (see its `if let (Some(callback),
+    // Some(parts))`); with parts and only the low-level `AuthnCallback`, it signs
+    // with `IdpSigningContext` or not at all. The engine's certificate is
+    // therefore only advertised when it is the one actually signing.
     let metadata_cert_b64 = metadata_signing_cert_b64(
         config.get_ref(),
         signing_ctx.as_ref().map(|ctx| ctx.get_ref().as_ref()),
-        response_engine
-            .as_ref()
-            .map(|parts| parts.get_ref().as_ref()),
+        policy_driven_parts(
+            response_engine
+                .as_ref()
+                .map(|parts| parts.get_ref().as_ref()),
+            authn_subject_callback.is_some(),
+        ),
     );
 
     let key_descriptors = if let Some(cert_b64) = metadata_cert_b64 {
@@ -1870,6 +1892,91 @@ mod tests {
             metadata_signing_cert_b64(&config, None, Some(&parts)),
             Some(parts.cert_der_b64.as_str())
         );
+    }
+
+    #[actix_web::test]
+    async fn idp_metadata_advertises_the_certificate_of_the_path_that_signs() {
+        // The finding: `idp_sso` uses ResponseEngineParts only when an
+        // AuthnSubjectCallback is registered too. With parts plus only the
+        // low-level AuthnCallback, responses are signed by IdpSigningContext, so
+        // metadata must advertise that certificate, not the engine's.
+        const PARTS_CERT: &str = "PARTS_CERT_MARKER";
+        let ctx_cert = cert_b64(SIGN_CERT_PEM);
+        let config = || {
+            web::Data::new(IdpConfig::new(
+                "https://idp.example.com",
+                "https://idp.example.com/sso",
+            ))
+        };
+        let signing_ctx = || {
+            Some(web::Data::new(Arc::new(IdpSigningContext::new(
+                test_signer(),
+                ctx_cert.clone(),
+            ))))
+        };
+        let parts = || {
+            Some(web::Data::new(Arc::new(ResponseEngineParts::new(
+                "https://idp.example.com",
+                Arc::new(ReleasePolicy::new()),
+                Arc::new(gamlastan::idp::ident::IdentDb::in_memory(
+                    "https://idp.example.com",
+                )),
+                Arc::new(AuthnBroker::new()),
+                Arc::new(test_signer()),
+                PARTS_CERT.to_string(),
+            ))))
+        };
+        let callback = || {
+            let callback: AuthnSubjectCallback = Box::new(|_processed, _disposition, _req| {
+                Ok(AuthnSubjectResult::Deny(Denial::NoPassive))
+            });
+            Some(web::Data::new(callback))
+        };
+
+        // Metadata is signed with the context's key when one is registered, so
+        // the context certificate also appears in the metadata signature's
+        // KeyInfo. What this test is about is the advertised KeyDescriptor.
+        fn key_descriptor(xml: &str) -> &str {
+            let open = xml
+                .find("KeyDescriptor")
+                .and_then(|i| xml[..i].rfind('<'))
+                .expect("metadata has a KeyDescriptor");
+            let name_end = xml[open + 1..].find([' ', '>']).expect("tag end") + open + 1;
+            let name = &xml[open + 1..name_end];
+            let close = xml[open..]
+                .find(&format!("</{name}>"))
+                .expect("closing tag")
+                + open;
+            &xml[open..close]
+        }
+
+        // Parts + context, no subject callback: the context signs.
+        let xml = idp_metadata(config(), signing_ctx(), parts(), None)
+            .await
+            .unwrap()
+            .0;
+        let kd = key_descriptor(&xml);
+        assert!(kd.contains(&ctx_cert), "context certificate advertised");
+        assert!(
+            !kd.contains(PARTS_CERT),
+            "engine certificate not advertised"
+        );
+
+        // Parts + context + subject callback: the policy-driven path signs.
+        let xml = idp_metadata(config(), signing_ctx(), parts(), callback())
+            .await
+            .unwrap()
+            .0;
+        let kd = key_descriptor(&xml);
+        assert!(kd.contains(PARTS_CERT), "engine certificate advertised");
+        assert!(
+            !kd.contains(&ctx_cert),
+            "context certificate not advertised"
+        );
+
+        // Parts alone, no callback: nothing signs on this path, so no key.
+        let xml = idp_metadata(config(), None, parts(), None).await.unwrap().0;
+        assert!(!xml.contains(PARTS_CERT), "parts alone sign nothing");
     }
 
     #[test]

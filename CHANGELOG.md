@@ -127,6 +127,17 @@ where needed to correct protocol handling.
   one process, so a backend that serialises its calls can pass without having
   the constraint, and a race between separate processes is not detected. The
   module moved to `idp/ident/conformance.rs`.
+- Added `AttributeConverter::from_directions`, `add_wire_to_local` and
+  `add_local_to_wire`, for building a converter from independent inbound and
+  outbound maps, which is the shape of a pysaml2 attribute map (`MAP["fro"]`
+  and `MAP["to"]`). `add_mapping` and `from_entries` set both directions at
+  once and so cannot load a map whose directions differ; such maps are real
+  (a deployed eduID `saml_uri` map has 83 inbound and 99 outbound entries).
+  Mirroring one would make an SP-supplied attribute name resolve to a local
+  attribute it did not before, and would make the outbound name depend on
+  insertion order for a map with several wire names per local name.
+  `from_static` now goes through `from_directions` with identical results,
+  which a test checks for every shipped map.
 
 ### Changed
 

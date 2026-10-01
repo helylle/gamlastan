@@ -1,7 +1,8 @@
 //! Denial reasons for the response orchestrator.
 //!
 //! A [`Denial`] is a *protocol* refusal — the SP asked for something the IdP
-//! cannot or will not provide — as opposed to a programming or configuration
+//! cannot or will not provide, or authentication did not complete (it failed
+//! or the user cancelled) — as opposed to a programming or configuration
 //! fault (which is a `ProfileError`). Every denial is rendered as a **signed**
 //! SAML protocol error response, matching what `example-idp` does today: an
 //! unsigned denial is trivially forgeable, so the Response envelope is always
@@ -42,6 +43,16 @@ pub enum Denial {
     /// configured — bypasses that service's own declared attribute scoping
     /// and releases the subject's entire attribute set.
     InvalidAttributeConsumingServiceIndex,
+    /// Authentication was attempted and did not succeed (wrong credentials,
+    /// an upstream failure, a method the user could not complete). SAML has no
+    /// finer-grained status for this than `AuthnFailed`.
+    AuthnFailed,
+    /// The user abandoned the login. SAML has no dedicated "cancelled"
+    /// status, so this is the same `AuthnFailed` status as
+    /// [`Denial::AuthnFailed`] with a message that says it was a cancellation,
+    /// which lets an SP show "cancelled" rather than "failed". Kept a distinct
+    /// variant so an integrator can still tell the two apart for logging.
+    Cancelled,
 }
 
 impl Denial {
@@ -54,6 +65,7 @@ impl Denial {
     ///   `Requester/InvalidNameIDPolicy`
     /// - `MissingRequiredAttributes` → `Requester/InvalidAttrNameOrValue`
     /// - `InvalidAttributeConsumingServiceIndex` → `Requester/ResourceNotRecognized`
+    /// - `AuthnFailed` / `Cancelled` → `Responder/AuthnFailed`
     pub fn status(&self) -> Status {
         match self {
             Denial::NoPassive => Status::with_sub_status(
@@ -91,6 +103,16 @@ impl Denial {
                      declared service"
                         .to_string(),
                 ),
+            ),
+            Denial::AuthnFailed => Status::with_sub_status(
+                constants::STATUS_RESPONDER,
+                constants::STATUS_AUTHN_FAILED,
+                Some("Authentication failed".to_string()),
+            ),
+            Denial::Cancelled => Status::with_sub_status(
+                constants::STATUS_RESPONDER,
+                constants::STATUS_AUTHN_FAILED,
+                Some("Authentication was cancelled".to_string()),
             ),
         }
     }
@@ -134,6 +156,16 @@ mod tests {
                 Denial::InvalidAttributeConsumingServiceIndex,
                 constants::STATUS_REQUESTER,
                 constants::STATUS_RESOURCE_NOT_RECOGNIZED,
+            ),
+            (
+                Denial::AuthnFailed,
+                constants::STATUS_RESPONDER,
+                constants::STATUS_AUTHN_FAILED,
+            ),
+            (
+                Denial::Cancelled,
+                constants::STATUS_RESPONDER,
+                constants::STATUS_AUTHN_FAILED,
             ),
         ];
 
@@ -193,6 +225,17 @@ mod tests {
         );
     }
 
+    /// A cancellation and a plain failure share the `AuthnFailed` wire status but
+    /// carry different messages, so an SP can tell them apart.
+    #[test]
+    fn cancelled_and_authn_failed_share_status_but_differ_in_message() {
+        assert_ne!(Denial::AuthnFailed, Denial::Cancelled);
+        let failed = Denial::AuthnFailed.status();
+        let cancelled = Denial::Cancelled.status();
+        assert_eq!(failed.status_code, cancelled.status_code);
+        assert_ne!(failed.status_message, cancelled.status_message);
+    }
+
     /// No denial message interpolates SP-supplied input: the message is one of a
     /// fixed set, so a hostile request field cannot inject markup.
     #[test]
@@ -204,6 +247,8 @@ mod tests {
             Denial::NameIdCreationNotAllowed,
             Denial::MissingRequiredAttributes,
             Denial::InvalidAttributeConsumingServiceIndex,
+            Denial::AuthnFailed,
+            Denial::Cancelled,
         ]
         .iter()
         .map(|d| d.status().status_message.clone().unwrap())

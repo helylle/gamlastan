@@ -1258,3 +1258,45 @@ fn proxy_shape_produces_compliant_response_without_release_policy_filter() {
         other => panic!("expected Issued, got {other:?}"),
     }
 }
+
+#[test]
+fn cancelled_denial_response_is_signed_and_reports_authn_failed() {
+    let decisions = ReleasePolicy::new();
+    let engine = engine_with_decisions(&decisions);
+    let p = params(processed(false, false, vec![], None));
+
+    let issued = crate::idp::orchestrator::create_denial_response(
+        &engine,
+        &p,
+        &crate::idp::orchestrator::Denial::Cancelled,
+    )
+    .unwrap();
+
+    // The Response envelope is signed (a populated SignatureValue, not the empty
+    // template placeholder) and answers the request with AuthnFailed.
+    assert!(issued.xml.contains("<ds:SignatureValue>"));
+    assert!(!issued.xml.contains("<ds:SignatureValue/>"));
+    assert!(issued.xml.contains(constants::STATUS_RESPONDER));
+    assert!(issued.xml.contains(constants::STATUS_AUTHN_FAILED));
+    assert!(issued.xml.contains("Authentication was cancelled"));
+    assert!(issued.xml.contains("InResponseTo=\"_req1\""));
+    assert!(issued.assertion_id.is_none());
+}
+
+#[test]
+fn authn_failed_denial_response_differs_from_cancelled_only_in_message() {
+    let decisions = ReleasePolicy::new();
+    let engine = engine_with_decisions(&decisions);
+    let p = params(processed(false, false, vec![], None));
+
+    let failed = crate::idp::orchestrator::create_denial_response(
+        &engine,
+        &p,
+        &crate::idp::orchestrator::Denial::AuthnFailed,
+    )
+    .unwrap();
+
+    assert!(failed.xml.contains(constants::STATUS_AUTHN_FAILED));
+    assert!(failed.xml.contains("Authentication failed"));
+    assert!(!failed.xml.contains("Authentication was cancelled"));
+}

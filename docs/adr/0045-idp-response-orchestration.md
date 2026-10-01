@@ -271,7 +271,10 @@ failure is a real protocol error rather than a silent per-integrator choice.
   pysaml2 does (a binding alone narrows the default endpoint; a URL without a
   binding uses the one it is registered under instead of assuming HTTP-POST; a
   binding given with an index must agree with it). The response still goes only
-  to an endpoint registered in the SP's metadata.
+  to an endpoint registered in the SP's metadata. `acs_binding` can therefore be
+  Artifact or Redirect; the ready Actix handler and `example-idp` deliver by
+  HTTP-POST only and refuse such a request (`UnsupportedBinding`), and an
+  application that must serve it delivers by `acs_binding` itself.
 - Not handled by the engine: `Scoping` and the principal named by an
   AuthnRequest `Subject`. An originating IdP can ignore `Scoping`, but a proxy
   must enforce `ProxyCount` and `IDPList` itself (SAML Core 3.4.1.2), reading

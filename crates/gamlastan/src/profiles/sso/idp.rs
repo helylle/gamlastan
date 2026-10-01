@@ -77,7 +77,10 @@ pub struct ProcessedAuthnRequest {
     /// The ACS URL where the response should be sent.
     pub acs_url: String,
 
-    /// The ACS binding to use for the response.
+    /// The ACS binding to use for the response. It is the binding the resolved
+    /// endpoint is registered under, so it may be HTTP-Artifact or HTTP-Redirect,
+    /// not only HTTP-POST; deliver the response with it. The ready Actix handlers
+    /// and `example-idp` deliver by HTTP-POST only and refuse any other.
     pub acs_binding: String,
 
     /// Whether to force re-authentication.

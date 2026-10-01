@@ -1315,6 +1315,48 @@ mod tests {
         );
     }
 
+    /// A backend that reports `ValueTaken` for every `get_or_insert_durable`,
+    /// including for a value nothing else holds.
+    #[derive(Default)]
+    struct AlwaysTakenStore(PartialConstraintStore);
+
+    impl IdentityStore for AlwaysTakenStore {
+        fn for_user(&self, user_id: &str) -> Result<Vec<NameId>, StoreError> {
+            self.0.for_user(user_id)
+        }
+        fn user_for(&self, value: &str) -> Result<Option<String>, StoreError> {
+            self.0.user_for(value)
+        }
+        fn get_or_insert_durable(&self, _: &str, _: NameId) -> Result<NameId, InsertError> {
+            Err(InsertError::ValueTaken)
+        }
+        fn insert(&self, user_id: &str, name_id: NameId) -> Result<(), InsertError> {
+            self.0.insert(user_id, name_id)
+        }
+        fn replace(&self, user_id: &str, name_id: NameId) -> Result<(), InsertError> {
+            self.0.replace(user_id, name_id)
+        }
+        fn remove(&self, value: &str) -> Result<(), StoreError> {
+            self.0.remove(value)
+        }
+        fn remove_all(&self, user_id: &str) -> Result<(), StoreError> {
+            self.0.remove_all(user_id)
+        }
+    }
+
+    #[test]
+    fn a_backend_that_always_reports_value_taken_fails_the_check_instead_of_hanging() {
+        // The concurrent check used to retry a ValueTaken with the same
+        // candidate, which never ends against a backend that always says so.
+        let err = conformance::check_one(
+            "concurrent_get_or_insert_converges_on_one_identifier",
+            AlwaysTakenStore::default,
+            &conformance::Options { threads: 2 },
+        )
+        .unwrap_err();
+        assert!(err.message.contains("reported ValueTaken"), "{err}");
+    }
+
     #[test]
     fn check_returns_the_violation_instead_of_panicking() {
         let err = conformance::check(|| BrokenStore {

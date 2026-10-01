@@ -1025,7 +1025,17 @@ fn validate_authn_request(
         return Err("unsigned AuthnRequest rejected by IdP policy".to_string());
     }
 
-    idp_profile::process_authn_request(authn_request, &sp.sp_sso, signed).map_err(|e| e.to_string())
+    let processed = idp_profile::process_authn_request(authn_request, &sp.sp_sso, signed)
+        .map_err(|e| e.to_string())?;
+    // This example delivers every Response by HTTP-POST. An ACS registered for
+    // another binding would be answered with the wrong one, so refuse it.
+    if processed.acs_binding != gamlastan::core::constants::BINDING_HTTP_POST {
+        return Err(format!(
+            "ACS {} is registered for {}, but this IdP delivers by HTTP-POST only",
+            processed.acs_url, processed.acs_binding
+        ));
+    }
+    Ok(processed)
 }
 
 /// Load every trusted SP, keyed by entity ID.
@@ -1637,6 +1647,34 @@ mod tests {
             provider_name: None,
             extensions: None,
         }
+    }
+
+    /// This example delivers every Response by HTTP-POST, so a request that
+    /// resolves to an ACS registered for another binding is refused rather than
+    /// answered with the wrong one.
+    #[test]
+    fn an_acs_registered_for_a_non_post_binding_is_refused() {
+        let mut state = test_state(false, &["https://sp.example.se/metadata"]);
+        state
+            .trusted_sps
+            .get_mut("https://sp.example.se/metadata")
+            .expect("trusted SP")
+            .sp_sso
+            .assertion_consumer_services
+            .push(gamlastan::metadata::types::endpoint::IndexedEndpoint::new(
+                gamlastan::metadata::types::endpoint::Endpoint::new(
+                    "urn:oasis:names:tc:SAML:2.0:bindings:HTTP-Artifact",
+                    "https://sp.example.se/artifact",
+                ),
+                9,
+            ));
+        let mut request = unsigned_request("https://sp.example.se/metadata");
+        request.assertion_consumer_service_url = None;
+        request.protocol_binding = None;
+        request.assertion_consumer_service_index = Some(9);
+
+        let err = validate_authn_request(&state, &request, "", None).unwrap_err();
+        assert!(err.contains("HTTP-POST only"), "{err}");
     }
 
     /// Build a validated request for helper-level policy and state tests.

@@ -151,12 +151,12 @@ pub struct AuthnCallbackResult {
 /// [`AuthnCallbackResult`] (NameID already constructed, attributes already
 /// filtered, authn context already matched) — this callback reports only the
 /// *identity facts* the application knows, and lets the
-/// [`ResponseEngine`](gamlastan::idp::orchestrator::ResponseEngine) derive the
+/// [`ResponseEngine`] derive the
 /// NameID, released attributes, and authn context, then assemble and sign the
 /// response. This is the crate's policy-driven path; [`AuthnCallback`] remains
 /// the lower-level escape hatch for integrators who want to bypass crate policy.
 ///
-/// The handler calls [`check_request`](gamlastan::idp::orchestrator::check_request)
+/// The handler calls [`check_request`]
 /// (via the registered [`EstablishedSessionCallback`], if any) *before*
 /// invoking this callback, and passes the resulting [`Disposition`]: a `Deny`
 /// is handled directly (a signed protocol error — this callback is never
@@ -181,7 +181,7 @@ pub type AuthnSubjectCallback = Box<
 
 /// Reports whether the current request already carries an established IdP
 /// session (e.g. by reading a session cookie the application recognizes),
-/// for [`check_request`](gamlastan::idp::orchestrator::check_request) to
+/// for [`check_request`] to
 /// weigh against `ForceAuthn`/`IsPassive`/`RequestedAuthnContext`.
 ///
 /// Distinct from [`SessionStore`](gamlastan::profiles::session::SessionStore):
@@ -508,6 +508,7 @@ async fn idp_sso(
     let processed =
         idp_profile::process_authn_request(&authn_request, &sp_sso, request_signature_verified)
             .map_err(SamlActixError::Profile)?;
+    require_post_acs(&processed)?;
 
     // The higher-level, policy-driven path: when both an AuthnSubjectCallback
     // and ResponseEngineParts are registered, the engine derives the NameID,
@@ -625,6 +626,25 @@ async fn idp_sso(
     );
 
     Ok(crate::response_adapter::post_binding_response(&html))
+}
+
+/// The ready handlers deliver a full Response through an auto-submitting HTTP-POST
+/// form, whatever the ACS binding the request resolved to. A request that resolves
+/// to an endpoint registered for another binding (HTTP-Artifact, HTTP-Redirect)
+/// would be answered with the wrong binding, so it is refused here instead.
+/// An application that has to serve such an SP uses the profile functions
+/// directly: `ProcessedAuthnRequest::acs_binding` says how to deliver.
+fn require_post_acs(
+    processed: &gamlastan::profiles::sso::idp::ProcessedAuthnRequest,
+) -> Result<(), SamlActixError> {
+    if processed.acs_binding == gamlastan::core::constants::BINDING_HTTP_POST {
+        return Ok(());
+    }
+    Err(SamlActixError::UnsupportedBinding(format!(
+        "the ACS {} resolved from the request is registered for {}, but this handler \
+         delivers by HTTP-POST only",
+        processed.acs_url, processed.acs_binding
+    )))
 }
 
 /// POST-encode a signed, assembled response to the SP's ACS and wrap it as the
@@ -2339,6 +2359,76 @@ mod tests {
             "AuthnSubjectCallback must be invoked when authentication is needed"
         );
         assert_eq!(response.status(), actix_web::http::StatusCode::OK);
+    }
+
+    #[actix_web::test]
+    async fn idp_sso_refuses_an_acs_registered_for_a_binding_it_cannot_deliver() {
+        // The ready handler delivers by HTTP-POST only. A request that resolves
+        // to an Artifact endpoint must be refused, not answered with a POSTed
+        // Response the SP's artifact endpoint cannot use, and the callback must
+        // not run (no login for a response that cannot be delivered).
+        const SP: &str = "https://sp.example.com";
+        const ACS: &str = "https://sp.example.com/acs";
+
+        let mut sp_sso = sp_sso_with_acs(ACS);
+        sp_sso.assertion_consumer_services.push(
+            gamlastan::metadata::types::endpoint::IndexedEndpoint::new(
+                gamlastan::metadata::types::endpoint::Endpoint::new(
+                    "urn:oasis:names:tc:SAML:2.0:bindings:HTTP-Artifact",
+                    "https://sp.example.com/artifact",
+                ),
+                5,
+            ),
+        );
+        let entity =
+            gamlastan::metadata::types::entity_descriptor::EntityDescriptor::for_sp(SP, sp_sso);
+        let config = web::Data::new(
+            IdpConfig::new("https://idp.example.com", "https://idp.example.com/sso")
+                .with_trusted_sp(entity),
+        );
+        let signing_ctx = web::Data::new(Arc::new(IdpSigningContext::new(
+            test_signer(),
+            cert_b64(SIGN_CERT_PEM),
+        )));
+        let callback_invoked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = callback_invoked.clone();
+        let authn_subject_callback: AuthnSubjectCallback =
+            Box::new(move |_processed, _disposition, _req| {
+                flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(AuthnSubjectResult::Deny(Denial::NoPassive))
+            });
+
+        let mut request = passive_authn_request(SP);
+        request.is_passive = None;
+        request.assertion_consumer_service_index = Some(5); // the Artifact endpoint
+        let msg = SamlMessage {
+            saml_xml: request.to_xml_string().unwrap().into_bytes(),
+            relay_state: None,
+            is_request: true,
+            binding: crate::extractors::SamlBinding::HttpPost,
+            redirect_signature: None,
+        };
+
+        let result = idp_sso(
+            msg,
+            config,
+            Some(signing_ctx),
+            None,
+            Some(web::Data::new(authn_subject_callback)),
+            None,
+            Some(web::Data::new(Arc::new(response_engine_parts()))),
+            actix_web::test::TestRequest::default().to_http_request(),
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(SamlActixError::UnsupportedBinding(_))),
+            "a non-POST ACS must be refused"
+        );
+        assert!(
+            !callback_invoked.load(std::sync::atomic::Ordering::SeqCst),
+            "the callback must not run for a request that cannot be answered"
+        );
     }
 
     #[actix_web::test]

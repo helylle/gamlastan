@@ -137,7 +137,10 @@ where needed to correct protocol handling.
   checks' thread count. `run` still panics and is unchanged for Rust tests. A
   backend call that fails is now a failed check naming the operation, and the
   concurrent-insert check no longer counts a backend failure as a lost race
-  (which made a dead backend look as if it had exactly one winner). The docs
+  (which made a dead backend look as if it had exactly one winner). The
+  concurrent get-or-insert check treats `ValueTaken` as a violation instead of
+  retrying with the same candidate, which never ended against a backend that
+  always reports it. The docs
   state what the suite cannot prove: its concurrent checks run on threads in
   one process, so a backend that serialises its calls can pass without having
   the constraint, and a race between separate processes is not detected. The
@@ -294,7 +297,13 @@ where needed to correct protocol handling.
   `AcsUrlMismatch`). A `ProtocolBinding` given with an index must match that
   endpoint's binding. The response still only goes to an endpoint registered in
   the SP's metadata, and a URL and an index given together still resolve by the
-  URL, as in pysaml2.
+  URL, as in pysaml2. `ProcessedAuthnRequest::acs_binding` is the binding the
+  endpoint is registered under, so it can be HTTP-Artifact or HTTP-Redirect. The
+  ready Actix handler and `example-idp` deliver by HTTP-POST only, and now refuse
+  a request that resolves to another binding
+  (`SamlActixError::UnsupportedBinding`) instead of POSTing a Response to an
+  endpoint that expects an artifact or a redirect; an application that has to
+  serve such an SP uses the profile functions and delivers by `acs_binding`.
 - **Breaking:** the store traits are fallible. `IdentityStore`, `KeyValueStore`
   and `AssertionStore` methods return `Result<_, StoreError>` (the two insert
   paths return `InsertError`, which separates a `ValueTaken` conflict from a

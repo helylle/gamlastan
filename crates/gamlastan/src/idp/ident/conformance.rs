@@ -725,18 +725,20 @@ where
             .map(|i| {
                 let store = Arc::clone(&store);
                 thread::spawn(move || -> Result<String, String> {
-                    // Retry on ValueTaken exactly as IdentDb does.
-                    loop {
-                        let candidate = nid(&format!("{label}{i}"), format, Some(SP_A));
-                        match store.get_or_insert_durable("alice", candidate) {
-                            Ok(winner) => return Ok(winner.value),
-                            Err(InsertError::ValueTaken) => continue,
-                            Err(e) => {
-                                return Err(format!(
-                                    "backend call `get_or_insert_durable` failed: {e}"
-                                ))
-                            }
-                        }
+                    // Every worker's value is distinct and the store is fresh, so
+                    // the value is never held by another record: ValueTaken
+                    // here is a backend fault, not a lost race to retry. (A
+                    // retry would reuse the same candidate and, against a
+                    // backend that always says ValueTaken, never end.)
+                    let candidate = nid(&format!("{label}{i}"), format, Some(SP_A));
+                    match store.get_or_insert_durable("alice", candidate) {
+                        Ok(winner) => Ok(winner.value),
+                        Err(InsertError::ValueTaken) => Err(format!(
+                            "backend call `get_or_insert_durable` reported ValueTaken for a \
+                             value no other record holds ({label}{i}): value uniqueness is \
+                             being enforced against the wrong thing"
+                        )),
+                        Err(e) => Err(format!("backend call `get_or_insert_durable` failed: {e}")),
                     }
                 })
             })

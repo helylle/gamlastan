@@ -1084,6 +1084,76 @@ fn response_engine_accepts_a_non_default_identity_store() {
     assert!(matches!(outcome, ResponseOutcome::Issued(_)));
 }
 
+// ── Per-SP signing algorithms ───────────────────────────────────────────────
+
+fn sha512_policy() -> ReleasePolicy {
+    use crate::crypto::{DigestMethod, SignatureMethod, SigningPreference};
+    use crate::idp::policy::{PolicyEntry, SignTargets};
+    ReleasePolicy::with_default(
+        PolicyEntry::new()
+            .with_sign(SignTargets {
+                response: true,
+                ..Default::default()
+            })
+            .with_signing_preference(
+                SigningPreference::new()
+                    .with_signature_methods(vec![SignatureMethod::RsaSha512])
+                    .with_digest_methods(vec![DigestMethod::Sha512]),
+            ),
+    )
+}
+
+#[test]
+fn a_configured_signing_preference_is_used_for_an_issued_response() {
+    use crate::crypto::{DigestMethod, SignatureMethod};
+    let decisions = sha512_policy();
+    let engine = engine_with_decisions(&decisions);
+    let p = params(processed(false, false, vec![], None));
+    let ResponseOutcome::Issued(issued) =
+        create_authn_response(&engine, &p, &subject_without_mail()).unwrap()
+    else {
+        panic!("expected an issued response");
+    };
+    assert!(issued.xml.contains(SignatureMethod::RsaSha512.uri()));
+    assert!(issued.xml.contains(DigestMethod::Sha512.uri()));
+    assert!(!issued.xml.contains("xmlenc#sha256"));
+}
+
+#[test]
+fn a_configured_signing_preference_is_used_for_a_denial_too() {
+    use crate::crypto::{DigestMethod, SignatureMethod};
+    let decisions = sha512_policy();
+    let engine = engine_with_decisions(&decisions);
+    let p = params(processed(false, false, vec![], None));
+    let denial = crate::idp::orchestrator::create_denial_response(
+        &engine,
+        &p,
+        &crate::idp::orchestrator::Denial::Cancelled,
+    )
+    .unwrap();
+    assert!(denial.xml.contains(SignatureMethod::RsaSha512.uri()));
+    assert!(denial.xml.contains(DigestMethod::Sha512.uri()));
+}
+
+#[test]
+fn without_a_signing_preference_the_signer_default_applies() {
+    use crate::crypto::DigestMethod;
+    use crate::idp::policy::{PolicyEntry, SignTargets};
+    let decisions = ReleasePolicy::with_default(PolicyEntry::new().with_sign(SignTargets {
+        response: true,
+        ..Default::default()
+    }));
+    let engine = engine_with_decisions(&decisions);
+    let p = params(processed(false, false, vec![], None));
+    let ResponseOutcome::Issued(issued) =
+        create_authn_response(&engine, &p, &subject_without_mail()).unwrap()
+    else {
+        panic!("expected an issued response");
+    };
+    assert!(issued.xml.contains(DigestMethod::Sha256.uri()));
+    assert!(issued.xml.contains("xmldsig-more#rsa-sha256"));
+}
+
 // ── Store outages ───────────────────────────────────────────────────────────
 
 fn outage() -> StoreError {

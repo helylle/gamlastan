@@ -23,6 +23,7 @@ use regex::Regex;
 use crate::attribute_map::AttributeConverterSet;
 use crate::core::assertion::attribute::{Attribute, AttributeValue};
 use crate::core::constants;
+use crate::crypto::SigningPreference;
 use crate::idp::entity_category::{
     releasable_attributes_owned, EntityCategoryPolicy, OwnedEntityCategoryPolicy, SubjectIdReq,
 };
@@ -98,6 +99,7 @@ pub struct PolicyEntry {
     nameid_format: Option<String>,
     name_form: Option<String>,
     sign: Option<SignTargets>,
+    signing_preference: Option<SigningPreference>,
     fail_on_missing_requested: Option<bool>,
     entity_categories: Option<Vec<OwnedEntityCategoryPolicy>>,
 }
@@ -171,6 +173,15 @@ impl PolicyEntry {
     /// Set the signing targets.
     pub fn with_sign(mut self, sign: SignTargets) -> Self {
         self.sign = Some(sign);
+        self
+    }
+
+    /// Set the signature and digest algorithms to prefer when signing for this
+    /// SP, most preferred first. The orchestrator picks, per response, the
+    /// first the SP also advertises in its metadata, else the first listed
+    /// (see [`SigningPreference`]). Without it the signer's defaults apply.
+    pub fn with_signing_preference(mut self, preference: SigningPreference) -> Self {
+        self.signing_preference = Some(preference);
         self
     }
 
@@ -404,6 +415,13 @@ impl ReleasePolicy {
     /// Signing targets for the SP (default: nothing).
     pub fn sign(&self, sp_entity_id: &str) -> SignTargets {
         self.get(sp_entity_id, |e| e.sign).unwrap_or_default()
+    }
+
+    /// Signing algorithm preference for the SP (default: none, so the signer's
+    /// own defaults apply).
+    pub fn signing_preference(&self, sp_entity_id: &str) -> SigningPreference {
+        self.get(sp_entity_id, |e| e.signing_preference.clone())
+            .unwrap_or_default()
     }
 
     /// Whether a missing required attribute is an error (default: true).

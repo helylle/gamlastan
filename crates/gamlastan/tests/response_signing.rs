@@ -11,9 +11,13 @@ use chrono::Utc;
 use gamlastan::core::assertion::name_id::NameId;
 use gamlastan::core::constants;
 use gamlastan::crypto::keys::loader;
+use gamlastan::crypto::{DigestMethod, SignatureMethod, SigningAlgorithms};
 use gamlastan::crypto::{KeyUsage, KeysManager, SamlSigner, SamlVerifier};
-use gamlastan::profiles::sso::idp::create_signed_response;
+use gamlastan::profiles::sso::idp::{
+    create_response, create_signed_response, sign_response_xml_with,
+};
 use gamlastan::profiles::sso::web_browser::{ResponseOptions, ResponseTimes};
+use gamlastan::xml::serialize::SamlSerialize;
 
 const CERT_PEM: &str = include_str!("fixtures/enc-cert.pem");
 const KEY_PEM: &str = include_str!("fixtures/enc-key.pem");
@@ -162,5 +166,50 @@ fn signs_response_and_assertion_and_verifies() {
     assert!(
         results.iter().all(|r| r.is_valid()),
         "response/assertion signatures did not validate"
+    );
+}
+
+#[test]
+fn signs_with_requested_algorithms_and_verifies() {
+    let (cert_b64, cert_der) = cert_b64_and_der();
+    let response = create_response(
+        &sample_options(),
+        &sample_name_id(),
+        ResponseTimes::at(Utc::now()),
+    );
+    let response_id = response.base.id.clone();
+    let assertion_id = response.assertions[0].id.clone();
+    let xml = response.to_xml_string().expect("serialize");
+
+    let signed = sign_response_xml_with(
+        &xml,
+        &signer(),
+        &cert_b64,
+        &response_id,
+        Some(&assertion_id),
+        true,
+        true,
+        &SigningAlgorithms {
+            signature: Some(SignatureMethod::RsaSha512),
+            digest: Some(DigestMethod::Sha512),
+        },
+    )
+    .expect("sign with RSA-SHA512 / SHA-512");
+
+    // Both signatures carry the requested algorithms and no SHA-256 default.
+    assert_eq!(signed.matches(SignatureMethod::RsaSha512.uri()).count(), 2);
+    assert_eq!(signed.matches(DigestMethod::Sha512.uri()).count(), 2);
+    assert!(!signed.contains("xmldsig-more#rsa-sha256"));
+    assert!(!signed.contains("xmlenc#sha256"));
+
+    // And they genuinely validate: the signature was made with the requested
+    // algorithms, not merely labelled with them.
+    let results = verifier(cert_der)
+        .verify_all_enveloped(&signed)
+        .expect("verify enveloped signatures");
+    assert_eq!(results.len(), 2);
+    assert!(
+        results.iter().all(|r| r.is_valid()),
+        "SHA-512 signatures did not validate"
     );
 }

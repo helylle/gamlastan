@@ -130,6 +130,10 @@ existing primitives into the profile flow, and move the semantics proven in
    application-level error, matching what `example-idp` did before this ADR.
    Denials always sign the Response envelope unconditionally, regardless of
    the per-SP `SignTargets` -- an unsigned denial is trivially forgeable.
+   Signature and digest algorithms follow the per-SP `SigningPreference`,
+   resolved against the SP's metadata advertisement but only ever among the
+   IdP's own entries (the advertisement is untrusted); with none configured
+   the signer's defaults (RSA-SHA256, SHA-256) apply.
 
 2. Invert the application contract. The application supplies what only it
    knows -- subject identifier, raw attribute values, which authentication

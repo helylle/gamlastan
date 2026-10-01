@@ -101,6 +101,19 @@ where needed to correct protocol handling.
   matches anything. `find` has a default that filters `for_user`; a backend
   overrides it to push the filter into a query. The conformance suite checks
   that an override agrees with the default's semantics.
+- Added per-SP signature and digest algorithm selection. `SignatureMethod`
+  (SHA-2 RSA and ECDSA), `DigestMethod` (SHA-2), `SigningPreference` and
+  `SigningAlgorithms` live in `crypto`; `PolicyEntry::with_signing_preference`
+  sets an SP's ordered preference. The orchestrator signs each response (and
+  each denial) with the first preferred algorithm the SP also advertises in its
+  metadata, else the first listed. The advertisement is untrusted: it only
+  chooses among the IdP's own entries, and SHA-1, MD5 and the like are not
+  representable, so neither configuration nor a peer can select them. The
+  digest used to be hardcoded to SHA-256; with no preference configured the
+  defaults are unchanged (the signer's method, SHA-256). Lower level:
+  `sign_response_xml_with`, `signature_template_with_digest` and
+  `SamlSigner::signature_method_uri_for`. An HSM-backed signer can only use its
+  token's own signature algorithm, and asking for another is an error.
 
 ### Changed
 

@@ -37,7 +37,7 @@ use crate::crypto::encryptor::{
 };
 use crate::metadata::types::sp::SpSsoDescriptor;
 
-use crate::crypto::SamlSigner;
+use crate::crypto::{DigestMethod, SamlSigner, SigningAlgorithms};
 use crate::profiles::error::ProfileError;
 use crate::profiles::sso::web_browser::{ResponseOptions, ResponseTimes};
 use crate::xml::serialize::SamlSerialize;
@@ -550,6 +550,23 @@ pub fn signature_template(
     cert_der_b64: &str,
     signature_method_uri: &str,
 ) -> String {
+    signature_template_with_digest(
+        reference_id,
+        cert_der_b64,
+        signature_method_uri,
+        DIGEST_METHOD_SHA256,
+    )
+}
+
+/// [`signature_template`] with an explicit `<ds:DigestMethod>` algorithm
+/// instead of SHA-256. `digest_method_uri` is escaped like the other caller
+/// supplied values; prefer [`DigestMethod::uri`] over a free-form string.
+pub fn signature_template_with_digest(
+    reference_id: &str,
+    cert_der_b64: &str,
+    signature_method_uri: &str,
+    digest_method_uri: &str,
+) -> String {
     use bergshamra_c14n::escape::escape_attr;
     let key_info = crate::crypto::build_x509_key_info(&[cert_der_b64]);
     format!(
@@ -557,7 +574,7 @@ pub fn signature_template(
         id = escape_attr(reference_id),
         key_info = key_info,
         sig_alg = escape_attr(signature_method_uri),
-        digest = DIGEST_METHOD_SHA256,
+        digest = escape_attr(digest_method_uri),
     )
 }
 
@@ -635,13 +652,51 @@ pub fn sign_response_xml(
     sign_assertions: bool,
     sign_responses: bool,
 ) -> Result<String, ProfileError> {
+    sign_response_xml_with(
+        response_xml,
+        signer,
+        cert_der_b64,
+        response_id,
+        assertion_id,
+        sign_assertions,
+        sign_responses,
+        &SigningAlgorithms::default(),
+    )
+}
+
+/// [`sign_response_xml`] with explicit signature and digest algorithms.
+///
+/// `algorithms` overrides the signer's default for this one response (a `None`
+/// field keeps the default: the signer's method, SHA-256 digest). An HSM-backed
+/// signer can only use its token's own signature algorithm; asking for another
+/// is an error (see [`SamlSigner::signature_method_uri_for`]).
+#[allow(clippy::too_many_arguments)]
+pub fn sign_response_xml_with(
+    response_xml: &str,
+    signer: &SamlSigner,
+    cert_der_b64: &str,
+    response_id: &str,
+    assertion_id: Option<&str>,
+    sign_assertions: bool,
+    sign_responses: bool,
+    algorithms: &SigningAlgorithms,
+) -> Result<String, ProfileError> {
+    let signature_method = signer.signature_method_uri_for(algorithms.signature)?;
+    let digest_method = algorithms
+        .digest
+        .map_or(DIGEST_METHOD_SHA256, DigestMethod::uri);
     let mut xml = response_xml.to_string();
 
     if sign_assertions {
         let assertion_id = assertion_id.ok_or_else(|| {
             ProfileError::Other("sign_assertions requested without an assertion_id".to_string())
         })?;
-        let sig = signature_template(assertion_id, cert_der_b64, signer.signature_method_uri()?);
+        let sig = signature_template_with_digest(
+            assertion_id,
+            cert_der_b64,
+            signature_method,
+            digest_method,
+        );
         xml = insert_signature_after_issuer(
             &xml,
             namespace::SAML_ASSERTION_NS,
@@ -653,7 +708,12 @@ pub fn sign_response_xml(
     }
 
     if sign_responses {
-        let sig = signature_template(response_id, cert_der_b64, signer.signature_method_uri()?);
+        let sig = signature_template_with_digest(
+            response_id,
+            cert_der_b64,
+            signature_method,
+            digest_method,
+        );
         xml = insert_signature_after_issuer(
             &xml,
             namespace::SAML_PROTOCOL_NS,
@@ -1097,6 +1157,26 @@ mod tests {
         assert!(tmpl.contains("<ds:DigestValue/>"));
         assert!(tmpl.contains("<ds:SignatureValue/>"));
         assert!(tmpl.contains("<ds:X509Certificate>CERTB64</ds:X509Certificate>"));
+    }
+
+    #[test]
+    fn test_signature_template_with_digest_uses_the_requested_digest() {
+        let tmpl = signature_template_with_digest(
+            "_a1",
+            "CERTB64",
+            RSA_SHA256_URI,
+            DigestMethod::Sha512.uri(),
+        );
+        assert!(tmpl.contains(&format!(
+            r#"<ds:DigestMethod Algorithm="{}"/>"#,
+            DigestMethod::Sha512.uri()
+        )));
+        assert!(
+            !tmpl.contains("xmlenc#sha256"),
+            "the SHA-256 default must not leak into a SHA-512 template"
+        );
+        // The plain constructor still emits SHA-256.
+        assert!(signature_template("_a1", "CERTB64", RSA_SHA256_URI).contains("xmlenc#sha256"));
     }
 
     #[test]

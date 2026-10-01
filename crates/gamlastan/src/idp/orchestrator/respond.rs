@@ -15,7 +15,7 @@ use crate::idp::authn_broker::AuthnBroker;
 use crate::idp::ident::NameIdConstructor;
 use crate::idp::policy::{sp_attribute_requirements, PolicyError, ReleasePolicy};
 use crate::profiles::error::ProfileError;
-use crate::profiles::sso::idp::{create_error_response, create_response, sign_response_xml};
+use crate::profiles::sso::idp::{create_error_response, create_response, sign_response_xml_with};
 use crate::profiles::sso::web_browser::{ResponseOptions, ResponseTimes};
 use crate::xml::serialize::SamlSerialize;
 
@@ -362,7 +362,7 @@ pub fn create_authn_response(
     let xml = response
         .to_xml_string()
         .map_err(|e| ProfileError::Other(format!("failed to serialize Response: {e}")))?;
-    let signed_xml = sign_response_xml(
+    let signed_xml = sign_response_xml_with(
         &xml,
         engine.signer,
         engine.cert_der_b64,
@@ -370,6 +370,7 @@ pub fn create_authn_response(
         assertion_id.as_deref(),
         sign.sign_assertion,
         sign.sign_response,
+        &signing_algorithms(engine, params),
     )?;
 
     // 8. Store the assertion for back-channel queries, if a store is present.
@@ -420,7 +421,7 @@ pub fn create_denial_response(
         .map_err(|e| ProfileError::Other(format!("failed to serialize denial Response: {e}")))?;
 
     // Denials always sign the Response envelope.
-    let signed_xml = crate::profiles::sso::idp::sign_response_xml(
+    let signed_xml = sign_response_xml_with(
         &xml,
         engine.signer,
         engine.cert_der_b64,
@@ -428,6 +429,7 @@ pub fn create_denial_response(
         None,
         false,
         true,
+        &signing_algorithms(engine, params),
     )?;
 
     Ok(IssuedResponse {
@@ -458,6 +460,28 @@ fn denied(
         denial: *denial,
         response,
     })
+}
+
+/// The signature and digest algorithms for this response: the SP's configured
+/// preference (see [`PolicyEntry::with_signing_preference`](crate::idp::policy::PolicyEntry::with_signing_preference))
+/// resolved against what the SP advertises in its metadata.
+///
+/// The advertisement is an untrusted claim: it only chooses among the IdP's own
+/// configured entries (see [`SigningPreference`](crate::crypto::SigningPreference)).
+/// With no preference configured this is the signer's default.
+fn signing_algorithms(
+    engine: &ResponseEngine,
+    params: &ResponseParams,
+) -> crate::crypto::SigningAlgorithms {
+    let advertised = params
+        .sp_entity
+        .as_ref()
+        .map(|entity| entity.supported_algorithms())
+        .unwrap_or_default();
+    engine
+        .decisions
+        .signing_preference(&params.processed.sp_entity_id)
+        .resolve(&advertised)
 }
 
 /// Why NameID construction did not produce a NameID.

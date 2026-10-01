@@ -511,14 +511,15 @@ pub(super) fn signing_algorithms(
     engine: &ResponseEngine,
     params: &ResponseParams,
 ) -> crate::crypto::SigningAlgorithms {
-    let advertised = sp_advertised_algorithms(params);
+    let (signature, digest) = sp_advertised_algorithms(params);
     engine
         .decisions
         .signing_preference(&params.processed.sp_entity_id)
-        .resolve(&advertised)
+        .resolve(&signature, &digest)
 }
 
-/// The algorithm URIs the SP advertises for this response: the entity-level
+/// The `(signature, digest)` algorithm URIs the SP advertises for this
+/// response, from `alg:SigningMethod` and `alg:DigestMethod` respectively: the entity-level
 /// `Extensions` plus the SAML 2.0 SP role the request was bound to
 /// (`params.sp_sso`).
 ///
@@ -526,22 +527,29 @@ pub(super) fn signing_algorithms(
 /// SP role of the entity and says single-role callers must filter: an algorithm
 /// advertised only by an IdP role, or by another SP role (a SAML 1.1
 /// descriptor), would otherwise be selected for this SAML 2.0 SP.
-pub(super) fn sp_advertised_algorithms(params: &ResponseParams) -> Vec<String> {
+pub(super) fn sp_advertised_algorithms(params: &ResponseParams) -> (Vec<String>, Vec<String>) {
     use crate::metadata::types::md_extensions::MdExtensions;
     let entity_ext = params
         .sp_entity
         .as_ref()
         .and_then(|entity| entity.extensions.as_ref());
     let role_ext = params.sp_sso.sso_base.base.extensions.as_ref();
-    let mut out: Vec<String> = Vec::new();
+    let mut signature: Vec<String> = Vec::new();
+    let mut digest: Vec<String> = Vec::new();
     for ext in [entity_ext, role_ext].into_iter().flatten() {
-        for alg in MdExtensions::from_extensions(ext).supported_algorithms() {
-            if !out.contains(&alg) {
-                out.push(alg);
+        let md = MdExtensions::from_extensions(ext);
+        for (out, algs) in [
+            (&mut signature, md.signing_methods),
+            (&mut digest, md.digest_methods),
+        ] {
+            for alg in algs {
+                if !out.contains(&alg) {
+                    out.push(alg);
+                }
             }
         }
     }
-    out
+    (signature, digest)
 }
 
 /// Why NameID construction did not produce a NameID.

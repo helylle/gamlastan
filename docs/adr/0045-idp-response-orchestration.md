@@ -164,7 +164,9 @@ existing primitives into the profile flow, and move the semantics proven in
    IdP's own entries (the advertisement is untrusted); with none configured
    the signer's defaults (RSA-SHA256, SHA-256) apply. The advertisement is
    read from the entity-level extensions and the SAML 2.0 SP role the request
-   was bound to, not from every role of the entity, and a response that signs
+   was bound to, not from every role of the entity; signatures are matched
+   against `alg:SigningMethod` entries and digests against `alg:DigestMethod`
+   entries separately. A response that signs
    nothing never consults the signer.
 
 2. Invert the application contract. The application supplies what only it

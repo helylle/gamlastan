@@ -535,7 +535,8 @@ async fn idp_sso(
 
         let result = callback(&processed, &disposition, &req)?;
         return match result {
-            AuthnSubjectResult::Authenticated(subject) => {
+            AuthnSubjectResult::Authenticated(mut subject) => {
+                pin_to_reused_session(&mut subject, &disposition);
                 let outcome = create_authn_response(engine, &params, &subject)
                     .map_err(SamlActixError::Profile)?;
                 let issued = match outcome {
@@ -634,6 +635,20 @@ async fn idp_sso(
 /// would be answered with the wrong binding, so it is refused here instead.
 /// An application that has to serve such an SP uses the profile functions
 /// directly: `ProcessedAuthnRequest::acs_binding` says how to deliver.
+/// On `ReuseSession` the session owns the subject, the method that ran, when
+/// it ran and the session index; `check_request` validated exactly those. The
+/// callback keeps only the attributes. Without this, a callback returning
+/// `authn_instant: None` would restart the absolute session expiry from now,
+/// or attach a different subject or session index to the reused session.
+fn pin_to_reused_session(subject: &mut AuthenticatedSubject, disposition: &Disposition) {
+    if let Disposition::ReuseSession { session } = disposition {
+        subject.subject_id = session.subject_id.clone();
+        subject.authn_method = session.authn_method.clone();
+        subject.authn_instant = Some(session.authn_instant);
+        subject.session_index = Some(session.session_index.clone());
+    }
+}
+
 fn require_post_acs(
     processed: &gamlastan::profiles::sso::idp::ProcessedAuthnRequest,
 ) -> Result<(), SamlActixError> {
@@ -2589,5 +2604,43 @@ mod tests {
         assert!(body.contains("SAMLResponse"));
         assert!(body.contains("https://sp.example.com/acs"));
         assert!(body.contains("RelayState"));
+    }
+
+    #[test]
+    fn a_reused_session_owns_the_subject_instant_and_index() {
+        use gamlastan::idp::orchestrator::AuthnMethodRef;
+        let method = |c: &str| AuthnMethodRef::Inline {
+            class_ref: c.to_string(),
+            authn_authority: None,
+        };
+        let instant = Utc::now() - chrono::TimeDelta::try_hours(3).unwrap();
+        let session = EstablishedSession {
+            subject_id: "alice".into(),
+            authn_method: method("urn:session"),
+            authn_instant: instant,
+            session_index: "s-1".into(),
+        };
+        let mut subject = AuthenticatedSubject {
+            subject_id: "mallory".into(),
+            attributes: vec![],
+            authn_method: method("urn:other"),
+            authn_instant: None,
+            session_index: Some("s-2".into()),
+        };
+
+        // A fresh login is the callback's own.
+        let fresh = Disposition::Authenticate { methods: vec![] };
+        pin_to_reused_session(&mut subject, &fresh);
+        assert_eq!(subject.subject_id, "mallory");
+        assert_eq!(subject.authn_instant, None);
+
+        pin_to_reused_session(&mut subject, &Disposition::ReuseSession { session });
+        assert_eq!(subject.subject_id, "alice");
+        assert_eq!(subject.authn_instant, Some(instant));
+        assert_eq!(subject.session_index.as_deref(), Some("s-1"));
+        assert!(matches!(
+            subject.authn_method,
+            AuthnMethodRef::Inline { ref class_ref, .. } if class_ref == "urn:session"
+        ));
     }
 }

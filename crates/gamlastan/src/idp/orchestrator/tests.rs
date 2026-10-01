@@ -1281,12 +1281,15 @@ fn signing_algorithms_come_from_the_entity_and_the_requested_role_only() {
     p.sp_sso = role;
     p.sp_entity = Some(entity);
 
-    let advertised = crate::idp::orchestrator::respond::sp_advertised_algorithms(&p);
-    assert!(advertised.contains(&SignatureMethod::RsaSha384.uri().to_string()));
-    assert!(advertised.contains(&DigestMethod::Sha384.uri().to_string()));
+    let (signature, digest) = crate::idp::orchestrator::respond::sp_advertised_algorithms(&p);
+    assert_eq!(
+        signature,
+        vec![SignatureMethod::RsaSha384.uri().to_string()]
+    );
+    assert_eq!(digest, vec![DigestMethod::Sha384.uri().to_string()]);
     assert!(
-        !advertised.contains(&SignatureMethod::RsaSha512.uri().to_string()),
-        "an algorithm advertised only by another role must not be selected: {advertised:?}"
+        !signature.contains(&SignatureMethod::RsaSha512.uri().to_string()),
+        "an algorithm advertised only by another role must not be selected: {signature:?}"
     );
 
     // And the IdP's own preference resolves against that, not the aggregate.

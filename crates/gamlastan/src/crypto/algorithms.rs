@@ -142,8 +142,15 @@ impl SigningPreference {
         self
     }
 
-    /// Resolve against the algorithm URIs an SP advertises in its metadata.
-    pub fn resolve(&self, sp_advertised: &[String]) -> SigningAlgorithms {
+    /// Resolve against the algorithm URIs an SP advertises in its metadata:
+    /// `alg:SigningMethod` URIs for the signature, `alg:DigestMethod` URIs for
+    /// the digest. Each kind is matched only against its own list, so a URI
+    /// the SP placed under the wrong element does not count.
+    pub fn resolve(
+        &self,
+        sp_signature_methods: &[String],
+        sp_digest_methods: &[String],
+    ) -> SigningAlgorithms {
         fn pick<T: Copy>(
             preferred: &[T],
             uri: impl Fn(T) -> &'static str,
@@ -156,8 +163,8 @@ impl SigningPreference {
                 .or_else(|| preferred.first().copied())
         }
         SigningAlgorithms {
-            signature: pick(&self.signature, SignatureMethod::uri, sp_advertised),
-            digest: pick(&self.digest, DigestMethod::uri, sp_advertised),
+            signature: pick(&self.signature, SignatureMethod::uri, sp_signature_methods),
+            digest: pick(&self.digest, DigestMethod::uri, sp_digest_methods),
         }
     }
 }
@@ -165,6 +172,13 @@ impl SigningPreference {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    impl SigningPreference {
+        /// Resolve against one mixed list, standing in for both kinds.
+        fn resolve_flat(&self, all: &[String]) -> SigningAlgorithms {
+            self.resolve(all, all)
+        }
+    }
 
     fn adv(uris: &[&str]) -> Vec<String> {
         uris.iter().map(|s| s.to_string()).collect()
@@ -215,7 +229,8 @@ mod tests {
 
     #[test]
     fn an_empty_preference_leaves_the_signer_default() {
-        let resolved = SigningPreference::new().resolve(&adv(&[SignatureMethod::RsaSha512.uri()]));
+        let resolved =
+            SigningPreference::new().resolve_flat(&adv(&[SignatureMethod::RsaSha512.uri()]));
         assert_eq!(resolved, SigningAlgorithms::default());
     }
 
@@ -228,7 +243,7 @@ mod tests {
                 SignatureMethod::RsaSha256,
             ])
             .with_digest_methods(vec![DigestMethod::Sha512, DigestMethod::Sha256]);
-        let resolved = pref.resolve(&adv(&[
+        let resolved = pref.resolve_flat(&adv(&[
             SignatureMethod::RsaSha256.uri(),
             SignatureMethod::RsaSha384.uri(),
             DigestMethod::Sha256.uri(),
@@ -247,7 +262,7 @@ mod tests {
             adv(&["http://www.w3.org/2000/09/xmldsig#rsa-sha1"]),
             adv(&["urn:evil"]),
         ] {
-            let resolved = pref.resolve(&advertised);
+            let resolved = pref.resolve_flat(&advertised);
             assert_eq!(resolved.signature, Some(SignatureMethod::RsaSha512));
             assert_eq!(resolved.digest, Some(DigestMethod::Sha512));
         }
@@ -260,11 +275,34 @@ mod tests {
         let pref = SigningPreference::new()
             .with_signature_methods(vec![SignatureMethod::RsaSha256])
             .with_digest_methods(vec![DigestMethod::Sha256]);
-        let resolved = pref.resolve(&adv(&[
+        let resolved = pref.resolve_flat(&adv(&[
             SignatureMethod::RsaSha512.uri(),
             DigestMethod::Sha512.uri(),
             "http://www.w3.org/2000/09/xmldsig#rsa-sha1",
         ]));
+        assert_eq!(resolved.signature, Some(SignatureMethod::RsaSha256));
+        assert_eq!(resolved.digest, Some(DigestMethod::Sha256));
+    }
+
+    #[test]
+    fn a_uri_under_the_wrong_advertisement_does_not_count() {
+        let pref = SigningPreference::new()
+            .with_signature_methods(vec![SignatureMethod::RsaSha512, SignatureMethod::RsaSha256])
+            .with_digest_methods(vec![DigestMethod::Sha512, DigestMethod::Sha256]);
+        // The SP lists the signature URIs only as digest methods and vice
+        // versa: neither kind has a usable advertisement, so each falls back
+        // to the IdP's first choice rather than the swapped entries.
+        let resolved = pref.resolve(
+            &adv(&[DigestMethod::Sha256.uri()]),
+            &adv(&[SignatureMethod::RsaSha256.uri()]),
+        );
+        assert_eq!(resolved.signature, Some(SignatureMethod::RsaSha512));
+        assert_eq!(resolved.digest, Some(DigestMethod::Sha512));
+        // Correctly placed, they are honoured.
+        let resolved = pref.resolve(
+            &adv(&[SignatureMethod::RsaSha256.uri()]),
+            &adv(&[DigestMethod::Sha256.uri()]),
+        );
         assert_eq!(resolved.signature, Some(SignatureMethod::RsaSha256));
         assert_eq!(resolved.digest, Some(DigestMethod::Sha256));
     }

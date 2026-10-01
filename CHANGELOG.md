@@ -116,7 +116,10 @@ where needed to correct protocol handling.
   `SigningAlgorithms` live in `crypto`; `PolicyEntry::with_signing_preference`
   sets an SP's ordered preference. The orchestrator signs each response (and
   each denial) with the first preferred algorithm the SP also advertises in its
-  metadata, else the first listed. The advertisement is untrusted: it only
+  metadata, else the first listed. Signatures are matched only against the
+  SP's `alg:SigningMethod` entries and digests only against `alg:DigestMethod`
+  (`SigningPreference::resolve` takes the two lists), so a URI placed under the
+  wrong element does not count. The advertisement is untrusted: it only
   chooses among the IdP's own entries, and SHA-1, MD5 and the like are not
   representable, so neither configuration nor a peer can select them. The
   digest used to be hardcoded to SHA-256; with no preference configured the
@@ -369,7 +372,11 @@ where needed to correct protocol handling.
   `AuthnStatement/@SessionNotOnOrAfter` on reuse is derived from the
   session's original `authn_instant`, not `now` - otherwise every reused
   session pushed its own absolute cap further out on each SSO hop, turning
-  it into an unbounded sliding window in practice.
+  it into an unbounded sliding window in practice. The Actix handler enforces
+  this for the `AuthnSubjectCallback` path: on `ReuseSession` it takes the
+  subject, method, `authn_instant` and session index from the established
+  session, so a callback returning `authn_instant: None` cannot restart the
+  window.
 
 ## [0.9.1] - 2026-09-29
 

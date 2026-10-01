@@ -579,6 +579,19 @@ fn construct_name_id(
         }
     }
 
+    // A requested format this IdP does not issue to this SP is refused with
+    // InvalidNameIDPolicy (SAML Core 3.4.1.1), before anything is minted or
+    // stored. Without this any format string was honoured: an identifier was
+    // minted with it and recorded.
+    if let Some(format) = policy.as_ref().and_then(|p| p.format.as_deref()) {
+        if !engine
+            .decisions
+            .supports_nameid_format(&params.processed.sp_entity_id, format)
+        {
+            return Err(NameIdFailure::Denied(Denial::InvalidNameIdPolicy));
+        }
+    }
+
     let default_format = engine
         .decisions
         .nameid_format(&params.processed.sp_entity_id);

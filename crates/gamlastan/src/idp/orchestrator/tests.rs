@@ -1043,12 +1043,12 @@ impl IdentityStore for CustomStore {
     fn user_for(&self, value: &str) -> Result<Option<String>, StoreError> {
         self.0.user_for(value)
     }
-    fn get_or_insert_persistent(
+    fn get_or_insert_durable(
         &self,
         user_id: &str,
         candidate: NameId,
     ) -> Result<NameId, InsertError> {
-        self.0.get_or_insert_persistent(user_id, candidate)
+        self.0.get_or_insert_durable(user_id, candidate)
     }
     fn insert(&self, user_id: &str, name_id: NameId) -> Result<(), InsertError> {
         self.0.insert(user_id, name_id)
@@ -1366,6 +1366,151 @@ fn a_descriptor_for_a_different_sp_is_refused() {
     assert!(ResponseParams::from_entity(request(), own).is_ok());
 }
 
+// ── Requested NameID formats ────────────────────────────────────────────────
+
+/// Run `f` against an engine over a fresh in-memory `IdentDb`, so a test can
+/// look at what the engine did or did not record.
+fn with_engine<R>(decisions: &ReleasePolicy, f: impl FnOnce(&ResponseEngine, &IdentDb) -> R) -> R {
+    let idents = IdentDb::in_memory(IDP);
+    let broker = broker();
+    let (signer, cert) = fixture_signer();
+    let engine = ResponseEngine {
+        idp_entity_id: IDP,
+        decisions,
+        release: decisions,
+        idents: &idents,
+        broker: &broker,
+        assertions: None,
+        signer: &signer,
+        cert_der_b64: cert,
+    };
+    f(&engine, &idents)
+}
+
+fn issued_name_id(
+    engine: &ResponseEngine,
+    format: &str,
+) -> Result<NameId, crate::idp::orchestrator::Denial> {
+    let p = params(processed_with_name_id_policy(Some(format), None, true));
+    match create_authn_response(engine, &p, &subject_without_mail()).unwrap() {
+        ResponseOutcome::Issued(issued) => Ok(issued.name_id),
+        ResponseOutcome::Denied { denial, .. } => Err(denial),
+    }
+}
+
+#[test]
+fn an_unsupported_requested_nameid_format_is_denied_and_nothing_is_minted() {
+    use crate::idp::orchestrator::Denial;
+    use crate::idp::policy::{PolicyEntry, ISSUABLE_NAMEID_FORMATS};
+    // Opt-in: with a supported set configured, a format outside it is
+    // InvalidNameIDPolicy (SAML Core 3.4.1.1). Without one, any string is
+    // honoured (see the next test).
+    let decisions = ReleasePolicy::with_default(
+        PolicyEntry::new().with_supported_nameid_formats(
+            ISSUABLE_NAMEID_FORMATS
+                .iter()
+                .map(|f| f.to_string())
+                .collect(),
+        ),
+    );
+    for format in [
+        "urn:evil:made-up",
+        "urn:oasis:names:tc:SAML:2.0:nameid-format:encrypted",
+        "urn:oasis:names:tc:SAML:1.1:nameid-format:X509SubjectName",
+    ] {
+        with_engine(&decisions, |engine, idents| {
+            assert_eq!(
+                issued_name_id(engine, format),
+                Err(Denial::InvalidNameIdPolicy),
+                "{format}"
+            );
+            assert!(
+                idents
+                    .name_ids_for(&subject_without_mail().subject_id)
+                    .unwrap()
+                    .is_empty(),
+                "{format}: a refused request must not record anything"
+            );
+        });
+    }
+}
+
+#[test]
+fn by_default_any_requested_nameid_format_is_accepted_as_in_pysaml2() {
+    // pysaml2 never validates the requested format, so by default neither does
+    // this engine: restricting formats is opt-in.
+    with_engine(&ReleasePolicy::new(), |engine, _| {
+        let nid = issued_name_id(engine, "urn:example:custom-format")
+            .expect("no supported set configured: every format is accepted");
+        assert_eq!(nid.format.as_deref(), Some("urn:example:custom-format"));
+    });
+}
+
+#[test]
+fn every_issuable_nameid_format_is_issued_when_opted_in() {
+    use crate::idp::policy::{PolicyEntry, ISSUABLE_NAMEID_FORMATS};
+    let decisions = ReleasePolicy::with_default(
+        PolicyEntry::new().with_supported_nameid_formats(
+            ISSUABLE_NAMEID_FORMATS
+                .iter()
+                .map(|f| f.to_string())
+                .collect(),
+        ),
+    );
+    with_engine(&decisions, |engine, _| {
+        for format in ISSUABLE_NAMEID_FORMATS {
+            let nid = issued_name_id(engine, format)
+                .unwrap_or_else(|d| panic!("{format} must be issued, got {d:?}"));
+            assert_eq!(nid.format.as_deref(), Some(*format));
+        }
+    });
+}
+
+#[test]
+fn a_configured_supported_set_is_honoured_and_the_sp_default_is_always_allowed() {
+    use crate::idp::orchestrator::Denial;
+    use crate::idp::policy::PolicyEntry;
+
+    // Only persistent is listed, and the SP's own default is email.
+    let decisions = ReleasePolicy::with_default(
+        PolicyEntry::new()
+            .with_supported_nameid_formats(vec![constants::NAMEID_PERSISTENT.to_string()])
+            .with_nameid_format(constants::NAMEID_EMAIL),
+    );
+    with_engine(&decisions, |engine, _| {
+        assert!(issued_name_id(engine, constants::NAMEID_PERSISTENT).is_ok());
+        assert_eq!(
+            issued_name_id(engine, constants::NAMEID_TRANSIENT),
+            Err(Denial::InvalidNameIdPolicy),
+            "transient is not in the configured set"
+        );
+        assert!(
+            issued_name_id(engine, constants::NAMEID_EMAIL).is_ok(),
+            "the SP's own default format needs no listing"
+        );
+    });
+}
+
+#[test]
+fn a_durable_nameid_is_the_same_on_every_login() {
+    with_engine(&ReleasePolicy::new(), |engine, idents| {
+        let first = issued_name_id(engine, constants::NAMEID_EMAIL).unwrap();
+        let second = issued_name_id(engine, constants::NAMEID_EMAIL).unwrap();
+        assert_eq!(
+            first.value, second.value,
+            "an email-format NameID that changes at each login cannot identify anyone"
+        );
+        assert_eq!(
+            idents
+                .name_ids_for(&subject_without_mail().subject_id)
+                .unwrap()
+                .len(),
+            1,
+            "and the store does not grow with each response"
+        );
+    });
+}
+
 // ── Per-SP signing algorithms ───────────────────────────────────────────────
 
 fn sha512_policy() -> ReleasePolicy {
@@ -1452,7 +1597,7 @@ impl IdentityStore for DownIdentityStore {
     fn user_for(&self, _: &str) -> Result<Option<String>, StoreError> {
         Err(outage())
     }
-    fn get_or_insert_persistent(&self, _: &str, _: NameId) -> Result<NameId, InsertError> {
+    fn get_or_insert_durable(&self, _: &str, _: NameId) -> Result<NameId, InsertError> {
         Err(outage().into())
     }
     fn insert(&self, _: &str, _: NameId) -> Result<(), InsertError> {

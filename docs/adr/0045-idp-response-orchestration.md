@@ -93,28 +93,43 @@ existing primitives into the profile flow, and move the semantics proven in
    concurrency-safe, without a multi-key transaction: `IdentityStore` is a
    record-shaped trait (one record per (user, NameID) association), and
    atomicity comes from two uniqueness constraints the backend must enforce
-   -- the NameID value is unique across all records, and among persistent
-   records `(user, sp_name_qualifier, name_qualifier)` is unique -- plus
-   single-record operations (`get_or_insert_persistent`, `insert`, `replace`,
-   `remove`). Two concurrent first requests for the same (user, SP) therefore
-   converge on one persistent identifier. Nothing in this crate can detect a
+   -- the NameID value is unique across all records, and among durable
+   records (every format except transient) `(user, sp_name_qualifier,
+   name_qualifier, format)` is unique -- plus single-record operations
+   (`get_or_insert_durable`, `insert`, `replace`, `remove`). Two concurrent
+   first requests for the same (user, SP, format) therefore converge on one
+   identifier. Every durable format is stable, not only persistent: an email or
+   unspecified NameID that was minted anew at each login (as 0.9.x did) cannot
+   identify anyone to an SP and grows the store with every response. Nothing in this crate can detect a
    missing constraint, so the trait has no default write methods and
    `ident::conformance::run` checks that a backend honours the contract.
    Both constraints hold on every write path -- `insert` and `replace` refuse
-   a second persistent record for the same `(user, sp_name_qualifier,
-   name_qualifier)` (`InsertError::PersistentExists`) just as
-   `get_or_insert_persistent` returns the existing one -- and the suite checks
+   a second durable record of the same format for the same `(user,
+   sp_name_qualifier, name_qualifier)` (`InsertError::DurableExists`) just as
+   `get_or_insert_durable` returns the existing one -- and the suite checks
    each path, since a backend can guard one and forget another.
    `InMemoryIdentityStore` takes one lock per call; a Mongo/SQL-backed store
-   must back the two constraints with real unique indexes (a partial unique
-   index for the persistent tuple), applied to every write. The plain `get`/`set`/`remove` shape
-   remains as `KeyValueStore`, which `Eptid` uses. Every store method is
+   must back the two constraints with real unique indexes (the second a
+   partial unique index on `(user, sp_name_qualifier, name_qualifier, format)`
+   where the format is not transient), applied to every write. The plain
+   `get`/`set`/`remove` shape remains as `KeyValueStore`, which `Eptid` uses. Every store method is
    fallible (`StoreError`; `InsertError` for the two insert paths, which also
    reports a `ValueTaken` conflict): a backend that cannot answer must not
    return an empty result, because reading an outage as "no record" would mint
    a second persistent identifier for a user who already has one. A store
    failure surfaces from the orchestrator as `Err(ProfileError::Store)`, never
    as a signed denial.
+
+   Refusing requested NameID formats is opt-in. By default any
+   `NameIDPolicy/@Format` is honoured, as in pysaml2, which never validates it
+   (so an SP that sends invented format strings gets one stored record per
+   string). An IdP that configures a per-SP supported set
+   (`PolicyEntry::with_supported_nameid_formats`; `ISSUABLE_NAMEID_FORMATS` is
+   a reasonable starting point) gets `InvalidNameIDPolicy` (SAML Core 3.4.1.1)
+   for a format outside it, before anything is minted or stored; the SP's own
+   default format is always allowed. Strict-by-default was considered and
+   rejected: it can turn a login that works today into a denial for a
+   pysaml2 deployment, for little gain.
 
    Transient NameIDs are one-time-use (SAML Core §8.3.7) and the default
    per-SP format is transient, so by default `IdentDb` mints them without
@@ -274,6 +289,10 @@ failure is a real protocol error rather than a silent per-integrator choice.
   to compile rather than misbehaving.
 - Breaking: every store method is fallible, so `IdentDb`, `Eptid` and the
   assertion-query helpers return `Result` (see above).
+- Behaviour change: durable formats other than persistent (email, unspecified)
+  are stable per (user, SP, format) instead of being minted anew at each login,
+  as `IdentDb` always did for persistent, matching what pysaml2's server does
+  by looking up an existing NameID before constructing one (see above).
 - Behaviour change: transient NameIDs are no longer stored by default (see
   above), so `find_local_id` on one finds nothing unless
   `IdentDb::with_persist_transient` is set.
@@ -323,11 +342,13 @@ failure is a real protocol error rather than a silent per-integrator choice.
   never reused by a NameIDMapping request; `find_nameid` filters on every
   field.
 - `ident::conformance`: the backend contract suite (value uniqueness,
-  persistent get-or-insert, the persistent constraint on `insert` and
-  `replace`, filtered lookup, scoped removal, and two concurrent checks) passes
-  on `InMemoryIdentityStore` and is verified to fail against a backend with no
-  value uniqueness, a check-then-insert backend, a backend that guards only
-  `get_or_insert_persistent`, and one that guards `insert` but not `replace`. The non-panicking `check` / `check_one` entry points return the
+  durable get-or-insert for persistent and email, the durable constraint on
+  `insert` and `replace`, filtered lookup, scoped removal, and two concurrent
+  checks run for both formats) passes on `InMemoryIdentityStore` and is
+  verified to fail against a backend with no value uniqueness, a
+  check-then-insert backend, a backend that guards only
+  `get_or_insert_durable`, and one that guards `insert` but not `replace`. The
+  non-panicking `check` / `check_one` entry points return the
   violation, run a check by name, and report a failing backend call as a
   failed check rather than a lost race.
 - `idp/orchestrator/tests.rs` (store and signing): an identity-store outage
@@ -343,6 +364,14 @@ failure is a real protocol error rather than a silent per-integrator choice.
   refused by `ResponseParams::new` and by both response paths. `gamlastan-actix`: `/saml/metadata`
   advertises the certificate of the path that signs (the engine's only with an
   `AuthnSubjectCallback`).
+- `idp/orchestrator/tests.rs` (NameID formats): by default any requested
+  format is accepted; with a supported set configured, an unsupported one (an
+  invented one, `encrypted`, X509SubjectName) is denied with
+  `InvalidNameIDPolicy` and records nothing, each issuable format is issued,
+  and the SP's own default format needs no listing; an email-format NameID is the same on every login and the store
+  holds one record, not one per response. `idp/ident.rs`: email and
+  unspecified are stable per (user, SP, format), concurrent first requests for
+  one converge, and `store` refuses a second record of a durable format.
 - `crypto::algorithms` and `crypto::signer`: weak and unknown algorithm URIs
   are not representable; the first IdP preference the SP also advertises wins,
   an SP advertising nothing usable gets the IdP's first choice, and an SP

@@ -153,6 +153,18 @@ where needed to correct protocol handling.
   insertion order for a map with several wire names per local name.
   `from_static` now goes through `from_directions` with identical results,
   which a test checks for every shipped map.
+- Added an opt-in supported-format set for requested NameIDs:
+  `PolicyEntry::with_supported_nameid_formats`,
+  `ReleasePolicy::supports_nameid_format` and `ISSUABLE_NAMEID_FORMATS`. With a
+  set configured, a requested `NameIDPolicy/@Format` outside it is denied with
+  `InvalidNameIDPolicy` (SAML Core 3.4.1.1) before anything is minted; the SP's
+  own default format is always allowed. **Without one, which is the default,
+  any requested format is accepted**, as in pysaml2, which never validates it:
+  an identifier is issued in whatever format was asked for, so an SP that sends
+  invented format strings gets one stored record per string.
+  `ISSUABLE_NAMEID_FORMATS` (transient, persistent, emailAddress, unspecified)
+  is a reasonable set to pass; it leaves out `encrypted`, a request to encrypt
+  the NameID, which is not supported.
 
 ### Changed
 
@@ -208,28 +220,34 @@ where needed to correct protocol handling.
   entirely, so a callback could redirect to a login form for `IsPassive` or
   reuse a session `ForceAuthn` should have defeated.
 - **Breaking:** `IdentityStore` is now a record-shaped backend: one record per
-  (user, NameID) association (`for_user`, `user_for`, `find_persistent`,
-  `get_or_insert_persistent`, `insert`, `replace`, `remove`, `remove_all`).
+  (user, NameID) association (`for_user`, `user_for`, `find_durable`,
+  `get_or_insert_durable`, `insert`, `replace`, `remove`, `remove_all`).
   In 0.9.x it was a plain `get`/`set`/`remove` trait; that shape is now
   `KeyValueStore` (`InMemoryKeyValueStore`), which `Eptid` uses.
   `IdentDb`'s atomicity comes from two uniqueness constraints the backend
   enforces - the NameID value is unique across all records, and among
-  persistent records `(user, sp_name_qualifier, name_qualifier)` is unique -
-  so two concurrent first requests for the same (user, SP) converge on one
-  persistent identifier instead of minting different ones, and a removal
-  cannot orphan a reverse mapping because there is no separate reverse key.
+  durable records (every format except transient) `(user, sp_name_qualifier,
+  name_qualifier, format)` is unique - so two concurrent first requests for
+  the same (user, SP, format) converge on one identifier instead of minting
+  different ones, and a removal cannot orphan a reverse mapping because there
+  is no separate reverse key.
   The constraints live in the store, so the trait has no default write
   methods (a non-atomic default would silently leave the race open on a
   multi-instance deployment) and `ident::conformance::run` is provided to
   check that a backend honours them. Both constraints hold on every write
-  path, not only on `get_or_insert_persistent`: `insert` and `replace` refuse
-  a second persistent record for the same `(user, sp_name_qualifier,
-  name_qualifier)` with `InsertError::PersistentExists` (`replace` now returns
+  path, not only on `get_or_insert_durable`: `insert` and `replace` refuse
+  a second durable record of the same format for the same `(user,
+  sp_name_qualifier, name_qualifier)` with `InsertError::DurableExists`
+  (`get_or_insert_durable` and `find_durable` take the format; `replace` now returns
   `InsertError`, and `IdentDb::store` returns `IdentError`, which gains
-  `PersistentExists`), and the conformance suite checks each path.
+  `DurableExists`), and the conformance suite checks each path.
   `InMemoryIdentityStore` takes one lock per call; a Mongo/SQL-backed store
-  must back the two constraints with real unique indexes (a partial unique
-  index for the persistent tuple), applied to every write.
+  must back the two constraints with real unique indexes (the second a
+  partial unique index on `(user, sp_name_qualifier, name_qualifier, format)`
+  where the format is not transient), applied to every write. A store that
+  already holds several records of one format per (user, SP) - 0.9.x minted a
+  new one at every login for email and unspecified - must be deduplicated
+  before that index can be built.
   Migration: an external implementor of the 0.9.x trait (pygamlastan's
   `PyIdentityStore` is one) implements `KeyValueStore` for the `Eptid` cache
   and the new `IdentityStore` for `IdentDb`; code still implementing the old
@@ -246,6 +264,17 @@ where needed to correct protocol handling.
   was never raised. `ProcessedAuthnRequest` documents what it does not carry:
   `Scoping`, which a proxying IdP must read from the original request itself,
   and the principal named by `Subject`.
+- **Behaviour change:** the durable NameID formats other than persistent
+  (email, unspecified, and any other non-transient format) are now stable per
+  `(user, SP, NameQualifier, format)`, as persistent always was: an existing
+  record is returned instead of a new value being minted. 0.9.x minted and
+  stored a fresh value on every call, so an email-format NameID changed at each
+  login, which no SP can use to recognise a user, and the identity store grew
+  with every response. `IdentityStore::get_or_insert_persistent` and
+  `find_persistent` became `get_or_insert_durable` and `find_durable`
+  (`find_durable` takes the format), and `InsertError::PersistentExists`
+  became `DurableExists`. `AllowCreate=false` still gates only the persistent
+  format.
 - **Breaking:** the store traits are fallible. `IdentityStore`, `KeyValueStore`
   and `AssertionStore` methods return `Result<_, StoreError>` (the two insert
   paths return `InsertError`, which separates a `ValueTaken` conflict from a
@@ -293,7 +322,7 @@ where needed to correct protocol handling.
 - Closed a check-then-create race on persistent NameID minting: two concurrent
   first requests for the same (user, SP) could each find no existing
   association and mint two different "stable" persistent identifiers. The
-  store's `get_or_insert_persistent` is now atomic, backed by the uniqueness
+  store's `get_or_insert_durable` is now atomic, backed by the uniqueness
   constraints described under "Changed".
 - `idp::orchestrator`'s NameIDPolicy handling only honours
   `NameIDPolicy/@SPNameQualifier` when it equals the requester's own

@@ -54,6 +54,22 @@ pub enum PolicyError {
     },
 }
 
+/// The NameID formats [`IdentDb`](crate::idp::ident::IdentDb) issues
+/// meaningfully: a reasonable set to hand to
+/// [`PolicyEntry::with_supported_nameid_formats`] when an IdP wants to refuse
+/// the rest. It is **not** applied by default (see there).
+///
+/// It leaves out `urn:oasis:names:tc:SAML:2.0:nameid-format:encrypted` (a request
+/// to encrypt the NameID, which is not supported) and formats such as Kerberos
+/// or X509SubjectName, which need a source of identifiers this crate does not
+/// have.
+pub const ISSUABLE_NAMEID_FORMATS: &[&str] = &[
+    constants::NAMEID_TRANSIENT,
+    constants::NAMEID_PERSISTENT,
+    constants::NAMEID_EMAIL,
+    constants::NAMEID_UNSPECIFIED,
+];
+
 /// Which messages the IdP signs for an SP (`"sign"` in pysaml2 policy).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SignTargets {
@@ -97,6 +113,7 @@ pub struct PolicyEntry {
     lifetime: Option<TimeDelta>,
     session_lifetime: Option<TimeDelta>,
     nameid_format: Option<String>,
+    supported_nameid_formats: Option<Vec<String>>,
     name_form: Option<String>,
     sign: Option<SignTargets>,
     signing_preference: Option<SigningPreference>,
@@ -161,6 +178,23 @@ impl PolicyEntry {
     /// Set the NameID format issued to this SP.
     pub fn with_nameid_format(mut self, format: impl Into<String>) -> Self {
         self.nameid_format = Some(format.into());
+        self
+    }
+
+    /// Opt in to refusing NameID formats: set the formats this IdP will issue to
+    /// this SP when the request's `NameIDPolicy/@Format` asks for one. A
+    /// requested format outside the set is refused with `InvalidNameIDPolicy`
+    /// (SAML Core 3.4.1.1) before anything is minted. The SP's own default
+    /// format ([`with_nameid_format`](Self::with_nameid_format)) is always
+    /// allowed, so it need not be listed.
+    /// [`ISSUABLE_NAMEID_FORMATS`] is a reasonable starting set.
+    ///
+    /// **Without this, any requested format is accepted**, as in pysaml2, which
+    /// never validates it: an identifier is issued in whatever format was asked
+    /// for, so an SP that sends invented format strings gets one stored record
+    /// per string. Set this to refuse them.
+    pub fn with_supported_nameid_formats(mut self, formats: Vec<String>) -> Self {
+        self.supported_nameid_formats = Some(formats);
         self
     }
 
@@ -380,6 +414,22 @@ impl ReleasePolicy {
     pub fn nameid_format(&self, sp_entity_id: &str) -> String {
         self.get(sp_entity_id, |e| e.nameid_format.clone())
             .unwrap_or_else(|| constants::NAMEID_TRANSIENT.to_string())
+    }
+
+    /// Whether this IdP will issue a NameID of `format` to the SP.
+    ///
+    /// With no supported set configured
+    /// ([`PolicyEntry::with_supported_nameid_formats`]) every format is
+    /// accepted, as in pysaml2. With one, the SP's own default format
+    /// ([`nameid_format`](Self::nameid_format)) is always allowed and any other
+    /// format must be in the set.
+    pub fn supports_nameid_format(&self, sp_entity_id: &str, format: &str) -> bool {
+        match self.get_ref(sp_entity_id, |e| e.supported_nameid_formats.as_ref()) {
+            None => true,
+            Some(formats) => {
+                format == self.nameid_format(sp_entity_id) || formats.iter().any(|f| f == format)
+            }
+        }
     }
 
     /// Attribute NameFormat for the SP (default: URI).
@@ -885,6 +935,61 @@ fn dedup_values(values: &mut Vec<AttributeValue>) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn without_a_configured_set_every_requested_nameid_format_is_accepted() {
+        // Opt-in, as pysaml2 never validates the requested format.
+        let policy = ReleasePolicy::new();
+        for format in [
+            constants::NAMEID_TRANSIENT,
+            "urn:oasis:names:tc:SAML:2.0:nameid-format:encrypted",
+            "urn:evil:made-up",
+        ] {
+            assert!(policy.supports_nameid_format("https://sp.example.org", format));
+        }
+    }
+
+    #[test]
+    fn the_issuable_set_refuses_the_rest_when_opted_into() {
+        let policy = ReleasePolicy::with_default(
+            PolicyEntry::new().with_supported_nameid_formats(
+                ISSUABLE_NAMEID_FORMATS
+                    .iter()
+                    .map(|f| f.to_string())
+                    .collect(),
+            ),
+        );
+        for format in ISSUABLE_NAMEID_FORMATS {
+            assert!(policy.supports_nameid_format("https://sp.example.org", format));
+        }
+        for format in [
+            "urn:oasis:names:tc:SAML:2.0:nameid-format:encrypted",
+            "urn:oasis:names:tc:SAML:1.1:nameid-format:X509SubjectName",
+            "urn:evil:made-up",
+        ] {
+            assert!(!policy.supports_nameid_format("https://sp.example.org", format));
+        }
+    }
+
+    #[test]
+    fn a_configured_set_replaces_the_default_but_the_sp_default_stays_allowed() {
+        let mut policy = ReleasePolicy::with_default(PolicyEntry::new());
+        policy.insert(
+            "https://sp.example.org",
+            PolicyEntry::new()
+                .with_supported_nameid_formats(vec![constants::NAMEID_PERSISTENT.to_string()])
+                .with_nameid_format(constants::NAMEID_EMAIL),
+        );
+        let sp = "https://sp.example.org";
+        assert!(policy.supports_nameid_format(sp, constants::NAMEID_PERSISTENT));
+        assert!(
+            policy.supports_nameid_format(sp, constants::NAMEID_EMAIL),
+            "the SP default"
+        );
+        assert!(!policy.supports_nameid_format(sp, constants::NAMEID_TRANSIENT));
+        // Another SP has no set configured, so it is unrestricted.
+        assert!(policy.supports_nameid_format("https://other.example.org", "urn:evil:made-up"));
+    }
+
     use super::*;
     use crate::idp::entity_category::{COCO_V1, EDUGAIN, REFEDS, REFEDS_RESEARCH_AND_SCHOLARSHIP};
     use crate::profiles::attribute::x500::{eppn_attribute, mail_attribute};

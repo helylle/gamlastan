@@ -2089,13 +2089,13 @@ mod tests {
         ) -> Result<Option<String>, gamlastan::idp::ident::StoreError> {
             self.0.user_for(value)
         }
-        fn get_or_insert_persistent(
+        fn get_or_insert_durable(
             &self,
             user_id: &str,
             candidate: gamlastan::core::assertion::name_id::NameId,
         ) -> Result<gamlastan::core::assertion::name_id::NameId, gamlastan::idp::ident::InsertError>
         {
-            self.0.get_or_insert_persistent(user_id, candidate)
+            self.0.get_or_insert_durable(user_id, candidate)
         }
         fn insert(
             &self,

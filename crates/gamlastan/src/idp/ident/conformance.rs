@@ -72,10 +72,10 @@ impl Default for Options {
 pub const CHECKS: &[&str] = &[
     "value_is_unique",
     "lookups_round_trip_and_isolate_users",
-    "persistent_is_get_or_insert",
-    "persistent_insert_reports_a_taken_value",
-    "persistent_is_unique_on_every_write_path",
-    "find_persistent_is_format_and_qualifier_exact",
+    "durable_is_get_or_insert",
+    "durable_insert_reports_a_taken_value",
+    "durable_is_unique_on_every_write_path",
+    "find_durable_is_format_and_qualifier_exact",
     "find_filters_on_every_field",
     "replace_upserts_by_value",
     "removal_is_scoped",
@@ -134,17 +134,17 @@ fn table<S: IdentityStore + 'static>() -> Vec<(&'static str, CheckFn<S>)> {
         ("lookups_round_trip_and_isolate_users", |s, _| {
             lookups_round_trip_and_isolate_users(&s)
         }),
-        ("persistent_is_get_or_insert", |s, _| {
-            persistent_is_get_or_insert(&s)
+        ("durable_is_get_or_insert", |s, _| {
+            durable_is_get_or_insert(&s)
         }),
-        ("persistent_insert_reports_a_taken_value", |s, _| {
-            persistent_insert_reports_a_taken_value(&s)
+        ("durable_insert_reports_a_taken_value", |s, _| {
+            durable_insert_reports_a_taken_value(&s)
         }),
-        ("persistent_is_unique_on_every_write_path", |s, _| {
-            persistent_is_unique_on_every_write_path(&s)
+        ("durable_is_unique_on_every_write_path", |s, _| {
+            durable_is_unique_on_every_write_path(&s)
         }),
-        ("find_persistent_is_format_and_qualifier_exact", |s, _| {
-            find_persistent_is_format_and_qualifier_exact(&s)
+        ("find_durable_is_format_and_qualifier_exact", |s, _| {
+            find_durable_is_format_and_qualifier_exact(&s)
         }),
         ("find_filters_on_every_field", |s, _| {
             find_filters_on_every_field(&s)
@@ -273,10 +273,11 @@ fn lookups_round_trip_and_isolate_users<S: IdentityStore>(s: &S) -> Outcome {
     Ok(())
 }
 
-fn persistent_is_get_or_insert<S: IdentityStore>(s: &S) -> Outcome {
+fn durable_is_get_or_insert<S: IdentityStore>(s: &S) -> Outcome {
+    let em = constants::NAMEID_EMAIL;
     let first = step(
-        "get_or_insert_persistent",
-        s.get_or_insert_persistent("alice", persistent("p1", SP_A)),
+        "get_or_insert_durable",
+        s.get_or_insert_durable("alice", persistent("p1", SP_A)),
     )?;
     ensure_eq!(
         first.value.as_str(),
@@ -284,21 +285,21 @@ fn persistent_is_get_or_insert<S: IdentityStore>(s: &S) -> Outcome {
         "the first candidate is inserted"
     );
     let again = step(
-        "get_or_insert_persistent",
-        s.get_or_insert_persistent("alice", persistent("p2", SP_A)),
+        "get_or_insert_durable",
+        s.get_or_insert_durable("alice", persistent("p2", SP_A)),
     )?;
     ensure_eq!(
         again.value.as_str(),
         "p1",
-        "a second candidate for the same (user, SP) must return the existing one"
+        "a second candidate for the same (user, SP, format) must return the existing one"
     );
     ensure!(
         step("user_for", s.user_for("p2"))?.is_none(),
         "the losing candidate must not be stored"
     );
     let other_sp = step(
-        "get_or_insert_persistent",
-        s.get_or_insert_persistent("alice", persistent("p3", SP_B)),
+        "get_or_insert_durable",
+        s.get_or_insert_durable("alice", persistent("p3", SP_B)),
     )?;
     ensure_eq!(
         other_sp.value.as_str(),
@@ -306,34 +307,69 @@ fn persistent_is_get_or_insert<S: IdentityStore>(s: &S) -> Outcome {
         "a different SP gets its own identifier"
     );
     let other_user = step(
-        "get_or_insert_persistent",
-        s.get_or_insert_persistent("bob", persistent("p4", SP_A)),
+        "get_or_insert_durable",
+        s.get_or_insert_durable("bob", persistent("p4", SP_A)),
     )?;
     ensure_eq!(
         other_user.value.as_str(),
         "p4",
         "a different user gets their own"
     );
+
+    // Every durable format is stable, not just persistent, and the formats are
+    // independent: alice's email and persistent identifiers for SP_A coexist.
+    let email = step(
+        "get_or_insert_durable",
+        s.get_or_insert_durable("alice", nid("e1", em, Some(SP_A))),
+    )?;
+    ensure_eq!(
+        email.value.as_str(),
+        "e1",
+        "a different format is a different identifier"
+    );
+    let email_again = step(
+        "get_or_insert_durable",
+        s.get_or_insert_durable("alice", nid("e2", em, Some(SP_A))),
+    )?;
+    ensure_eq!(
+        email_again.value.as_str(),
+        "e1",
+        "a non-persistent durable format must be reused too, not minted anew"
+    );
+    ensure!(
+        step("user_for", s.user_for("e2"))?.is_none(),
+        "the losing email candidate must not be stored"
+    );
+
+    // A transient candidate has no uniqueness constraint: a plain insert.
+    let t1 = step(
+        "get_or_insert_durable",
+        s.get_or_insert_durable("alice", nid("t1", constants::NAMEID_TRANSIENT, Some(SP_A))),
+    )?;
+    let t2 = step(
+        "get_or_insert_durable",
+        s.get_or_insert_durable("alice", nid("t2", constants::NAMEID_TRANSIENT, Some(SP_A))),
+    )?;
+    ensure!(
+        t1.value == "t1" && t2.value == "t2",
+        "transient candidates are not unique and must each be inserted"
+    );
     Ok(())
 }
 
-fn persistent_insert_reports_a_taken_value<S: IdentityStore>(s: &S) -> Outcome {
+fn durable_insert_reports_a_taken_value<S: IdentityStore>(s: &S) -> Outcome {
     step(
         "insert",
         s.insert("alice", nid("taken", constants::NAMEID_EMAIL, Some(SP_A))),
     )?;
-    match s.get_or_insert_persistent("bob", persistent("taken", SP_A)) {
+    match s.get_or_insert_durable("bob", persistent("taken", SP_A)) {
         Err(InsertError::ValueTaken) => {}
         Ok(_) => {
             return Err(
                 "no existing persistent record, but the value is taken by another user".to_string(),
             );
         }
-        Err(e) => {
-            return Err(format!(
-                "backend call `get_or_insert_persistent` failed: {e}"
-            ))
-        }
+        Err(e) => return Err(format!("backend call `get_or_insert_durable` failed: {e}")),
     }
     let owner = step("user_for", s.user_for("taken"))?;
     ensure_eq!(
@@ -344,99 +380,124 @@ fn persistent_insert_reports_a_taken_value<S: IdentityStore>(s: &S) -> Outcome {
     Ok(())
 }
 
-fn persistent_is_unique_on_every_write_path<S: IdentityStore>(s: &S) -> Outcome {
-    step(
-        "get_or_insert_persistent",
-        s.get_or_insert_persistent("alice", persistent("p1", SP_A)),
-    )?;
-
-    // A second persistent record for the same (user, SP, NameQualifier), written
-    // with a different value, must be refused on `insert` and on `replace`, not
-    // only through `get_or_insert_persistent`. A backend whose partial unique
-    // index is missing, or whose other write paths bypass it, would otherwise
-    // hold two "stable" identifiers for one (user, SP).
-    match s.insert("alice", persistent("p2", SP_A)) {
-        Err(InsertError::PersistentExists) => {}
-        Ok(()) => {
-            return Err(
-                "insert accepted a second persistent record for the same (user, \
-                        SPNameQualifier, NameQualifier): the persistent uniqueness \
-                        constraint is missing or does not cover insert"
-                    .to_string(),
-            );
+fn durable_is_unique_on_every_write_path<S: IdentityStore>(s: &S) -> Outcome {
+    let em = constants::NAMEID_EMAIL;
+    // For each durable format: after one record exists for (alice, SP_A), a
+    // second with a different value must be refused on `insert` and on
+    // `replace`, not only through `get_or_insert_durable`. A backend whose
+    // unique index is missing, or whose other write paths bypass it, would
+    // otherwise hold two "stable" identifiers for one (user, SP, format).
+    for (label, format, first, second, third) in [
+        ("persistent", constants::NAMEID_PERSISTENT, "p1", "p2", "p3"),
+        ("email", em, "e1", "e2", "e3"),
+    ] {
+        step(
+            "get_or_insert_durable",
+            s.get_or_insert_durable("alice", nid(first, format, Some(SP_A))),
+        )?;
+        match s.insert("alice", nid(second, format, Some(SP_A))) {
+            Err(InsertError::DurableExists) => {}
+            Ok(()) => {
+                return Err(format!(
+                    "insert accepted a second {label} record for the same (user, \
+                     SPNameQualifier, NameQualifier): the durable uniqueness constraint \
+                     is missing or does not cover insert (second record accepted)"
+                ));
+            }
+            Err(InsertError::ValueTaken) => {
+                return Err("insert reported ValueTaken for a fresh value; expected \
+                            DurableExists"
+                    .to_string());
+            }
+            Err(e) => return Err(format!("backend call `insert` failed: {e}")),
         }
-        Err(InsertError::ValueTaken) => {
-            return Err("insert reported ValueTaken for a fresh value; expected \
-                        PersistentExists"
-                .to_string());
+        match s.replace("alice", nid(third, format, Some(SP_A))) {
+            Err(InsertError::DurableExists) => {}
+            Ok(()) => {
+                return Err(format!(
+                    "replace accepted a second {label} record for the same (user, \
+                     SPNameQualifier, NameQualifier): the durable uniqueness constraint \
+                     is missing or does not cover replace (second record accepted)"
+                ));
+            }
+            Err(InsertError::ValueTaken) => {
+                return Err("replace reported ValueTaken; it upserts by value".to_string());
+            }
+            Err(e) => return Err(format!("backend call `replace` failed: {e}")),
         }
-        Err(e) => return Err(format!("backend call `insert` failed: {e}")),
+        // Nothing was written by the refused attempts.
+        ensure!(
+            step("user_for", s.user_for(second))?.is_none()
+                && step("user_for", s.user_for(third))?.is_none(),
+            "a refused {label} write must not be findable by its value"
+        );
+        // The existing record can still be updated in place.
+        let mut updated = nid(first, format, Some(SP_A));
+        updated.sp_provided_id = Some("alias".to_string());
+        step("replace", s.replace("alice", updated))?;
     }
-    match s.replace("alice", persistent("p3", SP_A)) {
-        Err(InsertError::PersistentExists) => {}
-        Ok(()) => {
-            return Err(
-                "replace accepted a second persistent record for the same (user, \
-                        SPNameQualifier, NameQualifier): the persistent uniqueness \
-                        constraint is missing or does not cover replace"
-                    .to_string(),
-            );
-        }
-        Err(InsertError::ValueTaken) => {
-            return Err("replace reported ValueTaken; it upserts by value".to_string());
-        }
-        Err(e) => return Err(format!("backend call `replace` failed: {e}")),
-    }
 
-    // Nothing was written by the refused attempts.
+    // Nothing but the two originals is left for (alice, SP_A).
     let alice = step("for_user", s.for_user("alice"))?;
     ensure_eq!(
         alice.len(),
-        1,
-        "a refused write must not leave a record behind"
-    );
-    ensure_eq!(alice[0].value.as_str(), "p1", "the original record is kept");
-    ensure!(
-        step("user_for", s.user_for("p2"))?.is_none()
-            && step("user_for", s.user_for("p3"))?.is_none(),
-        "a refused write must not be findable by its value"
+        2,
+        "refused writes must not leave records behind"
     );
 
-    // The constraint is exactly (user, SPNameQualifier, NameQualifier, persistent):
-    // other users, other SPs and other formats are unaffected...
-    step("insert", s.insert("alice", persistent("p4", SP_B)))?;
-    step("insert", s.insert("bob", persistent("p5", SP_A)))?;
+    // The constraint is exactly (user, SP, NameQualifier, format): other users
+    // and other SPs are unaffected...
     step(
         "insert",
-        s.insert("alice", nid("e1", constants::NAMEID_EMAIL, Some(SP_A))),
+        s.insert("alice", nid("p4", constants::NAMEID_PERSISTENT, Some(SP_B))),
     )?;
-    // ...and the existing persistent record can still be updated in place.
-    let mut updated = persistent("p1", SP_A);
-    updated.sp_provided_id = Some("alias".to_string());
-    step("replace", s.replace("alice", updated))?;
+    step(
+        "insert",
+        s.insert("bob", nid("p5", constants::NAMEID_PERSISTENT, Some(SP_A))),
+    )?;
+    step("insert", s.insert("bob", nid("e4", em, Some(SP_A))))?;
+    // ...and transient records have no constraint at all.
+    for value in ["t1", "t2"] {
+        step(
+            "insert",
+            s.insert("alice", nid(value, constants::NAMEID_TRANSIENT, Some(SP_A))),
+        )?;
+    }
     Ok(())
 }
 
-fn find_persistent_is_format_and_qualifier_exact<S: IdentityStore>(s: &S) -> Outcome {
-    step(
-        "insert",
-        s.insert("alice", nid("e1", constants::NAMEID_EMAIL, Some(SP_A))),
-    )?;
+fn find_durable_is_format_and_qualifier_exact<S: IdentityStore>(s: &S) -> Outcome {
+    let (per, em, tr) = (
+        constants::NAMEID_PERSISTENT,
+        constants::NAMEID_EMAIL,
+        constants::NAMEID_TRANSIENT,
+    );
+    step("insert", s.insert("alice", nid("e1", em, Some(SP_A))))?;
     ensure!(
         step(
-            "find_persistent",
-            s.find_persistent("alice", Some(SP_A), Some(IDP))
+            "find_durable",
+            s.find_durable("alice", Some(SP_A), Some(IDP), per)
         )?
         .is_none(),
-        "a non-persistent record must never satisfy a persistent lookup"
+        "a record of another format must never satisfy a lookup for this format"
+    );
+    let found = step(
+        "find_durable",
+        s.find_durable("alice", Some(SP_A), Some(IDP), em),
+    )?
+    .map(|n| n.value);
+    ensure_eq!(
+        found,
+        Some("e1".to_string()),
+        "the email record is found by its format and qualifiers"
     );
     step(
-        "get_or_insert_persistent",
-        s.get_or_insert_persistent("alice", persistent("p1", SP_A)),
+        "get_or_insert_durable",
+        s.get_or_insert_durable("alice", persistent("p1", SP_A)),
     )?;
     let found = step(
-        "find_persistent",
-        s.find_persistent("alice", Some(SP_A), Some(IDP)),
+        "find_durable",
+        s.find_durable("alice", Some(SP_A), Some(IDP), per),
     )?
     .map(|n| n.value);
     ensure_eq!(
@@ -446,19 +507,29 @@ fn find_persistent_is_format_and_qualifier_exact<S: IdentityStore>(s: &S) -> Out
     );
     ensure!(
         step(
-            "find_persistent",
-            s.find_persistent("alice", Some(SP_B), Some(IDP))
+            "find_durable",
+            s.find_durable("alice", Some(SP_B), Some(IDP), per)
         )?
         .is_none(),
         "a different SPNameQualifier must not match"
     );
     ensure!(
         step(
-            "find_persistent",
-            s.find_persistent("alice", None, Some(IDP))
+            "find_durable",
+            s.find_durable("alice", None, Some(IDP), per)
         )?
         .is_none(),
         "a None qualifier means the record has no such qualifier"
+    );
+    // A transient format is never durable, even when transient records exist.
+    step("insert", s.insert("alice", nid("t1", tr, Some(SP_A))))?;
+    ensure!(
+        step(
+            "find_durable",
+            s.find_durable("alice", Some(SP_A), Some(IDP), tr)
+        )?
+        .is_none(),
+        "a transient record must never satisfy a durable lookup"
     );
     Ok(())
 }
@@ -481,8 +552,8 @@ fn find_filters_on_every_field<S: IdentityStore>(s: &S) -> Outcome {
         s.insert("alice", nid("f2", constants::NAMEID_EMAIL, Some(SP_B))),
     )?;
     step(
-        "get_or_insert_persistent",
-        s.get_or_insert_persistent("alice", persistent("f3", SP_A)),
+        "get_or_insert_durable",
+        s.get_or_insert_durable("alice", persistent("f3", SP_A)),
     )?;
     step(
         "insert",
@@ -645,38 +716,48 @@ where
     S: IdentityStore + 'static,
 {
     let store = Arc::new(store);
-    let handles: Vec<_> = (0..options.threads.max(2))
-        .map(|i| {
-            let store = Arc::clone(&store);
-            thread::spawn(move || -> Result<String, String> {
-                // Retry on ValueTaken exactly as IdentDb does.
-                loop {
-                    let candidate = persistent(&format!("c{i}"), SP_A);
-                    match store.get_or_insert_persistent("alice", candidate) {
-                        Ok(winner) => return Ok(winner.value),
-                        Err(InsertError::ValueTaken) => continue,
-                        Err(e) => {
-                            return Err(format!(
-                                "backend call `get_or_insert_persistent` failed: {e}"
-                            ))
+    // The same race, for persistent and for a non-persistent durable format.
+    for (label, format) in [
+        ("persistent", constants::NAMEID_PERSISTENT),
+        ("email", constants::NAMEID_EMAIL),
+    ] {
+        let handles: Vec<_> = (0..options.threads.max(2))
+            .map(|i| {
+                let store = Arc::clone(&store);
+                thread::spawn(move || -> Result<String, String> {
+                    // Retry on ValueTaken exactly as IdentDb does.
+                    loop {
+                        let candidate = nid(&format!("{label}{i}"), format, Some(SP_A));
+                        match store.get_or_insert_durable("alice", candidate) {
+                            Ok(winner) => return Ok(winner.value),
+                            Err(InsertError::ValueTaken) => continue,
+                            Err(e) => {
+                                return Err(format!(
+                                    "backend call `get_or_insert_durable` failed: {e}"
+                                ))
+                            }
                         }
                     }
-                }
+                })
             })
-        })
-        .collect();
-    let values = join_all(handles)?;
-    ensure!(
-        values.iter().all(|v| v == &values[0]),
-        "concurrent first requests for one (user, SP) minted different \
-         persistent identifiers - the backend is missing its uniqueness \
-         constraint on (user, sp_name_qualifier, name_qualifier): {values:?}"
-    );
-    let stored = step("for_user", store.for_user("alice"))?
-        .into_iter()
-        .filter(|n| n.format.as_deref() == Some(constants::NAMEID_PERSISTENT))
-        .count();
-    ensure_eq!(stored, 1, "exactly one persistent record must be stored");
+            .collect();
+        let values = join_all(handles)?;
+        ensure!(
+            values.iter().all(|v| v == &values[0]),
+            "concurrent first requests for one (user, SP) minted different {label} \
+             identifiers - the backend is missing its uniqueness constraint on \
+             (user, sp_name_qualifier, name_qualifier, format): {values:?}"
+        );
+        let stored = step("for_user", store.for_user("alice"))?
+            .into_iter()
+            .filter(|n| n.format.as_deref() == Some(format))
+            .count();
+        ensure_eq!(
+            stored,
+            1,
+            "exactly one {label} record must be stored for (user, SP)"
+        );
+    }
     Ok(())
 }
 

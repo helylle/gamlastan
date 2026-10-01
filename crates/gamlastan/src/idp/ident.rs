@@ -50,21 +50,21 @@ pub enum IdentError {
     #[error(transparent)]
     Store(#[from] StoreError),
 
-    /// A persistent NameID already exists for this user and
-    /// `(SPNameQualifier, NameQualifier)`; a second cannot be recorded.
+    /// A durable (non-transient) NameID of this format already exists for this
+    /// user and `(SPNameQualifier, NameQualifier)`; a second cannot be recorded.
     #[error(
-        "a persistent NameID already exists for this user and (SPNameQualifier, NameQualifier)"
+        "a NameID of this format already exists for this user and (SPNameQualifier, NameQualifier)"
     )]
-    PersistentExists,
+    DurableExists,
 }
 
 impl From<InsertError> for IdentError {
-    /// For a write that can only conflict on the persistent tuple
+    /// For a write that can only conflict on the durable tuple
     /// ([`IdentityStore::replace`]). `ValueTaken` is outside that contract
     /// (`replace` upserts by value), so it is reported as a backend fault.
     fn from(e: InsertError) -> Self {
         match e {
-            InsertError::PersistentExists => IdentError::PersistentExists,
+            InsertError::DurableExists => IdentError::DurableExists,
             InsertError::Store(e) => IdentError::Store(e),
             InsertError::ValueTaken => IdentError::Store(StoreError::new(
                 "the backend reported ValueTaken from a write that upserts by value",
@@ -98,13 +98,14 @@ pub enum InsertError {
     /// The NameID value is already in use by another record.
     #[error("NameID value already in use")]
     ValueTaken,
-    /// The record is persistent, and the user already has a persistent record
-    /// for the same `(SPNameQualifier, NameQualifier)`. There can be only one:
-    /// `get_or_insert_persistent` is how to obtain it.
+    /// The record is durable (any format except transient), and the user
+    /// already has a record of the same format for the same
+    /// `(SPNameQualifier, NameQualifier)`. There can be only one:
+    /// `get_or_insert_durable` is how to obtain it.
     #[error(
-        "a persistent NameID already exists for this user and (SPNameQualifier, NameQualifier)"
+        "a NameID of this format already exists for this user and (SPNameQualifier, NameQualifier)"
     )]
-    PersistentExists,
+    DurableExists,
     /// The backend failed.
     #[error(transparent)]
     Store(#[from] StoreError),
@@ -114,7 +115,7 @@ pub enum InsertError {
 ///
 /// A `None` field matches any record. A `Some` field requires the record's
 /// field to equal it exactly, so a record that lacks the field does not match.
-/// This differs from [`IdentityStore::find_persistent`], where a `None`
+/// This differs from [`IdentityStore::find_durable`], where a `None`
 /// qualifier means "the record has no such qualifier".
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct NameIdFilter {
@@ -195,21 +196,22 @@ impl KeyValueStore for InMemoryKeyValueStore {
 /// must enforce.
 ///
 /// * the NameID **value** is unique across all records, and
-/// * among **persistent** records, `(user, sp_name_qualifier,
-///   name_qualifier)` is unique.
+/// * among **durable** records - every format except transient - `(user,
+///   sp_name_qualifier, name_qualifier, format)` is unique.
 ///
-/// Without them, two concurrent first requests for the same (user, SP) can
-/// both insert and mint two different "stable" persistent identifiers, and
-/// nothing in this crate can detect it - they must be real constraints in
-/// the store (a unique index, a `UNIQUE` constraint), not application-level
-/// checks. Run [`conformance`] against a real instance to check a backend.
+/// Without them, two concurrent first requests for the same (user, SP, format)
+/// can both insert and mint two different "stable" identifiers, and nothing in
+/// this crate can detect it - they must be real constraints in the store (a
+/// unique index, a `UNIQUE` constraint, partial on `format != transient`), not
+/// application-level checks. Transient records are exempt: they are
+/// one-time-use, and `IdentDb::with_persist_transient` may store many. Run [`conformance`] against a real instance to check a backend.
 ///
 /// There are deliberately no default write methods: a non-atomic default
 /// would silently leave those races open on a multi-instance deployment.
 ///
 /// Every method is fallible. A backend that cannot answer must return
 /// [`StoreError`], never an empty result: "no record" and "could not look"
-/// are different answers, and conflating them would mint a second persistent
+/// are different answers, and conflating them would mint a second durable
 /// identifier for a user who already has one.
 pub trait IdentityStore: Send + Sync {
     /// Every NameID associated with `user_id`, in unspecified order.
@@ -229,53 +231,57 @@ pub trait IdentityStore: Send + Sync {
             .collect())
     }
 
-    /// The user's persistent NameID for `(sp_name_qualifier,
-    /// name_qualifier)`, if one exists. `None` for a qualifier means the
-    /// record has no such qualifier. Overridable to push the lookup down to
-    /// an index; the default filters [`for_user`](Self::for_user).
-    fn find_persistent(
+    /// The user's durable NameID of `format` for `(sp_name_qualifier,
+    /// name_qualifier)`, if one exists. `None` for a qualifier means the record
+    /// has no such qualifier. A transient `format` never matches. Overridable
+    /// to push the lookup down to an index; the default filters
+    /// [`for_user`](Self::for_user).
+    fn find_durable(
         &self,
         user_id: &str,
         sp_name_qualifier: Option<&str>,
         name_qualifier: Option<&str>,
+        format: &str,
     ) -> Result<Option<NameId>, StoreError> {
         Ok(self
             .for_user(user_id)?
             .into_iter()
-            .find(|n| is_persistent_match(n, sp_name_qualifier, name_qualifier)))
+            .find(|n| is_durable_match(n, sp_name_qualifier, name_qualifier, format)))
     }
 
-    /// Atomically return the user's existing persistent NameID with the same
-    /// `(sp_name_qualifier, name_qualifier)` as `candidate`, or insert
+    /// Atomically return the user's existing durable NameID with the same
+    /// `(sp_name_qualifier, name_qualifier, format)` as `candidate`, or insert
     /// `candidate` and return it. `Err(InsertError::ValueTaken)` if the record
-    /// would be inserted but its value is already in use.
-    fn get_or_insert_persistent(
+    /// would be inserted but its value is already in use. For a transient
+    /// `candidate`, which has no uniqueness constraint, this is a plain insert.
+    fn get_or_insert_durable(
         &self,
         user_id: &str,
         candidate: NameId,
     ) -> Result<NameId, InsertError>;
 
     /// Insert a freshly minted NameID. `Err(InsertError::ValueTaken)` if any
-    /// record already has this value. `Err(InsertError::PersistentExists)` if
-    /// the record is persistent and `user_id` already has a persistent record
-    /// for the same `(sp_name_qualifier, name_qualifier)`: the second uniqueness
-    /// constraint holds on every write path, not only on
-    /// [`get_or_insert_persistent`](Self::get_or_insert_persistent).
+    /// record already has this value. `Err(InsertError::DurableExists)` if
+    /// the record is durable (any format except transient) and `user_id`
+    /// already has a record of that format for the same
+    /// `(sp_name_qualifier, name_qualifier)`: the second uniqueness constraint
+    /// holds on every write path, not only on
+    /// [`get_or_insert_durable`](Self::get_or_insert_durable).
     fn insert(&self, user_id: &str, name_id: NameId) -> Result<(), InsertError>;
 
     /// Insert or overwrite the record with this value, assigning it to
     /// `user_id`. Records are keyed by value, so this changes a record's *other*
     /// fields in place (e.g. a ManageNameID `NewID` sets `SPProvidedID` on the
-    /// same NameID value). It cannot give a persistent record a new value: a
-    /// different value is a different record. Persistent identifiers are meant
-    /// to stay stable, and rotating one is not an operation this trait offers
+    /// same NameID value). It cannot give a durable record a new value: a
+    /// different value is a different record. Durable identifiers are meant to
+    /// stay stable, and rotating one is not an operation this trait offers
     /// (`remove` followed by `insert` is not atomic).
     ///
     /// It never reports `ValueTaken`, since it upserts by value, but it holds
-    /// the same persistent constraint as [`insert`](Self::insert):
-    /// `Err(InsertError::PersistentExists)` if the write would leave `user_id`
-    /// with a second persistent record (a different value) for the same
-    /// `(sp_name_qualifier, name_qualifier)`. Updating the existing persistent
+    /// the same durable constraint as [`insert`](Self::insert):
+    /// `Err(InsertError::DurableExists)` if the write would leave `user_id`
+    /// with a second durable record (a different value) of the same format for
+    /// the same `(sp_name_qualifier, name_qualifier)`. Updating the existing
     /// record in place is fine.
     fn replace(&self, user_id: &str, name_id: NameId) -> Result<(), InsertError>;
 
@@ -286,32 +292,47 @@ pub trait IdentityStore: Send + Sync {
     fn remove_all(&self, user_id: &str) -> Result<(), StoreError>;
 }
 
-/// Whether `nid` is a persistent NameID with exactly these qualifiers
-/// (`None` matching only a record that has no such qualifier).
-pub(crate) fn is_persistent_match(
+/// Whether `nid` is a durable NameID of `format` with exactly these qualifiers
+/// (`None` matching only a record that has no such qualifier). A transient
+/// `format` is never durable, so never matches.
+pub(crate) fn is_durable_match(
     nid: &NameId,
     sp_name_qualifier: Option<&str>,
     name_qualifier: Option<&str>,
+    format: &str,
 ) -> bool {
-    nid.format.as_deref() == Some(constants::NAMEID_PERSISTENT)
+    format != constants::NAMEID_TRANSIENT
+        && nid.format.as_deref() == Some(format)
         && nid.sp_name_qualifier.as_deref() == sp_name_qualifier
         && nid.name_qualifier.as_deref() == name_qualifier
 }
 
+/// The format of `name_id` if it is durable: present and not transient.
+fn durable_format(name_id: &NameId) -> Option<&str> {
+    name_id
+        .format
+        .as_deref()
+        .filter(|f| *f != constants::NAMEID_TRANSIENT)
+}
+
 /// Whether writing `name_id` for `user_id` would leave the user with a second
-/// persistent record for the same `(sp_name_qualifier, name_qualifier)`: it is
-/// persistent, and a *different* value already holds that slot.
-fn persistent_tuple_taken(records: &[(String, NameId)], user_id: &str, name_id: &NameId) -> bool {
-    name_id.format.as_deref() == Some(constants::NAMEID_PERSISTENT)
-        && records.iter().any(|(user, existing)| {
-            user == user_id
-                && existing.value != name_id.value
-                && is_persistent_match(
-                    existing,
-                    name_id.sp_name_qualifier.as_deref(),
-                    name_id.name_qualifier.as_deref(),
-                )
-        })
+/// durable record of the same format for the same `(sp_name_qualifier,
+/// name_qualifier)`: it is durable, and a *different* value already holds that
+/// slot.
+fn durable_tuple_taken(records: &[(String, NameId)], user_id: &str, name_id: &NameId) -> bool {
+    let Some(format) = durable_format(name_id) else {
+        return false;
+    };
+    records.iter().any(|(user, existing)| {
+        user == user_id
+            && existing.value != name_id.value
+            && is_durable_match(
+                existing,
+                name_id.sp_name_qualifier.as_deref(),
+                name_id.name_qualifier.as_deref(),
+                format,
+            )
+    })
 }
 
 /// In-memory [`IdentityStore`] for tests, examples and single-instance
@@ -347,21 +368,24 @@ impl IdentityStore for InMemoryIdentityStore {
             .map(|(user, _)| user.clone()))
     }
 
-    fn get_or_insert_persistent(
+    fn get_or_insert_durable(
         &self,
         user_id: &str,
         candidate: NameId,
     ) -> Result<NameId, InsertError> {
         let mut records = self.records.lock().unwrap();
-        if let Some((_, existing)) = records.iter().find(|(user, nid)| {
-            user == user_id
-                && is_persistent_match(
-                    nid,
-                    candidate.sp_name_qualifier.as_deref(),
-                    candidate.name_qualifier.as_deref(),
-                )
-        }) {
-            return Ok(existing.clone());
+        if let Some(format) = durable_format(&candidate) {
+            if let Some((_, existing)) = records.iter().find(|(user, nid)| {
+                user == user_id
+                    && is_durable_match(
+                        nid,
+                        candidate.sp_name_qualifier.as_deref(),
+                        candidate.name_qualifier.as_deref(),
+                        format,
+                    )
+            }) {
+                return Ok(existing.clone());
+            }
         }
         if records.iter().any(|(_, nid)| nid.value == candidate.value) {
             return Err(InsertError::ValueTaken);
@@ -375,8 +399,8 @@ impl IdentityStore for InMemoryIdentityStore {
         if records.iter().any(|(_, nid)| nid.value == name_id.value) {
             return Err(InsertError::ValueTaken);
         }
-        if persistent_tuple_taken(&records, user_id, &name_id) {
-            return Err(InsertError::PersistentExists);
+        if durable_tuple_taken(&records, user_id, &name_id) {
+            return Err(InsertError::DurableExists);
         }
         records.push((user_id.to_string(), name_id));
         Ok(())
@@ -384,8 +408,8 @@ impl IdentityStore for InMemoryIdentityStore {
 
     fn replace(&self, user_id: &str, name_id: NameId) -> Result<(), InsertError> {
         let mut records = self.records.lock().unwrap();
-        if persistent_tuple_taken(&records, user_id, &name_id) {
-            return Err(InsertError::PersistentExists);
+        if durable_tuple_taken(&records, user_id, &name_id) {
+            return Err(InsertError::DurableExists);
         }
         match records
             .iter_mut()
@@ -592,7 +616,7 @@ impl<S: IdentityStore> IdentDb<S> {
     /// any record that already has the same value, so it updates that
     /// NameID's other fields in place rather than changing its value.
     ///
-    /// Fails with [`IdentError::PersistentExists`] if `name_id` is persistent
+    /// Fails with [`IdentError::DurableExists`] if `name_id` is persistent
     /// and the user already has a different persistent NameID for the same
     /// `(SPNameQualifier, NameQualifier)`; use
     /// [`persistent_nameid`](Self::persistent_nameid) to obtain that one. A
@@ -622,14 +646,18 @@ impl<S: IdentityStore> IdentDb<S> {
         sp_name_qualifier: Option<&str>,
         name_qualifier: Option<&str>,
     ) -> Result<Option<NameId>, StoreError> {
-        self.store
-            .find_persistent(user_id, sp_name_qualifier, name_qualifier)
+        self.store.find_durable(
+            user_id,
+            sp_name_qualifier,
+            name_qualifier,
+            constants::NAMEID_PERSISTENT,
+        )
     }
 
     /// Generate a fresh opaque identifier value (pysaml2 `create_id()`).
     ///
     /// The free-check here is only an optimisation: the store's `insert` /
-    /// `get_or_insert_persistent` enforce value uniqueness atomically, and a
+    /// `get_or_insert_durable` enforce value uniqueness atomically, and a
     /// collision that slips in between is retried by the caller. It is skipped
     /// (`check_free = false`) for identifiers that are never stored, so issuing
     /// one does not depend on the store being reachable.
@@ -664,8 +692,15 @@ impl<S: IdentityStore> IdentDb<S> {
         }
     }
 
-    /// Create a new NameID of the given format (pysaml2 `get_nameid()`);
-    /// persistent format reuses an existing association when one exists.
+    /// Get or create the NameID of the given format (pysaml2 `get_nameid()`).
+    ///
+    /// Every durable format (anything except transient: persistent, email,
+    /// unspecified, ...) is stable per `(user, SP, NameQualifier, format)`: an
+    /// existing record is returned rather than a new value minted, and two
+    /// concurrent first requests converge on one. (0.9.x minted and stored a
+    /// fresh value on every call for the non-persistent durable formats, so an
+    /// email-format NameID changed at each login and the store grew with each
+    /// response.)
     ///
     /// Transient identifiers are minted fresh and, unless
     /// [`with_persist_transient`](Self::with_persist_transient) is set,
@@ -674,10 +709,10 @@ impl<S: IdentityStore> IdentDb<S> {
     /// reverse lookup, so persisting them would only grow the store without
     /// bound (the default per-SP format is transient, so every response
     /// would otherwise add an entry that is never read back). All other
-    /// formats are stored so they can be looked up and reused. The rule is
-    /// "persist iff the identifier is ever reverse-looked-up or reused"; if a
-    /// future one-time-use format is added, generalize the transient check
-    /// to a set of non-persisted formats.
+    /// formats are stored and reused. The rule is "persist iff the identifier
+    /// is ever reverse-looked-up or reused"; if a future one-time-use format is
+    /// added, generalize the transient check to a set of non-persisted
+    /// formats.
     pub fn get_nameid(
         &self,
         user_id: &str,
@@ -685,21 +720,22 @@ impl<S: IdentityStore> IdentDb<S> {
         sp_name_qualifier: Option<&str>,
         name_qualifier: Option<&str>,
     ) -> Result<NameId, StoreError> {
-        // Persistent identifiers must stay stable per (user, SP): reuse an
-        // existing association instead of minting a new value (E78). The
+        // A durable identifier must stay stable per (user, SP, format): reuse
+        // an existing association instead of minting a new value (E78). The
         // read is the fast path for a returning user; the atomic
         // get-or-insert below is what makes two concurrent *first* requests
         // converge on one identifier.
-        if format == constants::NAMEID_PERSISTENT {
+        let durable = format != constants::NAMEID_TRANSIENT;
+        if durable {
             if let Some(existing) =
                 self.store
-                    .find_persistent(user_id, sp_name_qualifier, name_qualifier)?
+                    .find_durable(user_id, sp_name_qualifier, name_qualifier, format)?
             {
                 return Ok(existing);
             }
         }
 
-        let stored = format != constants::NAMEID_TRANSIENT || self.persist_transient;
+        let stored = durable || self.persist_transient;
         loop {
             let value = self.create_id(format, name_qualifier, sp_name_qualifier, stored)?;
             let name_id = NameId {
@@ -710,15 +746,15 @@ impl<S: IdentityStore> IdentDb<S> {
                 sp_provided_id: None,
             };
 
-            if format == constants::NAMEID_PERSISTENT {
-                match self.store.get_or_insert_persistent(user_id, name_id) {
+            if durable {
+                match self.store.get_or_insert_durable(user_id, name_id) {
                     Ok(winner) => return Ok(winner),
                     Err(InsertError::ValueTaken) => continue,
                     Err(InsertError::Store(e)) => return Err(e),
                     // It must hand back the existing record, never refuse.
-                    Err(InsertError::PersistentExists) => {
+                    Err(InsertError::DurableExists) => {
                         return Err(StoreError::new(
-                            "the backend reported PersistentExists from get_or_insert_persistent",
+                            "the backend reported DurableExists from get_or_insert_durable",
                         ))
                     }
                 }
@@ -730,11 +766,12 @@ impl<S: IdentityStore> IdentDb<S> {
                 Ok(()) => return Ok(name_id),
                 Err(InsertError::ValueTaken) => continue,
                 Err(InsertError::Store(e)) => return Err(e),
-                // Only a persistent record can hit this, and those take the
-                // get_or_insert_persistent path above.
-                Err(InsertError::PersistentExists) => {
+                // Only a durable record can hit this, and those take the
+                // get_or_insert_durable path above; what reaches here is a
+                // transient one, which has no uniqueness constraint.
+                Err(InsertError::DurableExists) => {
                     return Err(StoreError::new(
-                        "the backend reported PersistentExists for a non-persistent record",
+                        "the backend reported DurableExists for a transient record",
                     ))
                 }
             }
@@ -996,7 +1033,7 @@ mod tests {
         fn user_for(&self, value: &str) -> Result<Option<String>, StoreError> {
             self.inner.user_for(value)
         }
-        fn get_or_insert_persistent(
+        fn get_or_insert_durable(
             &self,
             user_id: &str,
             candidate: NameId,
@@ -1004,10 +1041,11 @@ mod tests {
             if self.check_then_insert {
                 // Look, release, then write: what a backend without a unique
                 // index does. Widen the window so the race is certain.
-                if let Some(existing) = self.inner.find_persistent(
+                if let Some(existing) = self.inner.find_durable(
                     user_id,
                     candidate.sp_name_qualifier.as_deref(),
                     candidate.name_qualifier.as_deref(),
+                    candidate.format.as_deref().unwrap_or_default(),
                 )? {
                     return Ok(existing);
                 }
@@ -1017,7 +1055,7 @@ mod tests {
                 self.inner.insert(user_id, candidate.clone())?;
                 return Ok(candidate);
             }
-            self.inner.get_or_insert_persistent(user_id, candidate)
+            self.inner.get_or_insert_durable(user_id, candidate)
         }
         fn insert(&self, user_id: &str, name_id: NameId) -> Result<(), InsertError> {
             if self.no_value_uniqueness {
@@ -1051,7 +1089,7 @@ mod tests {
         fn user_for(&self, _: &str) -> Result<Option<String>, StoreError> {
             Err(down())
         }
-        fn get_or_insert_persistent(&self, _: &str, _: NameId) -> Result<NameId, InsertError> {
+        fn get_or_insert_durable(&self, _: &str, _: NameId) -> Result<NameId, InsertError> {
             Err(down().into())
         }
         fn insert(&self, _: &str, _: NameId) -> Result<(), InsertError> {
@@ -1101,7 +1139,7 @@ mod tests {
     }
 
     /// A backend that enforces the persistent `(user, SP, NameQualifier)`
-    /// constraint only in `get_or_insert_persistent`, as the in-memory store
+    /// constraint only in `get_or_insert_durable`, as the in-memory store
     /// once did: `insert` (when `guard_insert` is off) and `replace` accept a
     /// second persistent record. Value uniqueness holds.
     #[derive(Default)]
@@ -1126,7 +1164,7 @@ mod tests {
                 .find(|(_, nid)| nid.value == value)
                 .map(|(user, _)| user.clone()))
         }
-        fn get_or_insert_persistent(
+        fn get_or_insert_durable(
             &self,
             user_id: &str,
             candidate: NameId,
@@ -1134,10 +1172,11 @@ mod tests {
             let mut records = self.records.lock().unwrap();
             if let Some((_, existing)) = records.iter().find(|(user, nid)| {
                 user == user_id
-                    && is_persistent_match(
+                    && is_durable_match(
                         nid,
                         candidate.sp_name_qualifier.as_deref(),
                         candidate.name_qualifier.as_deref(),
+                        candidate.format.as_deref().unwrap_or_default(),
                     )
             }) {
                 return Ok(existing.clone());
@@ -1153,8 +1192,8 @@ mod tests {
             if records.iter().any(|(_, nid)| nid.value == name_id.value) {
                 return Err(InsertError::ValueTaken);
             }
-            if self.guard_insert && persistent_tuple_taken(&records, user_id, &name_id) {
-                return Err(InsertError::PersistentExists);
+            if self.guard_insert && durable_tuple_taken(&records, user_id, &name_id) {
+                return Err(InsertError::DurableExists);
             }
             records.push((user_id.to_string(), name_id));
             Ok(())
@@ -1200,17 +1239,17 @@ mod tests {
     fn the_reference_store_enforces_the_persistent_constraint_on_every_write_path() {
         let store = InMemoryIdentityStore::new();
         store
-            .get_or_insert_persistent("alice", persistent_nid("p1", SP))
+            .get_or_insert_durable("alice", persistent_nid("p1", SP))
             .unwrap();
         // A second persistent record for the same (user, SP, NameQualifier),
         // by value-distinct `insert` or `replace`, is refused...
         assert!(matches!(
             store.insert("alice", persistent_nid("p2", SP)),
-            Err(InsertError::PersistentExists)
+            Err(InsertError::DurableExists)
         ));
         assert!(matches!(
             store.replace("alice", persistent_nid("p3", SP)),
-            Err(InsertError::PersistentExists)
+            Err(InsertError::DurableExists)
         ));
         assert_eq!(store.for_user("alice").unwrap().len(), 1);
         // ...while another SP, another user, another format, and an in-place
@@ -1230,7 +1269,7 @@ mod tests {
         ));
         assert!(matches!(
             store.replace("bob", persistent_nid("p1", SP)),
-            Err(InsertError::PersistentExists)
+            Err(InsertError::DurableExists)
         ));
     }
 
@@ -1245,7 +1284,7 @@ mod tests {
         };
         assert!(matches!(
             db.store("alice", &second),
-            Err(IdentError::PersistentExists)
+            Err(IdentError::DurableExists)
         ));
         assert_eq!(db.name_ids_for("alice").unwrap(), vec![first.clone()]);
         // Storing the existing identifier again (an update) is fine.
@@ -1255,7 +1294,7 @@ mod tests {
     #[test]
     fn conformance_catches_a_backend_that_only_guards_get_or_insert_persistent() {
         let err = conformance::check(PartialConstraintStore::default).unwrap_err();
-        assert_eq!(err.check, "persistent_is_unique_on_every_write_path");
+        assert_eq!(err.check, "durable_is_unique_on_every_write_path");
         assert!(
             err.message.contains("insert accepted a second persistent"),
             "{err}"
@@ -1269,7 +1308,7 @@ mod tests {
             ..Default::default()
         })
         .unwrap_err();
-        assert_eq!(err.check, "persistent_is_unique_on_every_write_path");
+        assert_eq!(err.check, "durable_is_unique_on_every_write_path");
         assert!(
             err.message.contains("replace accepted a second persistent"),
             "{err}"
@@ -1371,11 +1410,11 @@ mod tests {
 
     // A check-then-insert backend has no persistent constraint on its write
     // paths, so the whole suite now stops at the deterministic
-    // `persistent_is_unique_on_every_write_path` check before it reaches the
+    // `durable_is_unique_on_every_write_path` check before it reaches the
     // racing ones. The race itself is still proven on its own by
     // `a_single_check_names_the_constraint_a_backend_is_missing`.
     #[test]
-    #[should_panic(expected = "persistent_is_unique_on_every_write_path")]
+    #[should_panic(expected = "durable_is_unique_on_every_write_path")]
     fn conformance_catches_a_check_then_insert_backend() {
         conformance::run(|| BrokenStore {
             check_then_insert: true,
@@ -1453,6 +1492,91 @@ mod tests {
             )
             .unwrap();
         assert_eq!(only_persistent, vec![persistent]);
+    }
+
+    #[test]
+    fn durable_non_persistent_formats_are_stable_not_minted_anew() {
+        // 0.9.x minted and stored a fresh value on every call for email and
+        // unspecified, so the identifier changed at each login and the store
+        // grew with each response. Like persistent, they are stable per
+        // (user, SP, format).
+        let db = db();
+        for format in [constants::NAMEID_EMAIL, constants::NAMEID_UNSPECIFIED] {
+            let policy = NameIdPolicy {
+                format: Some(format.to_string()),
+                sp_name_qualifier: None,
+                allow_create: true,
+            };
+            let mut values = std::collections::HashSet::new();
+            for _ in 0..5 {
+                let nid = db
+                    .construct_nameid("alice", SP, Some(&policy), None)
+                    .unwrap();
+                assert_eq!(nid.format.as_deref(), Some(format));
+                values.insert(nid.value);
+            }
+            assert_eq!(values.len(), 1, "{format}: the same identifier every time");
+        }
+        // One record per format, not one per call.
+        assert_eq!(db.name_ids_for("alice").unwrap().len(), 2);
+
+        // Different SP, different user and different format are different
+        // identifiers.
+        let for_sp = |user: &str, sp: &str, format: &str| {
+            db.get_nameid(user, format, Some(sp), Some(IDP))
+                .unwrap()
+                .value
+        };
+        let base = for_sp("alice", SP, constants::NAMEID_EMAIL);
+        assert_ne!(
+            base,
+            for_sp(
+                "alice",
+                "https://other-sp.example.com",
+                constants::NAMEID_EMAIL
+            )
+        );
+        assert_ne!(base, for_sp("bob", SP, constants::NAMEID_EMAIL));
+        assert_ne!(base, for_sp("alice", SP, constants::NAMEID_PERSISTENT));
+    }
+
+    #[test]
+    fn concurrent_first_requests_for_a_durable_format_converge_on_one_identifier() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let db = Arc::new(db());
+        let threads: Vec<_> = (0..16)
+            .map(|_| {
+                let db = Arc::clone(&db);
+                thread::spawn(move || {
+                    db.get_nameid("alice", constants::NAMEID_EMAIL, Some(SP), Some(IDP))
+                        .unwrap()
+                        .value
+                })
+            })
+            .collect();
+        let values: Vec<String> = threads.into_iter().map(|t| t.join().unwrap()).collect();
+        assert!(values.iter().all(|v| v == &values[0]), "{values:?}");
+        assert_eq!(db.name_ids_for("alice").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn store_refuses_a_second_nameid_of_a_durable_format_for_the_same_user_and_sp() {
+        let db = db();
+        let first = db
+            .get_nameid("alice", constants::NAMEID_EMAIL, Some(SP), Some(IDP))
+            .unwrap();
+        let second = NameId {
+            value: "another@idp.example.org".to_string(),
+            ..first.clone()
+        };
+        assert!(matches!(
+            db.store("alice", &second),
+            Err(IdentError::DurableExists)
+        ));
+        db.store("alice", &first).unwrap();
+        assert_eq!(db.name_ids_for("alice").unwrap(), vec![first]);
     }
 
     #[test]
@@ -1646,7 +1770,7 @@ mod tests {
         // both observe "no existing association" and each mint a different
         // persistent identifier - violating the "stable per (user, SP)"
         // invariant (E78) the very first time it mattered. The
-        // atomic get_or_insert_persistent closes this.
+        // atomic get_or_insert_durable closes this.
         use std::sync::Arc;
         use std::thread;
 

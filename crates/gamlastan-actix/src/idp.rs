@@ -1966,25 +1966,38 @@ mod tests {
     /// A distinct `IdentityStore` impl (not `InMemoryIdentityStore`) - stands
     /// in for a Redis/SQL-backed store an application registers.
     #[derive(Default)]
-    struct CustomStore(std::sync::Mutex<std::collections::HashMap<String, String>>);
+    struct CustomStore(gamlastan::idp::ident::InMemoryIdentityStore);
 
     impl gamlastan::idp::ident::IdentityStore for CustomStore {
-        fn get(&self, key: &str) -> Option<String> {
-            self.0.lock().unwrap().get(key).cloned()
+        fn for_user(&self, user_id: &str) -> Vec<gamlastan::core::assertion::name_id::NameId> {
+            self.0.for_user(user_id)
         }
-        fn set(&self, key: &str, value: String) {
-            self.0.lock().unwrap().insert(key.to_string(), value);
+        fn user_for(&self, value: &str) -> Option<String> {
+            self.0.user_for(value)
         }
-        fn remove(&self, key: &str) {
-            self.0.lock().unwrap().remove(key);
+        fn get_or_insert_persistent(
+            &self,
+            user_id: &str,
+            candidate: gamlastan::core::assertion::name_id::NameId,
+        ) -> Result<gamlastan::core::assertion::name_id::NameId, gamlastan::idp::ident::ValueTaken>
+        {
+            self.0.get_or_insert_persistent(user_id, candidate)
         }
-        fn compare_and_swap(&self, key: &str, expected: Option<&str>, new: &str) -> bool {
-            let mut map = self.0.lock().unwrap();
-            if map.get(key).map(String::as_str) != expected {
-                return false;
-            }
-            map.insert(key.to_string(), new.to_string());
-            true
+        fn insert(
+            &self,
+            user_id: &str,
+            name_id: gamlastan::core::assertion::name_id::NameId,
+        ) -> Result<(), gamlastan::idp::ident::ValueTaken> {
+            self.0.insert(user_id, name_id)
+        }
+        fn replace(&self, user_id: &str, name_id: gamlastan::core::assertion::name_id::NameId) {
+            self.0.replace(user_id, name_id)
+        }
+        fn remove(&self, value: &str) {
+            self.0.remove(value)
+        }
+        fn remove_all(&self, user_id: &str) {
+            self.0.remove_all(user_id)
         }
     }
 

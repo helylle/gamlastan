@@ -44,54 +44,34 @@ pub enum IdentError {
     Unsupported(&'static str),
 }
 
-/// Pluggable key/value backend for the identity database.
+/// Plain key/value backend.
 ///
-/// Implement this over Redis/SQL/etc. for multi-instance deployments.
-pub trait IdentityStore: Send + Sync {
+/// Used where a mapping needs no cross-record atomicity, such as
+/// [`Eptid`](crate::idp::Eptid)'s deterministic eduPersonTargetedID cache.
+/// NameID storage needs stronger guarantees and uses [`IdentityStore`].
+pub trait KeyValueStore: Send + Sync {
     /// Fetch a value.
     fn get(&self, key: &str) -> Option<String>;
     /// Store a value.
     fn set(&self, key: &str, value: String);
     /// Remove a value.
     fn remove(&self, key: &str);
-
-    /// Atomically replace `key`'s value with `new`, but only if its current
-    /// value equals `expected` (`None` means "key must be absent"). Returns
-    /// whether the swap happened.
-    ///
-    /// `IdentDb` uses this to close a check-then-create race on persistent
-    /// NameID minting: two concurrent requests for the same (user, SP) that
-    /// both observe no existing association must not both succeed at
-    /// storing a *different* persistent identifier for it. This must be a
-    /// real atomic operation at the storage layer for a multi-instance
-    /// backend (Redis `WATCH`/`MULTI`, a SQL `UPDATE ... WHERE current =
-    /// expected`, etc.) - a single process serializing its own calls (e.g.
-    /// behind a mutex) is not enough once more than one process shares the
-    /// same backing store. There is deliberately no default implementation:
-    /// a plausible-looking but non-atomic default (a plain `get`+`set`, or
-    /// even a process-local mutex) would silently leave the exact race this
-    /// method exists to close in place for any multi-instance deployment
-    /// that didn't happen to notice it needed to do something extra.
-    /// Implementing `IdentityStore` for a new backend is already the moment
-    /// to decide this deliberately, not a moment to inherit a default that
-    /// looks safe and isn't.
-    fn compare_and_swap(&self, key: &str, expected: Option<&str>, new: &str) -> bool;
 }
 
-/// In-memory identity store.
+/// In-memory [`KeyValueStore`].
 #[derive(Debug, Default)]
-pub struct InMemoryIdentityStore {
+pub struct InMemoryKeyValueStore {
     map: Mutex<HashMap<String, String>>,
 }
 
-impl InMemoryIdentityStore {
+impl InMemoryKeyValueStore {
     /// Create an empty store.
     pub fn new() -> Self {
         Self::default()
     }
 }
 
-impl IdentityStore for InMemoryIdentityStore {
+impl KeyValueStore for InMemoryKeyValueStore {
     fn get(&self, key: &str) -> Option<String> {
         self.map.lock().unwrap().get(key).cloned()
     }
@@ -103,14 +83,182 @@ impl IdentityStore for InMemoryIdentityStore {
     fn remove(&self, key: &str) {
         self.map.lock().unwrap().remove(key);
     }
+}
 
-    fn compare_and_swap(&self, key: &str, expected: Option<&str>, new: &str) -> bool {
-        let mut map = self.map.lock().unwrap();
-        if map.get(key).map(String::as_str) != expected {
-            return false;
+/// A NameID value is already in use by another record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ValueTaken;
+
+/// Pluggable backend for [`IdentDb`]: one record per (user, NameID)
+/// association.
+///
+/// Implement this over your database (Mongo, SQL, ...). Each method is a
+/// single-record operation, so there is nothing to coordinate across keys or
+/// documents: atomicity comes from two uniqueness constraints the backend
+/// must enforce.
+///
+/// * the NameID **value** is unique across all records, and
+/// * among **persistent** records, `(user, sp_name_qualifier,
+///   name_qualifier)` is unique.
+///
+/// Without them, two concurrent first requests for the same (user, SP) can
+/// both insert and mint two different "stable" persistent identifiers, and
+/// nothing in this crate can detect it - they must be real constraints in
+/// the store (a unique index, a `UNIQUE` constraint), not application-level
+/// checks. Run [`conformance`] against a real instance to check a backend.
+///
+/// There are deliberately no default write methods: a non-atomic default
+/// would silently leave those races open on a multi-instance deployment.
+pub trait IdentityStore: Send + Sync {
+    /// Every NameID associated with `user_id`, in unspecified order.
+    fn for_user(&self, user_id: &str) -> Vec<NameId>;
+
+    /// The user a NameID value belongs to.
+    fn user_for(&self, value: &str) -> Option<String>;
+
+    /// The user's persistent NameID for `(sp_name_qualifier,
+    /// name_qualifier)`, if one exists. `None` for a qualifier means the
+    /// record has no such qualifier. Overridable to push the lookup down to
+    /// an index; the default filters [`for_user`](Self::for_user).
+    fn find_persistent(
+        &self,
+        user_id: &str,
+        sp_name_qualifier: Option<&str>,
+        name_qualifier: Option<&str>,
+    ) -> Option<NameId> {
+        self.for_user(user_id)
+            .into_iter()
+            .find(|n| is_persistent_match(n, sp_name_qualifier, name_qualifier))
+    }
+
+    /// Atomically return the user's existing persistent NameID with the same
+    /// `(sp_name_qualifier, name_qualifier)` as `candidate`, or insert
+    /// `candidate` and return it. `Err(ValueTaken)` if the record would be
+    /// inserted but its value is already in use.
+    fn get_or_insert_persistent(
+        &self,
+        user_id: &str,
+        candidate: NameId,
+    ) -> Result<NameId, ValueTaken>;
+
+    /// Insert a freshly minted NameID. `Err(ValueTaken)` if any record
+    /// already has this value.
+    fn insert(&self, user_id: &str, name_id: NameId) -> Result<(), ValueTaken>;
+
+    /// Insert or overwrite the record with this value, assigning it to
+    /// `user_id`. Used to update an existing association (e.g. a
+    /// ManageNameID `NewID`). Callers must not use it to create a second
+    /// persistent record for a `(user, sp_name_qualifier, name_qualifier)`
+    /// that already has one.
+    fn replace(&self, user_id: &str, name_id: NameId);
+
+    /// Remove the record with this value, if any.
+    fn remove(&self, value: &str);
+
+    /// Remove every record belonging to `user_id`.
+    fn remove_all(&self, user_id: &str);
+}
+
+/// Whether `nid` is a persistent NameID with exactly these qualifiers
+/// (`None` matching only a record that has no such qualifier).
+pub(crate) fn is_persistent_match(
+    nid: &NameId,
+    sp_name_qualifier: Option<&str>,
+    name_qualifier: Option<&str>,
+) -> bool {
+    nid.format.as_deref() == Some(constants::NAMEID_PERSISTENT)
+        && nid.sp_name_qualifier.as_deref() == sp_name_qualifier
+        && nid.name_qualifier.as_deref() == name_qualifier
+}
+
+/// In-memory [`IdentityStore`] for tests, examples and single-instance
+/// deployments. Every method takes one lock, so atomicity is trivial; lookups
+/// are linear scans, which a real backend replaces with indexes.
+#[derive(Debug, Default)]
+pub struct InMemoryIdentityStore {
+    records: Mutex<Vec<(String, NameId)>>,
+}
+
+impl InMemoryIdentityStore {
+    /// Create an empty store.
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+impl IdentityStore for InMemoryIdentityStore {
+    fn for_user(&self, user_id: &str) -> Vec<NameId> {
+        let records = self.records.lock().unwrap();
+        records
+            .iter()
+            .filter(|(user, _)| user == user_id)
+            .map(|(_, nid)| nid.clone())
+            .collect()
+    }
+
+    fn user_for(&self, value: &str) -> Option<String> {
+        let records = self.records.lock().unwrap();
+        records
+            .iter()
+            .find(|(_, nid)| nid.value == value)
+            .map(|(user, _)| user.clone())
+    }
+
+    fn get_or_insert_persistent(
+        &self,
+        user_id: &str,
+        candidate: NameId,
+    ) -> Result<NameId, ValueTaken> {
+        let mut records = self.records.lock().unwrap();
+        if let Some((_, existing)) = records.iter().find(|(user, nid)| {
+            user == user_id
+                && is_persistent_match(
+                    nid,
+                    candidate.sp_name_qualifier.as_deref(),
+                    candidate.name_qualifier.as_deref(),
+                )
+        }) {
+            return Ok(existing.clone());
         }
-        map.insert(key.to_string(), new.to_string());
-        true
+        if records.iter().any(|(_, nid)| nid.value == candidate.value) {
+            return Err(ValueTaken);
+        }
+        records.push((user_id.to_string(), candidate.clone()));
+        Ok(candidate)
+    }
+
+    fn insert(&self, user_id: &str, name_id: NameId) -> Result<(), ValueTaken> {
+        let mut records = self.records.lock().unwrap();
+        if records.iter().any(|(_, nid)| nid.value == name_id.value) {
+            return Err(ValueTaken);
+        }
+        records.push((user_id.to_string(), name_id));
+        Ok(())
+    }
+
+    fn replace(&self, user_id: &str, name_id: NameId) {
+        let mut records = self.records.lock().unwrap();
+        match records
+            .iter_mut()
+            .find(|(_, nid)| nid.value == name_id.value)
+        {
+            Some(slot) => *slot = (user_id.to_string(), name_id),
+            None => records.push((user_id.to_string(), name_id)),
+        }
+    }
+
+    fn remove(&self, value: &str) {
+        self.records
+            .lock()
+            .unwrap()
+            .retain(|(_, nid)| nid.value != value);
+    }
+
+    fn remove_all(&self, user_id: &str) {
+        self.records
+            .lock()
+            .unwrap()
+            .retain(|(user, _)| user != user_id);
     }
 }
 
@@ -213,9 +361,6 @@ pub fn decode_name_id(coded: &str) -> NameId {
 
 // ── IdentDb ─────────────────────────────────────────────────────────────────
 
-const FORWARD_PREFIX: &str = "user:";
-const REVERSE_PREFIX: &str = "nameid:";
-
 /// The identity database (pysaml2 `IdentDB`).
 pub struct IdentDb<S: IdentityStore = InMemoryIdentityStore> {
     store: S,
@@ -248,97 +393,20 @@ impl<S: IdentityStore> IdentDb<S> {
         self
     }
 
-    fn forward_key(user_id: &str) -> String {
-        format!("{FORWARD_PREFIX}{user_id}")
-    }
-
-    fn reverse_key(value: &str) -> String {
-        format!("{REVERSE_PREFIX}{value}")
-    }
-
-    /// Split a forward entry's stored value into its coded NameID entries,
-    /// filtering out empty segments so the empty-string sentinel a CAS-based
-    /// removal can leave behind (see [`Self::remove_forward_entry`]) reads
-    /// back as "no entries", not a phantom entry.
-    fn forward_entries(joined: &str) -> Vec<&str> {
-        joined.split(' ').filter(|s| !s.is_empty()).collect()
-    }
-
     /// All NameIDs stored for a local user.
     pub fn name_ids_for(&self, user_id: &str) -> Vec<NameId> {
-        self.store
-            .get(&Self::forward_key(user_id))
-            .map(|joined| {
-                Self::forward_entries(&joined)
-                    .into_iter()
-                    .map(decode_name_id)
-                    .collect()
-            })
-            .unwrap_or_default()
+        self.store.for_user(user_id)
     }
 
-    /// Associate a NameID with a local user (pysaml2 `store()`).
-    ///
-    /// Maintains both directions: user -> issued NameIDs (forward) and
-    /// NameID value -> user (reverse, used by `find_local_id`).
-    ///
-    /// Writes the reverse key *before* appending to the forward list, not
-    /// after: `remove_local`'s cleanup derives which reverse keys to remove
-    /// from what it reads in the forward list, so a concurrent `store()`
-    /// that becomes forward-list-visible before its reverse key exists lets
-    /// `remove_local` observe the new forward entry, find nothing to clean
-    /// up for it (a `remove` on an as-yet-absent key is a silent no-op), and
-    /// finish - after which this call's now-late reverse-key write creates
-    /// a mapping nothing will ever revisit. Writing reverse-then-forward
-    /// means any forward-visible entry already has its reverse key, which
-    /// is the invariant `remove_local`'s snapshot-based cleanup needs.
+    /// Associate a NameID with a local user (pysaml2 `store()`), replacing
+    /// any record that already has the same value.
     pub fn store(&self, user_id: &str, name_id: &NameId) {
-        let coded = code_name_id(name_id);
-        self.store
-            .set(&Self::reverse_key(&name_id.value), user_id.to_string());
-        self.append_forward_entry(user_id, &coded);
-    }
-
-    /// Atomically append `coded` to a user's forward entry, retrying on CAS
-    /// conflict.
-    ///
-    /// Every writer of the forward key (this, and the persistent-NameID
-    /// get-or-create loop) must go through `compare_and_swap` against the
-    /// *same* key, or two writers can still race: one reads the old list,
-    /// the other's plain `get`+`set` (or CAS) commits first, and the first
-    /// then overwrites that committed entry with its own stale-based
-    /// value - silently dropping whichever entry lost the race, independent
-    /// of whether either individual writer was itself "atomic".
-    fn append_forward_entry(&self, user_id: &str, coded: &str) {
-        let key = Self::forward_key(user_id);
-        loop {
-            let current = self.store.get(&key);
-            let mut entries: Vec<String> = current
-                .as_deref()
-                .map(|joined| {
-                    Self::forward_entries(joined)
-                        .into_iter()
-                        .map(str::to_string)
-                        .collect()
-                })
-                .unwrap_or_default();
-            if entries.iter().any(|e| e == coded) {
-                return;
-            }
-            entries.push(coded.to_string());
-            let new_value = entries.join(" ");
-            if self
-                .store
-                .compare_and_swap(&key, current.as_deref(), &new_value)
-            {
-                return;
-            }
-        }
+        self.store.replace(user_id, name_id.clone());
     }
 
     /// The local user a NameID was issued to (pysaml2 `find_local_id()`).
     pub fn find_local_id(&self, name_id: &NameId) -> Option<String> {
-        self.store.get(&Self::reverse_key(&name_id.value))
+        self.store.user_for(&name_id.value)
     }
 
     /// Find an existing *persistent* NameID for (user, SP, IdP) (pysaml2
@@ -357,23 +425,15 @@ impl<S: IdentityStore> IdentDb<S> {
         sp_name_qualifier: Option<&str>,
         name_qualifier: Option<&str>,
     ) -> Option<NameId> {
-        self.name_ids_for(user_id).into_iter().find(|nid| {
-            if nid.format.as_deref() != Some(constants::NAMEID_PERSISTENT) {
-                return false;
-            }
-            let sp_match = match sp_name_qualifier {
-                Some(spq) => nid.sp_name_qualifier.as_deref() == Some(spq),
-                None => nid.sp_name_qualifier.is_none(),
-            };
-            let nq_match = match name_qualifier {
-                Some(nq) => nid.name_qualifier.as_deref() == Some(nq),
-                None => nid.name_qualifier.is_none(),
-            };
-            sp_match && nq_match
-        })
+        self.store
+            .find_persistent(user_id, sp_name_qualifier, name_qualifier)
     }
 
     /// Generate a fresh opaque identifier value (pysaml2 `create_id()`).
+    ///
+    /// The free-check here is only an optimisation: the store's `insert` /
+    /// `get_or_insert_persistent` enforce value uniqueness atomically, and a
+    /// collision that slips in between is retried by the caller.
     fn create_id(
         &self,
         format: &str,
@@ -390,16 +450,15 @@ impl<S: IdentityStore> IdentDb<S> {
             let digest = sha256(&input).expect("SHA-256 is always available");
             let id = to_hex(&digest);
             // Build the final stored value (email format appends `@domain`)
-            // *before* the collision check, otherwise the check tests a key
-            // that is never stored and a rare collision would silently
-            // overwrite the reverse mapping.
+            // *before* the collision check, so the check tests the value
+            // that is actually stored.
             let value = if format == constants::NAMEID_EMAIL {
                 let domain = self.domain.as_deref().unwrap_or("idp.example.org");
                 format!("{id}@{domain}")
             } else {
                 id
             };
-            if self.store.get(&Self::reverse_key(&value)).is_none() {
+            if self.store.user_for(&value).is_none() {
                 return value;
             }
         }
@@ -413,7 +472,10 @@ impl<S: IdentityStore> IdentDb<S> {
     /// reverse lookup, so persisting them would only grow the store without
     /// bound (the default per-SP format is transient, so every response
     /// would otherwise add an entry that is never read back). All other
-    /// formats are stored so they can be looked up and reused.
+    /// formats are stored so they can be looked up and reused. The rule is
+    /// "persist iff the identifier is ever reverse-looked-up or reused"; if a
+    /// future one-time-use format is added, generalize the transient check
+    /// to a set of non-persisted formats.
     pub fn get_nameid(
         &self,
         user_id: &str,
@@ -422,129 +484,41 @@ impl<S: IdentityStore> IdentDb<S> {
         name_qualifier: Option<&str>,
     ) -> NameId {
         // Persistent identifiers must stay stable per (user, SP): reuse an
-        // existing association instead of minting a new value (E78), via an
-        // atomic get-or-create so two concurrent requests for the same
-        // (user, SP) can't both observe "none exists" and mint two
-        // different persistent identifiers.
+        // existing association instead of minting a new value (E78). The
+        // read is the fast path for a returning user; the atomic
+        // get-or-insert below is what makes two concurrent *first* requests
+        // converge on one identifier.
         if format == constants::NAMEID_PERSISTENT {
-            return self.get_or_create_persistent(user_id, sp_name_qualifier, name_qualifier);
-        }
-
-        // `create_id` already applies the email-format `@domain` suffix and
-        // guarantees the value is free in the reverse index.
-        let value = self.create_id(format, name_qualifier, sp_name_qualifier);
-
-        let name_id = NameId {
-            value,
-            format: Some(format.to_string()),
-            name_qualifier: name_qualifier.map(str::to_string),
-            sp_name_qualifier: sp_name_qualifier.map(str::to_string),
-            sp_provided_id: None,
-        };
-        // Transient identifiers are one-time-use and never reverse-looked-up,
-        // so they are not persisted (see the method doc). Every other format
-        // is stored so it can be found and reused later.
-        //
-        // This is deliberately targeted at the transient format only, not all
-        // non-persistent formats. The rule is "persist iff the identifier is
-        // ever reverse-looked-up or reused": transient is the one format the
-        // spec (SAML Core §8.3.7) defines as one-time-use, and it is also the
-        // default per-SP format, so it is the one that accumulates on every
-        // response. The other non-persistent formats this crate mints (email,
-        // unspecified, custom) are durable per-user identifiers that *are*
-        // reverse-looked-up (find_local_id / name_ids_for) and reused, so they
-        // must stay stored. If a future one-time-use format is added (or a
-        // deployment wants to treat another format as non-durable), generalize
-        // this to a set of "non-persisted" formats rather than a single
-        // equality check - the invariant to preserve is that a format is
-        // persisted exactly when something later needs to look it back up.
-        if format != constants::NAMEID_TRANSIENT {
-            self.store(user_id, &name_id);
-        }
-        name_id
-    }
-
-    /// Atomic get-or-create for a persistent NameID (see [`IdentityStore::compare_and_swap`]).
-    ///
-    /// Loops: read the user's current forward entry, return an existing
-    /// persistent match if one is already there (possibly written by a
-    /// concurrent caller since the last read), otherwise mint a candidate
-    /// and try to CAS it in; on CAS failure someone else just wrote to this
-    /// key, so retry from the read.
-    ///
-    /// The candidate's reverse key is written *before* the forward CAS is
-    /// attempted, and reused (not regenerated) across retries, for the same
-    /// reason [`Self::store`] writes reverse-before-forward: once an entry
-    /// is visible in the forward list, its reverse key must already exist,
-    /// or a concurrent `remove_local` can observe the forward entry, find
-    /// nothing yet to clean up in the reverse index, and finish before this
-    /// call's reverse-key write lands - permanently orphaning it. If a
-    /// retry instead finds an existing match (someone else's write already
-    /// satisfies this request), the unused candidate's speculative reverse
-    /// key is rolled back rather than left dangling.
-    fn get_or_create_persistent(
-        &self,
-        user_id: &str,
-        sp_name_qualifier: Option<&str>,
-        name_qualifier: Option<&str>,
-    ) -> NameId {
-        let key = Self::forward_key(user_id);
-        let mut candidate: Option<NameId> = None;
-        loop {
-            let current = self.store.get(&key);
-            let entries: Vec<String> = current
-                .as_deref()
-                .map(|joined| {
-                    Self::forward_entries(joined)
-                        .into_iter()
-                        .map(str::to_string)
-                        .collect()
-                })
-                .unwrap_or_default();
-
-            if let Some(existing) = entries.iter().map(|e| decode_name_id(e)).find(|nid| {
-                nid.format.as_deref() == Some(constants::NAMEID_PERSISTENT)
-                    && nid.sp_name_qualifier.as_deref() == sp_name_qualifier
-                    && nid.name_qualifier.as_deref() == name_qualifier
-            }) {
-                if let Some(abandoned) = &candidate {
-                    self.store.remove(&Self::reverse_key(&abandoned.value));
-                }
+            if let Some(existing) =
+                self.store
+                    .find_persistent(user_id, sp_name_qualifier, name_qualifier)
+            {
                 return existing;
             }
+        }
 
-            let name_id = candidate.get_or_insert_with(|| {
-                let value = self.create_id(
-                    constants::NAMEID_PERSISTENT,
-                    name_qualifier,
-                    sp_name_qualifier,
-                );
-                let name_id = NameId {
-                    value,
-                    format: Some(constants::NAMEID_PERSISTENT.to_string()),
-                    name_qualifier: name_qualifier.map(str::to_string),
-                    sp_name_qualifier: sp_name_qualifier.map(str::to_string),
-                    sp_provided_id: None,
-                };
-                self.store
-                    .set(&Self::reverse_key(&name_id.value), user_id.to_string());
-                name_id
-            });
+        loop {
+            let value = self.create_id(format, name_qualifier, sp_name_qualifier);
+            let name_id = NameId {
+                value,
+                format: Some(format.to_string()),
+                name_qualifier: name_qualifier.map(str::to_string),
+                sp_name_qualifier: sp_name_qualifier.map(str::to_string),
+                sp_provided_id: None,
+            };
 
-            let mut new_entries = entries.clone();
-            new_entries.push(code_name_id(name_id));
-            let new_value = new_entries.join(" ");
-
-            if self
-                .store
-                .compare_and_swap(&key, current.as_deref(), &new_value)
-            {
-                return candidate.expect("just inserted above");
+            if format == constants::NAMEID_PERSISTENT {
+                match self.store.get_or_insert_persistent(user_id, name_id) {
+                    Ok(winner) => return winner,
+                    Err(ValueTaken) => continue,
+                }
             }
-            // Someone else wrote to `key` concurrently; loop and re-check
-            // whether *their* write already satisfies this request - reusing
-            // the same candidate (and its already-written reverse key) if we
-            // end up needing to append it after all.
+            if format == constants::NAMEID_TRANSIENT {
+                return name_id;
+            }
+            if self.store.insert(user_id, name_id.clone()).is_ok() {
+                return name_id;
+            }
         }
     }
 
@@ -627,70 +601,12 @@ impl<S: IdentityStore> IdentDb<S> {
 
     /// Forget a NameID (pysaml2 `remove_remote()`).
     pub fn remove_remote(&self, name_id: &NameId) {
-        let coded = code_name_id(name_id);
-        if let Some(user_id) = self.find_local_id(name_id) {
-            self.remove_forward_entry(&user_id, &coded);
-        }
-        self.store.remove(&Self::reverse_key(&name_id.value));
-    }
-
-    /// Atomically remove `coded` from a user's forward entry, retrying on
-    /// CAS conflict. See [`Self::append_forward_entry`] for why this must
-    /// go through `compare_and_swap` rather than a plain `get`+`set`.
-    ///
-    /// When removal empties the entry, this CASes to `""` rather than
-    /// removing the key outright - a separate, non-atomic `remove` call
-    /// would let a concurrent reader observe a half-updated state, and
-    /// [`Self::forward_entries`] treats `""` identically to an absent key.
-    fn remove_forward_entry(&self, user_id: &str, coded: &str) {
-        let key = Self::forward_key(user_id);
-        loop {
-            let Some(current) = self.store.get(&key) else {
-                return;
-            };
-            let remaining = Self::forward_entries(&current);
-            if !remaining.contains(&coded) {
-                return;
-            }
-            let new_value = remaining
-                .into_iter()
-                .filter(|c| *c != coded)
-                .collect::<Vec<_>>()
-                .join(" ");
-            if self
-                .store
-                .compare_and_swap(&key, Some(&current), &new_value)
-            {
-                return;
-            }
-        }
+        self.store.remove(&name_id.value);
     }
 
     /// Forget every NameID for a local user (pysaml2 `remove_local()`).
     pub fn remove_local(&self, user_id: &str) {
-        let key = Self::forward_key(user_id);
-        loop {
-            let Some(current) = self.store.get(&key) else {
-                return;
-            };
-            // CAS the forward key to the empty sentinel (see
-            // Self::remove_forward_entry) rather than reading-then-removing:
-            // a plain remove here could discard an entry a concurrent
-            // store()/get_or_create_persistent() call just added for a
-            // *different* SP, in the window between our read and the
-            // removal, while leaving that entry's reverse-key mapping
-            // dangling forever (it was never cleaned up because it didn't
-            // exist yet when we read the forward list).
-            if self.store.compare_and_swap(&key, Some(&current), "") {
-                for coded in Self::forward_entries(&current) {
-                    let nid = decode_name_id(coded);
-                    self.store.remove(&Self::reverse_key(&nid.value));
-                }
-                return;
-            }
-            // Someone else wrote to `key` concurrently; retry against the
-            // now-current value instead of clobbering their write.
-        }
+        self.store.remove_all(user_id);
     }
 
     /// Apply a ManageNameIDRequest to the database (pysaml2
@@ -726,8 +642,7 @@ impl<S: IdentityStore> IdentDb<S> {
             }
         }
 
-        self.remove_remote(name_id);
-        self.store(&user_id, &updated);
+        self.store.replace(&user_id, updated.clone());
         Ok(updated)
     }
 
@@ -810,6 +725,252 @@ pub(crate) fn to_hex(bytes: &[u8]) -> String {
     out
 }
 
+/// A reusable check that an [`IdentityStore`] backend honours the contract
+/// [`IdentDb`] relies on.
+///
+/// The two uniqueness constraints (NameID value; persistent `(user,
+/// sp_name_qualifier, name_qualifier)`) live in the backend, not in this
+/// crate, so a backend that forgets one - say a missing unique index -
+/// compiles fine and only misbehaves under concurrent load. Run [`run`]
+/// against a real instance (e.g. in the integration suite of the crate that
+/// implements the Mongo store) to catch that.
+///
+/// `new_store` must return a **fresh, empty** store each call. Panics with a
+/// description of the first violated rule.
+pub mod conformance {
+    use super::*;
+    use std::sync::Arc;
+    use std::thread;
+
+    const IDP: &str = "https://idp.example.com";
+    const SP_A: &str = "https://sp-a.example.com";
+    const SP_B: &str = "https://sp-b.example.com";
+    const THREADS: usize = 16;
+
+    fn nid(value: &str, format: &str, sp: Option<&str>) -> NameId {
+        NameId {
+            value: value.to_string(),
+            format: Some(format.to_string()),
+            name_qualifier: Some(IDP.to_string()),
+            sp_name_qualifier: sp.map(str::to_string),
+            sp_provided_id: None,
+        }
+    }
+
+    fn persistent(value: &str, sp: &str) -> NameId {
+        nid(value, constants::NAMEID_PERSISTENT, Some(sp))
+    }
+
+    /// Run every check against stores produced by `new_store`.
+    pub fn run<S, F>(new_store: F)
+    where
+        S: IdentityStore + 'static,
+        F: Fn() -> S,
+    {
+        value_is_unique(&new_store());
+        lookups_round_trip_and_isolate_users(&new_store());
+        persistent_is_get_or_insert(&new_store());
+        persistent_insert_reports_a_taken_value(&new_store());
+        find_persistent_is_format_and_qualifier_exact(&new_store());
+        replace_upserts_by_value(&new_store());
+        removal_is_scoped(&new_store());
+        concurrent_get_or_insert_converges_on_one_identifier(new_store());
+        concurrent_insert_of_one_value_has_one_winner(new_store());
+    }
+
+    fn value_is_unique<S: IdentityStore>(s: &S) {
+        let first = nid("v1", constants::NAMEID_EMAIL, Some(SP_A));
+        assert_eq!(s.insert("alice", first.clone()), Ok(()));
+        assert_eq!(
+            s.insert("bob", nid("v1", constants::NAMEID_EMAIL, Some(SP_B))),
+            Err(ValueTaken),
+            "a value already in use must be rejected, for any user"
+        );
+        assert_eq!(s.user_for("v1").as_deref(), Some("alice"));
+        assert_eq!(s.for_user("alice"), vec![first], "loser must not overwrite");
+        assert!(s.for_user("bob").is_empty());
+    }
+
+    fn lookups_round_trip_and_isolate_users<S: IdentityStore>(s: &S) {
+        s.insert("alice", nid("a1", constants::NAMEID_EMAIL, Some(SP_A)))
+            .unwrap();
+        s.insert("bob", nid("b1", constants::NAMEID_EMAIL, Some(SP_A)))
+            .unwrap();
+        assert_eq!(s.user_for("a1").as_deref(), Some("alice"));
+        assert_eq!(s.user_for("b1").as_deref(), Some("bob"));
+        assert_eq!(s.user_for("nobody"), None);
+        assert_eq!(s.for_user("alice").len(), 1);
+        assert_eq!(s.for_user("alice")[0].value, "a1");
+        assert!(s.for_user("carol").is_empty());
+    }
+
+    fn persistent_is_get_or_insert<S: IdentityStore>(s: &S) {
+        let first = s
+            .get_or_insert_persistent("alice", persistent("p1", SP_A))
+            .unwrap();
+        assert_eq!(first.value, "p1");
+        let again = s
+            .get_or_insert_persistent("alice", persistent("p2", SP_A))
+            .unwrap();
+        assert_eq!(
+            again.value, "p1",
+            "a second candidate for the same (user, SP) must return the existing one"
+        );
+        assert!(
+            s.user_for("p2").is_none(),
+            "the losing candidate must not be stored"
+        );
+        let other_sp = s
+            .get_or_insert_persistent("alice", persistent("p3", SP_B))
+            .unwrap();
+        assert_eq!(
+            other_sp.value, "p3",
+            "a different SP gets its own identifier"
+        );
+        let other_user = s
+            .get_or_insert_persistent("bob", persistent("p4", SP_A))
+            .unwrap();
+        assert_eq!(other_user.value, "p4", "a different user gets their own");
+    }
+
+    fn persistent_insert_reports_a_taken_value<S: IdentityStore>(s: &S) {
+        s.insert("alice", nid("taken", constants::NAMEID_EMAIL, Some(SP_A)))
+            .unwrap();
+        assert_eq!(
+            s.get_or_insert_persistent("bob", persistent("taken", SP_A)),
+            Err(ValueTaken),
+            "no existing persistent record, but the value is taken by another user"
+        );
+        assert_eq!(s.user_for("taken").as_deref(), Some("alice"));
+    }
+
+    fn find_persistent_is_format_and_qualifier_exact<S: IdentityStore>(s: &S) {
+        s.insert("alice", nid("e1", constants::NAMEID_EMAIL, Some(SP_A)))
+            .unwrap();
+        assert!(
+            s.find_persistent("alice", Some(SP_A), Some(IDP)).is_none(),
+            "a non-persistent record must never satisfy a persistent lookup"
+        );
+        s.get_or_insert_persistent("alice", persistent("p1", SP_A))
+            .unwrap();
+        assert_eq!(
+            s.find_persistent("alice", Some(SP_A), Some(IDP))
+                .map(|n| n.value),
+            Some("p1".to_string())
+        );
+        assert!(s.find_persistent("alice", Some(SP_B), Some(IDP)).is_none());
+        assert!(s.find_persistent("alice", None, Some(IDP)).is_none());
+    }
+
+    fn replace_upserts_by_value<S: IdentityStore>(s: &S) {
+        s.replace("alice", nid("r1", constants::NAMEID_EMAIL, Some(SP_A)));
+        let mut updated = nid("r1", constants::NAMEID_EMAIL, Some(SP_A));
+        updated.sp_provided_id = Some("alias".to_string());
+        s.replace("alice", updated.clone());
+        assert_eq!(
+            s.for_user("alice"),
+            vec![updated],
+            "replace must update in place, not add a second record for the value"
+        );
+        s.replace("bob", nid("r1", constants::NAMEID_EMAIL, Some(SP_A)));
+        assert_eq!(
+            s.user_for("r1").as_deref(),
+            Some("bob"),
+            "replace reassigns"
+        );
+        assert!(s.for_user("alice").is_empty());
+    }
+
+    fn removal_is_scoped<S: IdentityStore>(s: &S) {
+        s.insert("alice", nid("x1", constants::NAMEID_EMAIL, Some(SP_A)))
+            .unwrap();
+        s.insert("alice", nid("x2", constants::NAMEID_EMAIL, Some(SP_B)))
+            .unwrap();
+        s.insert("bob", nid("x3", constants::NAMEID_EMAIL, Some(SP_A)))
+            .unwrap();
+        s.remove("x1");
+        assert_eq!(s.user_for("x1"), None);
+        assert_eq!(s.for_user("alice").len(), 1, "remove drops one record only");
+        s.remove("no-such-value"); // must not panic
+        s.remove_all("alice");
+        assert!(s.for_user("alice").is_empty());
+        assert_eq!(
+            s.user_for("x2"),
+            None,
+            "remove_all clears the value lookup too"
+        );
+        assert_eq!(
+            s.user_for("x3").as_deref(),
+            Some("bob"),
+            "other users untouched"
+        );
+    }
+
+    fn concurrent_get_or_insert_converges_on_one_identifier<S>(store: S)
+    where
+        S: IdentityStore + 'static,
+    {
+        let store = Arc::new(store);
+        let handles: Vec<_> = (0..THREADS)
+            .map(|i| {
+                let store = Arc::clone(&store);
+                thread::spawn(move || {
+                    // Retry on ValueTaken exactly as IdentDb does.
+                    loop {
+                        let candidate = persistent(&format!("c{i}"), SP_A);
+                        if let Ok(winner) = store.get_or_insert_persistent("alice", candidate) {
+                            return winner.value;
+                        }
+                    }
+                })
+            })
+            .collect();
+        let values: Vec<String> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        assert!(
+            values.iter().all(|v| v == &values[0]),
+            "concurrent first requests for one (user, SP) minted different \
+             persistent identifiers - the backend is missing its uniqueness \
+             constraint on (user, sp_name_qualifier, name_qualifier): {values:?}"
+        );
+        let stored = store
+            .for_user("alice")
+            .into_iter()
+            .filter(|n| n.format.as_deref() == Some(constants::NAMEID_PERSISTENT))
+            .count();
+        assert_eq!(stored, 1, "exactly one persistent record must be stored");
+    }
+
+    fn concurrent_insert_of_one_value_has_one_winner<S>(store: S)
+    where
+        S: IdentityStore + 'static,
+    {
+        let store = Arc::new(store);
+        let handles: Vec<_> = (0..THREADS)
+            .map(|i| {
+                let store = Arc::clone(&store);
+                thread::spawn(move || {
+                    store
+                        .insert(
+                            &format!("user{i}"),
+                            nid("same", constants::NAMEID_EMAIL, Some(SP_A)),
+                        )
+                        .is_ok()
+                })
+            })
+            .collect();
+        let winners = handles
+            .into_iter()
+            .map(|h| h.join().unwrap())
+            .filter(|ok| *ok)
+            .count();
+        assert_eq!(
+            winners, 1,
+            "exactly one concurrent insert of a value may succeed - the \
+             backend is missing its uniqueness constraint on the NameID value"
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -819,6 +980,86 @@ mod tests {
 
     fn db() -> IdentDb {
         IdentDb::in_memory(IDP)
+    }
+
+    #[test]
+    fn in_memory_identity_store_passes_the_conformance_suite() {
+        conformance::run(InMemoryIdentityStore::new);
+    }
+
+    /// Delegates to the in-memory store, except where a test overrides a
+    /// method to model a backend that forgot a uniqueness constraint.
+    #[derive(Default)]
+    struct BrokenStore {
+        inner: InMemoryIdentityStore,
+        no_value_uniqueness: bool,
+        check_then_insert: bool,
+    }
+
+    impl IdentityStore for BrokenStore {
+        fn for_user(&self, user_id: &str) -> Vec<NameId> {
+            self.inner.for_user(user_id)
+        }
+        fn user_for(&self, value: &str) -> Option<String> {
+            self.inner.user_for(value)
+        }
+        fn get_or_insert_persistent(
+            &self,
+            user_id: &str,
+            candidate: NameId,
+        ) -> Result<NameId, ValueTaken> {
+            if self.check_then_insert {
+                // Look, release, then write: what a backend without a unique
+                // index does. Widen the window so the race is certain.
+                if let Some(existing) = self.inner.find_persistent(
+                    user_id,
+                    candidate.sp_name_qualifier.as_deref(),
+                    candidate.name_qualifier.as_deref(),
+                ) {
+                    return Ok(existing);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                // Value uniqueness still holds; only the persistent
+                // (user, SP) tuple has no constraint behind this check.
+                self.inner.insert(user_id, candidate.clone())?;
+                return Ok(candidate);
+            }
+            self.inner.get_or_insert_persistent(user_id, candidate)
+        }
+        fn insert(&self, user_id: &str, name_id: NameId) -> Result<(), ValueTaken> {
+            if self.no_value_uniqueness {
+                self.inner.replace(user_id, name_id);
+                return Ok(());
+            }
+            self.inner.insert(user_id, name_id)
+        }
+        fn replace(&self, user_id: &str, name_id: NameId) {
+            self.inner.replace(user_id, name_id)
+        }
+        fn remove(&self, value: &str) {
+            self.inner.remove(value)
+        }
+        fn remove_all(&self, user_id: &str) {
+            self.inner.remove_all(user_id)
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "a value already in use must be rejected")]
+    fn conformance_catches_a_backend_without_value_uniqueness() {
+        conformance::run(|| BrokenStore {
+            no_value_uniqueness: true,
+            ..Default::default()
+        });
+    }
+
+    #[test]
+    #[should_panic(expected = "minted different persistent identifiers")]
+    fn conformance_catches_a_check_then_insert_backend() {
+        conformance::run(|| BrokenStore {
+            check_then_insert: true,
+            ..Default::default()
+        });
     }
 
     #[test]
@@ -1014,7 +1255,7 @@ mod tests {
         // both observe "no existing association" and each mint a different
         // persistent identifier - violating the "stable per (user, SP)"
         // invariant (E78) the very first time it mattered. The
-        // IdentityStore::compare_and_swap-backed retry loop closes this.
+        // atomic get_or_insert_persistent closes this.
         use std::sync::Arc;
         use std::thread;
 
@@ -1057,7 +1298,7 @@ mod tests {
         // before the persistent CAS committed and then overwrite it with a
         // stale value, silently dropping the persistent entry even though its
         // own CAS "succeeded". Both paths now go through the same
-        // compare_and_swap-based retry.
+        // atomic get_or_insert_persistent / insert.
         //
         // (Transient identifiers are not stored at all, so they no longer
         // exercise this path; email is a durable non-persistent format that
@@ -1167,140 +1408,6 @@ mod tests {
                 );
             }
         }
-    }
-
-    /// An `IdentityStore` that pauses the *first* `set()` call on a
-    /// reverse-index key (`nameid:...`) after it has landed, releasing only
-    /// when told to - used to deterministically force a `remove_local` to
-    /// interleave in the exact window a scheduling-dependent test can only
-    /// hit by luck.
-    struct SteppedStore {
-        inner: InMemoryIdentityStore,
-        reverse_written_tx: Mutex<Option<std::sync::mpsc::Sender<()>>>,
-        proceed_rx: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
-    }
-
-    impl IdentityStore for SteppedStore {
-        fn get(&self, key: &str) -> Option<String> {
-            self.inner.get(key)
-        }
-        fn set(&self, key: &str, value: String) {
-            self.inner.set(key, value);
-            if key.starts_with(REVERSE_PREFIX) {
-                if let Some(tx) = self.reverse_written_tx.lock().unwrap().take() {
-                    let _ = tx.send(());
-                    if let Some(rx) = self.proceed_rx.lock().unwrap().take() {
-                        let _ = rx.recv();
-                    }
-                }
-            }
-        }
-        fn remove(&self, key: &str) {
-            self.inner.remove(key);
-        }
-        fn compare_and_swap(&self, key: &str, expected: Option<&str>, new: &str) -> bool {
-            self.inner.compare_and_swap(key, expected, new)
-        }
-    }
-
-    #[test]
-    fn get_or_create_persistent_reverse_key_survives_a_racing_remove_local() {
-        // Regression: get_or_create_persistent used to CAS the candidate
-        // into the forward list, THEN write its reverse key as a separate,
-        // later operation. A remove_local landing in that exact gap would
-        // see the new forward entry (post-CAS) with no reverse key yet,
-        // clean up based on that snapshot (a `remove` on the not-yet-present
-        // reverse key is a silent no-op), and finish - after which the
-        // writer's now-late reverse-key write created a mapping nothing
-        // would ever revisit. Writing the reverse key *before* the forward
-        // CAS (and reusing it across retries) closes this. Force the exact
-        // interleaving deterministically instead of relying on scheduling
-        // luck (see the sibling test above, which never caught this in
-        // practice despite exercising the same two operations concurrently).
-        use std::sync::{mpsc, Arc};
-        use std::thread;
-
-        let (reverse_written_tx, reverse_written_rx) = mpsc::channel();
-        let (proceed_tx, proceed_rx) = mpsc::channel();
-        let store = SteppedStore {
-            inner: InMemoryIdentityStore::new(),
-            reverse_written_tx: Mutex::new(Some(reverse_written_tx)),
-            proceed_rx: Mutex::new(Some(proceed_rx)),
-        };
-        let db = Arc::new(IdentDb::new(store, IDP));
-
-        let writer = {
-            let db = Arc::clone(&db);
-            thread::spawn(move || db.persistent_nameid("alice", Some(SP)))
-        };
-
-        // Wait until the writer has written its candidate's reverse key and
-        // is paused before attempting its forward CAS.
-        reverse_written_rx.recv().unwrap();
-
-        // The candidate isn't in the forward list yet (the writer's CAS
-        // hasn't run), so this must be a no-op with respect to it.
-        db.remove_local("alice");
-
-        // Let the writer proceed to its forward CAS.
-        proceed_tx.send(()).unwrap();
-        let minted = writer.join().unwrap();
-
-        let listed = db.name_ids_for("alice");
-        assert!(
-            listed.iter().any(|n| n.value == minted.value),
-            "the minted persistent NameID must end up in the forward list: {listed:?}"
-        );
-        assert_eq!(
-            db.find_local_id(&minted).as_deref(),
-            Some("alice"),
-            "and its reverse mapping must still resolve, not be orphaned"
-        );
-    }
-
-    #[test]
-    fn store_reverse_key_survives_a_racing_remove_local() {
-        // Same fix, same deterministic technique, for store() (the path
-        // durable non-persistent NameIDs like email go through) rather than
-        // get_or_create_persistent. The scheduling-based sibling test above
-        // races a durable get_nameid (-> store()) against remove_local across
-        // 20 rounds and 4 threads without ever reproducing this - the
-        // window is only a few CPU instructions wide, so a real regression
-        // here would ship silently without a deterministic reproduction.
-        use std::sync::{mpsc, Arc};
-        use std::thread;
-
-        let (reverse_written_tx, reverse_written_rx) = mpsc::channel();
-        let (proceed_tx, proceed_rx) = mpsc::channel();
-        let store = SteppedStore {
-            inner: InMemoryIdentityStore::new(),
-            reverse_written_tx: Mutex::new(Some(reverse_written_tx)),
-            proceed_rx: Mutex::new(Some(proceed_rx)),
-        };
-        let db = Arc::new(IdentDb::new(store, IDP));
-
-        let writer = {
-            let db = Arc::clone(&db);
-            thread::spawn(move || {
-                db.get_nameid("alice", constants::NAMEID_EMAIL, Some(SP), Some(IDP))
-            })
-        };
-
-        reverse_written_rx.recv().unwrap();
-        db.remove_local("alice");
-        proceed_tx.send(()).unwrap();
-        let minted = writer.join().unwrap();
-
-        let listed = db.name_ids_for("alice");
-        assert!(
-            listed.iter().any(|n| n.value == minted.value),
-            "the minted email NameID must end up in the forward list: {listed:?}"
-        );
-        assert_eq!(
-            db.find_local_id(&minted).as_deref(),
-            Some("alice"),
-            "and its reverse mapping must still resolve, not be orphaned"
-        );
     }
 
     #[test]

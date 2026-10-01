@@ -10,12 +10,13 @@
 use chrono::{TimeDelta, Utc};
 
 use crate::core::assertion::attribute::{Attribute, AttributeValue};
+use crate::core::assertion::name_id::NameId;
 use crate::core::constants;
 use crate::core::protocol::request::AuthnContextComparison;
 use crate::crypto::keys::loader;
 use crate::crypto::{KeyUsage, KeysManager, SamlSigner};
 use crate::idp::authn_broker::AuthnBroker;
-use crate::idp::ident::{IdentDb, IdentityStore};
+use crate::idp::ident::{IdentDb, IdentityStore, ValueTaken};
 use crate::idp::orchestrator::release::PassThroughRelease;
 use crate::idp::orchestrator::{
     check_request, create_authn_response, AuthnMethodRef, Disposition, EstablishedSession,
@@ -1032,25 +1033,33 @@ fn subject_id_req_reads_the_full_metadata_attribute_name() {
 /// NameIdConstructor`) actually accepts an `IdentDb` over any store, not
 /// just the default.
 #[derive(Default)]
-struct CustomStore(std::sync::Mutex<std::collections::HashMap<String, String>>);
+struct CustomStore(crate::idp::ident::InMemoryIdentityStore);
 
 impl IdentityStore for CustomStore {
-    fn get(&self, key: &str) -> Option<String> {
-        self.0.lock().unwrap().get(key).cloned()
+    fn for_user(&self, user_id: &str) -> Vec<NameId> {
+        self.0.for_user(user_id)
     }
-    fn set(&self, key: &str, value: String) {
-        self.0.lock().unwrap().insert(key.to_string(), value);
+    fn user_for(&self, value: &str) -> Option<String> {
+        self.0.user_for(value)
     }
-    fn remove(&self, key: &str) {
-        self.0.lock().unwrap().remove(key);
+    fn get_or_insert_persistent(
+        &self,
+        user_id: &str,
+        candidate: NameId,
+    ) -> Result<NameId, ValueTaken> {
+        self.0.get_or_insert_persistent(user_id, candidate)
     }
-    fn compare_and_swap(&self, key: &str, expected: Option<&str>, new: &str) -> bool {
-        let mut map = self.0.lock().unwrap();
-        if map.get(key).map(String::as_str) != expected {
-            return false;
-        }
-        map.insert(key.to_string(), new.to_string());
-        true
+    fn insert(&self, user_id: &str, name_id: NameId) -> Result<(), ValueTaken> {
+        self.0.insert(user_id, name_id)
+    }
+    fn replace(&self, user_id: &str, name_id: NameId) {
+        self.0.replace(user_id, name_id)
+    }
+    fn remove(&self, value: &str) {
+        self.0.remove(value)
+    }
+    fn remove_all(&self, user_id: &str) {
+        self.0.remove_all(user_id)
     }
 }
 

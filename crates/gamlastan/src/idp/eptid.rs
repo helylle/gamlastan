@@ -72,7 +72,7 @@ use crate::core::assertion::attribute::Attribute;
 use crate::core::assertion::name_id::NameId;
 use crate::core::constants;
 use crate::crypto::digest::sha256;
-use crate::idp::ident::{to_hex, IdentityStore, InMemoryIdentityStore};
+use crate::idp::ident::{to_hex, InMemoryKeyValueStore, KeyValueStore};
 
 use md5::{Digest, Md5};
 
@@ -134,16 +134,16 @@ pub enum EptidConfigError {
 }
 
 /// eduPersonTargetedID generator (pysaml2 `Eptid`).
-pub struct Eptid<S: IdentityStore = InMemoryIdentityStore> {
+pub struct Eptid<S: KeyValueStore = InMemoryKeyValueStore> {
     secret: String,
     store: S,
     options: EptidOptions,
 }
 
-impl Eptid<InMemoryIdentityStore> {
+impl Eptid<InMemoryKeyValueStore> {
     /// Create a generator with an in-memory cache.
     pub fn new(secret: impl Into<String>) -> Self {
-        Eptid::with_store(InMemoryIdentityStore::new(), secret)
+        Eptid::with_store(InMemoryKeyValueStore::new(), secret)
     }
 
     /// Create a generator with explicit options and an in-memory cache.
@@ -151,11 +151,11 @@ impl Eptid<InMemoryIdentityStore> {
         secret: impl Into<String>,
         options: EptidOptions,
     ) -> Result<Self, EptidConfigError> {
-        Eptid::try_with_store_options(InMemoryIdentityStore::new(), secret, options)
+        Eptid::try_with_store_options(InMemoryKeyValueStore::new(), secret, options)
     }
 }
 
-impl<S: IdentityStore> Eptid<S> {
+impl<S: KeyValueStore> Eptid<S> {
     /// Create a generator over a custom store (pysaml2 `EptidShelve`
     /// analogue — back it with Redis/SQL for persistence).
     pub fn with_store(store: S, secret: impl Into<String>) -> Self {
@@ -254,7 +254,7 @@ mod tests {
         map: Arc<Mutex<HashMap<String, String>>>,
     }
 
-    impl IdentityStore for SharedStore {
+    impl KeyValueStore for SharedStore {
         fn get(&self, key: &str) -> Option<String> {
             self.map.lock().unwrap().get(key).cloned()
         }
@@ -265,15 +265,6 @@ mod tests {
 
         fn remove(&self, key: &str) {
             self.map.lock().unwrap().remove(key);
-        }
-
-        fn compare_and_swap(&self, key: &str, expected: Option<&str>, new: &str) -> bool {
-            let mut map = self.map.lock().unwrap();
-            if map.get(key).map(String::as_str) != expected {
-                return false;
-            }
-            map.insert(key.to_string(), new.to_string());
-            true
         }
     }
 

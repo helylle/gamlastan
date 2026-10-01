@@ -500,11 +500,13 @@ fn construct_name_id(
         .nameid_format(&params.processed.sp_entity_id);
     // The default per-SP format is transient, and a transient is minted fresh
     // on every call - including repeated reuse of the same session. That is
-    // fine for the identity store because `IdentDb` does not persist transient
-    // identifiers (they are one-time-use per SAML Core §8.3.7 and never need
-    // a reverse lookup); only durable formats (persistent, email, ...) are
-    // stored. See `IdentDb::get_nameid`. Without that, every successful
-    // response would grow the store without bound.
+    // fine for the identity store because, by default, `IdentDb` does not
+    // persist transient identifiers (they are one-time-use per SAML Core
+    // §8.3.7 and never need a reverse lookup); only durable formats
+    // (persistent, email, ...) are stored. See `IdentDb::get_nameid`. Without
+    // that, every successful response would grow the store without bound. A
+    // deployment that needs to resolve a transient NameID back to its user
+    // (back-channel logout) opts in with `IdentDb::with_persist_transient`.
     engine
         .idents
         .construct_nameid(

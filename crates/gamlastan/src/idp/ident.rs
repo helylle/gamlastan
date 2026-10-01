@@ -6,12 +6,14 @@
 // NameIDs honoring an incoming `NameIDPolicy`, and implements the server
 // side of the ManageNameID and NameIDMapping profiles on top of it.
 //
-// Transient NameIDs are minted fresh on every issuance and are *not*
-// persisted to the store: per SAML Core §8.3.7 a transient identifier is
-// one-time-use and MUST NOT be reused, so it has no reverse-lookup need.
-// Persisting them would grow the identity store without bound (the default
-// per-SP format is transient, so every response would add an entry that is
-// never read back). Persistent and other durable formats are stored.
+// Transient NameIDs are minted fresh on every issuance and, by default, are
+// *not* persisted to the store: per SAML Core §8.3.7 a transient identifier is
+// one-time-use and MUST NOT be reused, so it has no reverse-lookup need in the
+// SSO flow. Persisting them would grow the identity store without bound (the
+// default per-SP format is transient, so every response would add an entry
+// that is never read back). Persistent and other durable formats are stored.
+// A deployment whose back-channel logout must resolve a transient NameID to its
+// user opts in with `IdentDb::with_persist_transient`.
 //
 // The storage backend is pluggable via `IdentityStore`; the in-memory
 // implementation suits single-instance deployments and tests.
@@ -410,6 +412,9 @@ pub struct IdentDb<S: IdentityStore = InMemoryIdentityStore> {
     name_qualifier: String,
     /// Domain appended to generated email-format NameIDs.
     domain: Option<String>,
+    /// Also store transient NameIDs (off by default; see
+    /// [`with_persist_transient`](Self::with_persist_transient)).
+    persist_transient: bool,
 }
 
 impl IdentDb<InMemoryIdentityStore> {
@@ -426,12 +431,37 @@ impl<S: IdentityStore> IdentDb<S> {
             store,
             name_qualifier: idp_entity_id.into(),
             domain: None,
+            persist_transient: false,
         }
     }
 
     /// Set the domain used for email-format NameIDs.
     pub fn with_domain(mut self, domain: impl Into<String>) -> Self {
         self.domain = Some(domain.into());
+        self
+    }
+
+    /// Also store transient NameIDs (default: off).
+    ///
+    /// By default a transient NameID is minted and returned without being
+    /// stored. It is one-time-use (SAML Core §8.3.7) and the default per-SP
+    /// format is transient, so storing every one would grow the store without
+    /// bound. The cost of that default is that
+    /// [`find_local_id`](Self::find_local_id) cannot resolve a transient
+    /// NameID, which a back-channel (SOAP) LogoutRequest carrying one needs in
+    /// order to find the user.
+    ///
+    /// Turning this on makes each transient NameID a record, so it resolves.
+    /// Three consequences:
+    ///
+    /// - The record trait has no expiry. A transient record is useless once
+    ///   its session ends, so the backend must expire them (a TTL index, a
+    ///   periodic purge), or the store grows by one record per response.
+    /// - Issuing a transient NameID then needs the store to be reachable.
+    /// - A stored transient is still one-time-use: a NameIDMapping request
+    ///   never reuses one.
+    pub fn with_persist_transient(mut self, persist: bool) -> Self {
+        self.persist_transient = persist;
         self
     }
 
@@ -512,7 +542,9 @@ impl<S: IdentityStore> IdentDb<S> {
     /// Create a new NameID of the given format (pysaml2 `get_nameid()`);
     /// persistent format reuses an existing association when one exists.
     ///
-    /// Transient identifiers are minted fresh and returned *without* being
+    /// Transient identifiers are minted fresh and, unless
+    /// [`with_persist_transient`](Self::with_persist_transient) is set,
+    /// returned *without* being
     /// stored: they are one-time-use (SAML Core §8.3.7) and never need a
     /// reverse lookup, so persisting them would only grow the store without
     /// bound (the default per-SP format is transient, so every response
@@ -542,7 +574,7 @@ impl<S: IdentityStore> IdentDb<S> {
             }
         }
 
-        let stored = format != constants::NAMEID_TRANSIENT;
+        let stored = format != constants::NAMEID_TRANSIENT || self.persist_transient;
         loop {
             let value = self.create_id(format, name_qualifier, sp_name_qualifier, stored)?;
             let name_id = NameId {
@@ -720,7 +752,10 @@ impl<S: IdentityStore> IdentDb<S> {
         let wanted_format = name_id_policy.format.as_deref();
         let wanted_spq = name_id_policy.sp_name_qualifier.as_deref();
         if let Some(existing) = self.name_ids_for(&user_id)?.into_iter().find(|nid| {
-            (wanted_format.is_none() || nid.format.as_deref() == wanted_format)
+            // A transient identifier is one-time-use and must not be reused,
+            // even when persist_transient keeps it in the store.
+            nid.format.as_deref() != Some(constants::NAMEID_TRANSIENT)
+                && (wanted_format.is_none() || nid.format.as_deref() == wanted_format)
                 && (wanted_spq.is_none() || nid.sp_name_qualifier.as_deref() == wanted_spq)
         }) {
             return Ok(existing);
@@ -1254,6 +1289,48 @@ mod tests {
         assert_eq!(db.find_local_id(&a).unwrap(), None);
         assert_eq!(db.find_local_id(&b).unwrap(), None);
         assert!(db.name_ids_for("alice").unwrap().is_empty());
+    }
+
+    #[test]
+    fn persist_transient_makes_a_transient_nameid_resolvable() {
+        let db = IdentDb::in_memory(IDP).with_persist_transient(true);
+        let a = db.transient_nameid("alice", Some(SP)).unwrap();
+        let b = db.transient_nameid("alice", Some(SP)).unwrap();
+        assert_ne!(a.value, b.value, "each issuance is still a fresh value");
+        assert_eq!(db.find_local_id(&a).unwrap().as_deref(), Some("alice"));
+        assert_eq!(db.find_local_id(&b).unwrap().as_deref(), Some("alice"));
+        assert_eq!(db.name_ids_for("alice").unwrap().len(), 2);
+        // A stored transient is never mistaken for the persistent identifier.
+        assert!(db
+            .match_local_id("alice", Some(SP), Some(IDP))
+            .unwrap()
+            .is_none());
+        db.remove_remote(&a).unwrap();
+        assert_eq!(db.find_local_id(&a).unwrap(), None);
+        db.remove_local("alice").unwrap();
+        assert_eq!(db.find_local_id(&b).unwrap(), None);
+    }
+
+    #[test]
+    fn a_stored_transient_is_never_reused_by_a_nameid_mapping_request() {
+        let db = IdentDb::in_memory(IDP).with_persist_transient(true);
+        let t = db.transient_nameid("alice", Some(SP)).unwrap();
+        let policy = NameIdPolicy {
+            format: Some(constants::NAMEID_TRANSIENT.to_string()),
+            sp_name_qualifier: Some(SP.to_string()),
+            allow_create: true,
+        };
+        let mapped = db.handle_name_id_mapping_request(&t, &policy).unwrap();
+        assert_ne!(
+            mapped.value, t.value,
+            "a transient identifier is one-time-use and must not be handed out again"
+        );
+    }
+
+    #[test]
+    fn persist_transient_needs_the_store() {
+        let db = IdentDb::new(DownStore, IDP).with_persist_transient(true);
+        assert!(db.transient_nameid("alice", Some(SP)).is_err());
     }
 
     #[test]

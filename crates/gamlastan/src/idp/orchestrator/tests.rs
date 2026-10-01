@@ -1221,6 +1221,39 @@ fn assertion_store_outage_is_an_error_not_a_silent_skip() {
     );
 }
 
+#[test]
+fn persist_transient_lets_the_issued_nameid_resolve_to_its_user() {
+    // The back-channel logout case: the SP later presents the transient NameID
+    // it was given, and the IdP has to find the user from it.
+    let idents = IdentDb::in_memory(IDP).with_persist_transient(true);
+    let broker = broker();
+    let decisions = ReleasePolicy::new(); // default format: transient
+    let engine = ResponseEngine {
+        idp_entity_id: IDP,
+        decisions: &decisions,
+        release: &decisions,
+        idents: &idents,
+        broker: &broker,
+        assertions: None,
+        signer: &SamlSigner::new(KeysManager::new()),
+        cert_der_b64: "",
+    };
+    let subject = subject_without_mail();
+    let p = params(processed(false, false, vec![], None));
+    let ResponseOutcome::Issued(issued) = create_authn_response(&engine, &p, &subject).unwrap()
+    else {
+        panic!("expected an issued response");
+    };
+    assert_eq!(
+        issued.name_id.format.as_deref(),
+        Some(constants::NAMEID_TRANSIENT)
+    );
+    assert_eq!(
+        idents.find_local_id(&issued.name_id).unwrap().as_deref(),
+        Some(subject.subject_id.as_str())
+    );
+}
+
 // ── NameID construction through create_authn_response ──────────────────────
 
 #[test]

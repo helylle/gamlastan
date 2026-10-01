@@ -86,6 +86,15 @@ where needed to correct protocol handling.
   no `IdpSigningContext`) produced signed responses while metadata
   advertised no key at all - or a *different* key, if `IdpSigningContext`
   also happened to be registered with its own certificate.
+- Added `IdentDb::with_persist_transient` (default off). Transient NameIDs are
+  one-time-use and the default per-SP format is transient, so by default they
+  are minted without being stored; the cost is that `find_local_id` cannot
+  resolve one, which a back-channel (SOAP) LogoutRequest carrying a transient
+  NameID needs in order to find the user. Opting in stores each transient
+  NameID so it resolves. The record trait has no expiry, so the backend must
+  expire them (a TTL index, a periodic purge); issuing a transient NameID then
+  needs the store to be reachable. A stored transient is still never reused by
+  a NameIDMapping request.
 
 ### Changed
 

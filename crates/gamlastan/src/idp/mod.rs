@@ -101,7 +101,7 @@ pub use authn_broker::{AuthnBroker, AuthnMethod};
 pub use eptid::Eptid;
 pub use ident::{
     IdentDb, IdentError, IdentityStore, InMemoryIdentityStore, InMemoryKeyValueStore, InsertError,
-    KeyValueStore, NameIdConstructor, StoreError,
+    KeyValueStore, NameIdConstructor, NameIdFilter, StoreError,
 };
 pub use orchestrator::{
     check_request, create_authn_response, create_denial_response, AttributeRelease,

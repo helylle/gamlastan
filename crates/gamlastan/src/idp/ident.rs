@@ -81,6 +81,39 @@ pub enum InsertError {
     Store(#[from] StoreError),
 }
 
+/// Criteria for [`IdentityStore::find`] (pysaml2 `IdentDB.find_nameid`).
+///
+/// A `None` field matches any record. A `Some` field requires the record's
+/// field to equal it exactly, so a record that lacks the field does not match.
+/// This differs from [`IdentityStore::find_persistent`], where a `None`
+/// qualifier means "the record has no such qualifier".
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NameIdFilter {
+    /// Required NameID format.
+    pub format: Option<String>,
+    /// Required `SPNameQualifier`.
+    pub sp_name_qualifier: Option<String>,
+    /// Required `NameQualifier`.
+    pub name_qualifier: Option<String>,
+    /// Required `SPProvidedID`.
+    pub sp_provided_id: Option<String>,
+}
+
+impl NameIdFilter {
+    /// Whether `name_id` satisfies every field that is set.
+    pub fn matches(&self, name_id: &NameId) -> bool {
+        fn ok(wanted: &Option<String>, actual: &Option<String>) -> bool {
+            wanted
+                .as_deref()
+                .is_none_or(|w| actual.as_deref() == Some(w))
+        }
+        ok(&self.format, &name_id.format)
+            && ok(&self.sp_name_qualifier, &name_id.sp_name_qualifier)
+            && ok(&self.name_qualifier, &name_id.name_qualifier)
+            && ok(&self.sp_provided_id, &name_id.sp_provided_id)
+    }
+}
+
 /// Plain key/value backend.
 ///
 /// Used where a mapping needs no cross-record atomicity, such as
@@ -155,6 +188,17 @@ pub trait IdentityStore: Send + Sync {
 
     /// The user a NameID value belongs to.
     fn user_for(&self, value: &str) -> Result<Option<String>, StoreError>;
+
+    /// Every NameID of `user_id` that satisfies `filter`, in unspecified order
+    /// (pysaml2 `find_nameid`). Overridable to push the filter down to an
+    /// index or query; the default filters [`for_user`](Self::for_user).
+    fn find(&self, user_id: &str, filter: &NameIdFilter) -> Result<Vec<NameId>, StoreError> {
+        Ok(self
+            .for_user(user_id)?
+            .into_iter()
+            .filter(|n| filter.matches(n))
+            .collect())
+    }
 
     /// The user's persistent NameID for `(sp_name_qualifier,
     /// name_qualifier)`, if one exists. `None` for a qualifier means the
@@ -465,6 +509,16 @@ impl<S: IdentityStore> IdentDb<S> {
         self
     }
 
+    /// The NameIDs stored for a local user that satisfy `filter` (pysaml2
+    /// `find_nameid()`).
+    pub fn find_nameid(
+        &self,
+        user_id: &str,
+        filter: &NameIdFilter,
+    ) -> Result<Vec<NameId>, StoreError> {
+        self.store.find(user_id, filter)
+    }
+
     /// All NameIDs stored for a local user.
     pub fn name_ids_for(&self, user_id: &str) -> Result<Vec<NameId>, StoreError> {
         self.store.for_user(user_id)
@@ -751,13 +805,18 @@ impl<S: IdentityStore> IdentDb<S> {
 
         let wanted_format = name_id_policy.format.as_deref();
         let wanted_spq = name_id_policy.sp_name_qualifier.as_deref();
-        if let Some(existing) = self.name_ids_for(&user_id)?.into_iter().find(|nid| {
-            // A transient identifier is one-time-use and must not be reused,
-            // even when persist_transient keeps it in the store.
-            nid.format.as_deref() != Some(constants::NAMEID_TRANSIENT)
-                && (wanted_format.is_none() || nid.format.as_deref() == wanted_format)
-                && (wanted_spq.is_none() || nid.sp_name_qualifier.as_deref() == wanted_spq)
-        }) {
+        let filter = NameIdFilter {
+            format: wanted_format.map(str::to_string),
+            sp_name_qualifier: wanted_spq.map(str::to_string),
+            ..Default::default()
+        };
+        // A transient identifier is one-time-use and must not be reused, even
+        // when persist_transient keeps it in the store.
+        if let Some(existing) = self
+            .find_nameid(&user_id, &filter)?
+            .into_iter()
+            .find(|nid| nid.format.as_deref() != Some(constants::NAMEID_TRANSIENT))
+        {
             return Ok(existing);
         }
 
@@ -864,6 +923,7 @@ pub mod conformance {
         persistent_is_get_or_insert(&new_store());
         persistent_insert_reports_a_taken_value(&new_store());
         find_persistent_is_format_and_qualifier_exact(&new_store());
+        find_filters_on_every_field(&new_store());
         replace_upserts_by_value(&new_store());
         removal_is_scoped(&new_store());
         concurrent_get_or_insert_converges_on_one_identifier(new_store());
@@ -969,6 +1029,80 @@ pub mod conformance {
             .find_persistent("alice", None, Some(IDP))
             .unwrap()
             .is_none());
+    }
+
+    fn find_filters_on_every_field<S: IdentityStore>(s: &S) {
+        let mut with_alias = nid("f1", constants::NAMEID_EMAIL, Some(SP_A));
+        with_alias.sp_provided_id = Some("alias".to_string());
+        s.insert("alice", with_alias).unwrap();
+        s.insert("alice", nid("f2", constants::NAMEID_EMAIL, Some(SP_B)))
+            .unwrap();
+        s.get_or_insert_persistent("alice", persistent("f3", SP_A))
+            .unwrap();
+        s.insert("bob", nid("f4", constants::NAMEID_EMAIL, Some(SP_A)))
+            .unwrap();
+
+        let values = |filter: NameIdFilter| -> Vec<String> {
+            let mut v: Vec<String> = s
+                .find("alice", &filter)
+                .unwrap()
+                .into_iter()
+                .map(|n| n.value)
+                .collect();
+            v.sort();
+            v
+        };
+        assert_eq!(
+            values(NameIdFilter::default()),
+            ["f1", "f2", "f3"],
+            "an empty filter matches every record of the user, and no one else's"
+        );
+        assert_eq!(
+            values(NameIdFilter {
+                format: Some(constants::NAMEID_EMAIL.to_string()),
+                ..Default::default()
+            }),
+            ["f1", "f2"],
+            "format filters"
+        );
+        assert_eq!(
+            values(NameIdFilter {
+                sp_name_qualifier: Some(SP_A.to_string()),
+                ..Default::default()
+            }),
+            ["f1", "f3"],
+            "sp_name_qualifier filters"
+        );
+        assert_eq!(
+            values(NameIdFilter {
+                name_qualifier: Some(IDP.to_string()),
+                ..Default::default()
+            }),
+            ["f1", "f2", "f3"],
+            "name_qualifier filters"
+        );
+        assert_eq!(
+            values(NameIdFilter {
+                sp_provided_id: Some("alias".to_string()),
+                ..Default::default()
+            }),
+            ["f1"],
+            "sp_provided_id filters, and a record without one does not match"
+        );
+        assert_eq!(
+            values(NameIdFilter {
+                format: Some(constants::NAMEID_EMAIL.to_string()),
+                sp_name_qualifier: Some(SP_A.to_string()),
+                ..Default::default()
+            }),
+            ["f1"],
+            "fields combine with AND"
+        );
+        assert!(values(NameIdFilter {
+            sp_name_qualifier: Some("https://nobody.example.com".to_string()),
+            ..Default::default()
+        })
+        .is_empty());
     }
 
     fn replace_upserts_by_value<S: IdentityStore>(s: &S) {
@@ -1289,6 +1423,30 @@ mod tests {
         assert_eq!(db.find_local_id(&a).unwrap(), None);
         assert_eq!(db.find_local_id(&b).unwrap(), None);
         assert!(db.name_ids_for("alice").unwrap().is_empty());
+    }
+
+    #[test]
+    fn find_nameid_filters_a_users_records() {
+        let db = db();
+        let persistent = db.persistent_nameid("alice", Some(SP)).unwrap();
+        db.get_nameid("alice", constants::NAMEID_EMAIL, Some(SP), Some(IDP))
+            .unwrap();
+        db.persistent_nameid("bob", Some(SP)).unwrap();
+
+        let all = db.find_nameid("alice", &NameIdFilter::default()).unwrap();
+        assert_eq!(all.len(), 2, "only alice's records");
+
+        let only_persistent = db
+            .find_nameid(
+                "alice",
+                &NameIdFilter {
+                    format: Some(constants::NAMEID_PERSISTENT.to_string()),
+                    sp_name_qualifier: Some(SP.to_string()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(only_persistent, vec![persistent]);
     }
 
     #[test]

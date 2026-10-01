@@ -95,6 +95,12 @@ where needed to correct protocol handling.
   expire them (a TTL index, a periodic purge); issuing a transient NameID then
   needs the store to be reachable. A stored transient is still never reused by
   a NameIDMapping request.
+- Added `IdentityStore::find` and `IdentDb::find_nameid` (pysaml2
+  `find_nameid`): the NameIDs of a user matching a `NameIdFilter` on format,
+  `SPNameQualifier`, `NameQualifier` and `SPProvidedID`, where an unset field
+  matches anything. `find` has a default that filters `for_user`; a backend
+  overrides it to push the filter into a query. The conformance suite checks
+  that an override agrees with the default's semantics.
 
 ### Changed
 

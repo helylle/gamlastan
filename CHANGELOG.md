@@ -146,44 +146,25 @@ where needed to correct protocol handling.
   own `AuthnBroker` has the same broadening; gamlastan diverges from it
   here). Added `AuthnBroker::allow_exact_level_matching` to opt back into the
   looser, pysaml2-compatible behavior.
-- **Breaking:** `IdentityStore` gained a required `compare_and_swap` method,
-  used to close a check-then-create race on a user's forward NameID list:
-  two concurrent requests for the same (user, SP) could previously both
-  observe no existing persistent association and each mint a *different*
-  persistent identifier, and separately, any two concurrent writers of the
-  same forward list (e.g. a persistent mint racing a transient/email
-  issuance, or a removal) could silently drop one writer's update even if
-  that writer's own operation was individually atomic - including
-  `remove_local`, whose unconditional, non-CAS forward-key removal could
-  wipe out a concurrently-added entry from a different writer while
-  permanently orphaning that entry's reverse-key mapping. Every
-  forward-list mutation (`IdentDb::store`/`get_or_create_persistent`/
-  `remove_remote`/`remove_local`) now goes through `compare_and_swap`
-  against the same key, with a retry loop. `IdentityStore` has no
+- **Breaking:** `IdentityStore` is now a record-shaped backend: one record per
+  (user, NameID) association (`for_user`, `user_for`, `find_persistent`,
+  `get_or_insert_persistent`, `insert`, `replace`, `remove`, `remove_all`).
+  `IdentDb`'s atomicity comes from two uniqueness constraints the backend
+  enforces - the NameID value is unique across all records, and among
+  persistent records `(user, sp_name_qualifier, name_qualifier)` is unique -
+  so two concurrent first requests for the same (user, SP) converge on one
+  persistent identifier instead of minting different ones, and a removal
+  cannot orphan a reverse mapping because there is no separate reverse key.
+  The constraints live in the store, so the trait has no default write
+  methods (a non-atomic default would silently leave the race open on a
+  multi-instance deployment) and `ident::conformance::run` is provided to
+  check that a backend honours them. `InMemoryIdentityStore` takes one lock
+  per call; a Mongo/SQL-backed store must back the two constraints with real
+  unique indexes (a partial unique index for the persistent tuple). The plain
+  `get`/`set`/`remove` shape is kept as `KeyValueStore`
+  (`InMemoryKeyValueStore`), which `Eptid` uses. `IdentityStore` has no
   implementors outside this crate yet, so this is a design decision, not a
-  disruption: `compare_and_swap` has no default implementation, since a
-  plausible-looking but non-atomic one (a plain `get`+`set`, or even a
-  process-local mutex) would silently leave the exact race this method
-  exists to close in place for any multi-instance deployment that didn't
-  notice it needed to do something extra. `InMemoryIdentityStore` overrides
-  it with a per-instance mutex-guarded compare-and-swap; a multi-instance
-  backend (Redis/SQL) must implement a genuinely atomic storage-layer
-  operation (Redis `WATCH`/`MULTI`, a SQL `UPDATE ... WHERE current =
-  expected`, etc.).
-- Making the forward-list CAS atomic left one more gap: `store()` and
-  `get_or_create_persistent()` still wrote a NameID's reverse-index entry
-  as a separate operation *after* committing it to the forward list. A
-  `remove_local` racing in that exact window could see the new entry
-  already in the forward list (post-commit), find no reverse key yet to
-  clean up for it (a `remove` on an absent key is a silent no-op), and
-  finish - after which the late reverse-key write created a mapping
-  nothing would ever revisit: a permanent orphan surviving an explicit
-  "forget this user" call. Both now write the reverse key *before*
-  attempting the forward commit (reusing, not regenerating, the same
-  candidate across `get_or_create_persistent`'s CAS retries, and rolling
-  back an abandoned candidate's reverse key if a retry finds an existing
-  match instead), so a forward-list-visible entry always already has its
-  reverse key.
+  disruption.
 - `idp::orchestrator`'s NameIDPolicy handling only honours
   `NameIDPolicy/@SPNameQualifier` when it equals the requester's own
   (verified) entity ID. Per saml-core-2.0-os 8.3.7, SPNameQualifier may

@@ -80,20 +80,20 @@ existing primitives into the profile flow, and move the semantics proven in
    persistent identifier for the same subject just by naming it in its own
    request -- so a mismatched qualifier is denied (`InvalidNameIdPolicy`)
    rather than passed through. Persistent NameID minting is also
-   concurrency-safe: `IdentityStore` gained a required `compare_and_swap`
-   method, and every writer of a user's forward NameID list
-   (`store`/`get_or_create_persistent`/`remove_remote`/`remove_local`) goes
-   through it with a retry loop, so two concurrent requests (for the same or
-   different SPs) can no longer silently drop one writer's update or mint
-   two different "stable" persistent identifiers for the same (user, SP).
-   `compare_and_swap` has no default implementation -- `IdentityStore` has no
-   implementors outside this crate yet, so requiring it costs nothing real,
-   and a plausible-looking non-atomic default (even a process-local mutex)
-   would silently leave the race open for any multi-instance backend that
-   didn't think to override it. `InMemoryIdentityStore` implements it with a
-   per-instance mutex; a Redis/SQL-backed store must implement a genuinely
-   atomic storage-layer operation (`WATCH`/`MULTI`, `UPDATE ... WHERE
-   current = expected`, etc.).
+   concurrency-safe, without a multi-key transaction: `IdentityStore` is a
+   record-shaped trait (one record per (user, NameID) association), and
+   atomicity comes from two uniqueness constraints the backend must enforce
+   -- the NameID value is unique across all records, and among persistent
+   records `(user, sp_name_qualifier, name_qualifier)` is unique -- plus
+   single-record operations (`get_or_insert_persistent`, `insert`, `replace`,
+   `remove`). Two concurrent first requests for the same (user, SP) therefore
+   converge on one persistent identifier. Nothing in this crate can detect a
+   missing constraint, so the trait has no default write methods and
+   `ident::conformance::run` checks that a backend honours the contract.
+   `InMemoryIdentityStore` takes one lock per call; a Mongo/SQL-backed store
+   must back the two constraints with real unique indexes (a partial unique
+   index for the persistent tuple). The plain `get`/`set`/`remove` shape
+   remains as `KeyValueStore`, which `Eptid` uses.
 
    The forward-list CAS alone was not sufficient: `store()` and
    `get_or_create_persistent()` wrote a NameID's reverse-index entry as a
@@ -221,9 +221,11 @@ failure is a real protocol error rather than a silent per-integrator choice.
   changed from level-based matching to literal class-ref matching (see
   above). Any integrator relying on the old broadened behaviour must pass
   `allow_exact_level_matching(true)` explicitly.
-- Breaking (pre-release): `IdentityStore` gained a required `compare_and_swap`
-  method with no default implementation (see above). A custom implementor
-  (there are none outside this crate yet) must add it.
+- Breaking (pre-release): `IdentityStore` is now the record-shaped NameID
+  backend; the former get/set/remove trait is `KeyValueStore` (used by
+  `Eptid`). A custom implementor (there are none outside this crate yet) must
+  implement the record methods and enforce the two uniqueness constraints
+  (see above).
 
 ## Alternatives considered
 

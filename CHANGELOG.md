@@ -114,6 +114,19 @@ where needed to correct protocol handling.
   `sign_response_xml_with`, `signature_template_with_digest` and
   `SamlSigner::signature_method_uri_for`. An HSM-backed signer can only use its
   token's own signature algorithm, and asking for another is an error.
+- `ident::conformance` (the reusable `IdentityStore` backend check) gains
+  non-panicking entry points for callers that are not Rust tests, such as a
+  language binding: `check` / `check_with` return the first violation as a
+  `ConformanceError` naming the failing check, `check_one` runs a single check
+  by name, `CHECKS` lists the names, and `Options::threads` sets the concurrent
+  checks' thread count. `run` still panics and is unchanged for Rust tests. A
+  backend call that fails is now a failed check naming the operation, and the
+  concurrent-insert check no longer counts a backend failure as a lost race
+  (which made a dead backend look as if it had exactly one winner). The docs
+  state what the suite cannot prove: its concurrent checks run on threads in
+  one process, so a backend that serialises its calls can pass without having
+  the constraint, and a race between separate processes is not detected. The
+  module moved to `idp/ident/conformance.rs`.
 
 ### Changed
 

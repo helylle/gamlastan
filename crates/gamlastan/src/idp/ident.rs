@@ -876,352 +876,7 @@ pub(crate) fn to_hex(bytes: &[u8]) -> String {
     out
 }
 
-/// A reusable check that an [`IdentityStore`] backend honours the contract
-/// [`IdentDb`] relies on.
-///
-/// The two uniqueness constraints (NameID value; persistent `(user,
-/// sp_name_qualifier, name_qualifier)`) live in the backend, not in this
-/// crate, so a backend that forgets one - say a missing unique index -
-/// compiles fine and only misbehaves under concurrent load. Run [`run`]
-/// against a real instance (e.g. in the integration suite of the crate that
-/// implements the Mongo store) to catch that.
-///
-/// `new_store` must return a **fresh, empty** store each call. Panics with a
-/// description of the first violated rule.
-pub mod conformance {
-    use super::*;
-    use std::sync::Arc;
-    use std::thread;
-
-    const IDP: &str = "https://idp.example.com";
-    const SP_A: &str = "https://sp-a.example.com";
-    const SP_B: &str = "https://sp-b.example.com";
-    const THREADS: usize = 16;
-
-    fn nid(value: &str, format: &str, sp: Option<&str>) -> NameId {
-        NameId {
-            value: value.to_string(),
-            format: Some(format.to_string()),
-            name_qualifier: Some(IDP.to_string()),
-            sp_name_qualifier: sp.map(str::to_string),
-            sp_provided_id: None,
-        }
-    }
-
-    fn persistent(value: &str, sp: &str) -> NameId {
-        nid(value, constants::NAMEID_PERSISTENT, Some(sp))
-    }
-
-    /// Run every check against stores produced by `new_store`.
-    pub fn run<S, F>(new_store: F)
-    where
-        S: IdentityStore + 'static,
-        F: Fn() -> S,
-    {
-        value_is_unique(&new_store());
-        lookups_round_trip_and_isolate_users(&new_store());
-        persistent_is_get_or_insert(&new_store());
-        persistent_insert_reports_a_taken_value(&new_store());
-        find_persistent_is_format_and_qualifier_exact(&new_store());
-        find_filters_on_every_field(&new_store());
-        replace_upserts_by_value(&new_store());
-        removal_is_scoped(&new_store());
-        concurrent_get_or_insert_converges_on_one_identifier(new_store());
-        concurrent_insert_of_one_value_has_one_winner(new_store());
-    }
-
-    fn value_is_unique<S: IdentityStore>(s: &S) {
-        let first = nid("v1", constants::NAMEID_EMAIL, Some(SP_A));
-        s.insert("alice", first.clone()).unwrap();
-        assert!(
-            matches!(
-                s.insert("bob", nid("v1", constants::NAMEID_EMAIL, Some(SP_B))),
-                Err(InsertError::ValueTaken)
-            ),
-            "a value already in use must be rejected, for any user"
-        );
-        assert_eq!(s.user_for("v1").unwrap().as_deref(), Some("alice"));
-        assert_eq!(
-            s.for_user("alice").unwrap(),
-            vec![first],
-            "loser must not overwrite"
-        );
-        assert!(s.for_user("bob").unwrap().is_empty());
-    }
-
-    fn lookups_round_trip_and_isolate_users<S: IdentityStore>(s: &S) {
-        s.insert("alice", nid("a1", constants::NAMEID_EMAIL, Some(SP_A)))
-            .unwrap();
-        s.insert("bob", nid("b1", constants::NAMEID_EMAIL, Some(SP_A)))
-            .unwrap();
-        assert_eq!(s.user_for("a1").unwrap().as_deref(), Some("alice"));
-        assert_eq!(s.user_for("b1").unwrap().as_deref(), Some("bob"));
-        assert_eq!(s.user_for("nobody").unwrap(), None);
-        assert_eq!(s.for_user("alice").unwrap().len(), 1);
-        assert_eq!(s.for_user("alice").unwrap()[0].value, "a1");
-        assert!(s.for_user("carol").unwrap().is_empty());
-    }
-
-    fn persistent_is_get_or_insert<S: IdentityStore>(s: &S) {
-        let first = s
-            .get_or_insert_persistent("alice", persistent("p1", SP_A))
-            .unwrap();
-        assert_eq!(first.value, "p1");
-        let again = s
-            .get_or_insert_persistent("alice", persistent("p2", SP_A))
-            .unwrap();
-        assert_eq!(
-            again.value, "p1",
-            "a second candidate for the same (user, SP) must return the existing one"
-        );
-        assert!(
-            s.user_for("p2").unwrap().is_none(),
-            "the losing candidate must not be stored"
-        );
-        let other_sp = s
-            .get_or_insert_persistent("alice", persistent("p3", SP_B))
-            .unwrap();
-        assert_eq!(
-            other_sp.value, "p3",
-            "a different SP gets its own identifier"
-        );
-        let other_user = s
-            .get_or_insert_persistent("bob", persistent("p4", SP_A))
-            .unwrap();
-        assert_eq!(other_user.value, "p4", "a different user gets their own");
-    }
-
-    fn persistent_insert_reports_a_taken_value<S: IdentityStore>(s: &S) {
-        s.insert("alice", nid("taken", constants::NAMEID_EMAIL, Some(SP_A)))
-            .unwrap();
-        assert!(
-            matches!(
-                s.get_or_insert_persistent("bob", persistent("taken", SP_A)),
-                Err(InsertError::ValueTaken)
-            ),
-            "no existing persistent record, but the value is taken by another user"
-        );
-        assert_eq!(s.user_for("taken").unwrap().as_deref(), Some("alice"));
-    }
-
-    fn find_persistent_is_format_and_qualifier_exact<S: IdentityStore>(s: &S) {
-        s.insert("alice", nid("e1", constants::NAMEID_EMAIL, Some(SP_A)))
-            .unwrap();
-        assert!(
-            s.find_persistent("alice", Some(SP_A), Some(IDP))
-                .unwrap()
-                .is_none(),
-            "a non-persistent record must never satisfy a persistent lookup"
-        );
-        s.get_or_insert_persistent("alice", persistent("p1", SP_A))
-            .unwrap();
-        assert_eq!(
-            s.find_persistent("alice", Some(SP_A), Some(IDP))
-                .unwrap()
-                .map(|n| n.value),
-            Some("p1".to_string())
-        );
-        assert!(s
-            .find_persistent("alice", Some(SP_B), Some(IDP))
-            .unwrap()
-            .is_none());
-        assert!(s
-            .find_persistent("alice", None, Some(IDP))
-            .unwrap()
-            .is_none());
-    }
-
-    fn find_filters_on_every_field<S: IdentityStore>(s: &S) {
-        let mut with_alias = nid("f1", constants::NAMEID_EMAIL, Some(SP_A));
-        with_alias.sp_provided_id = Some("alias".to_string());
-        s.insert("alice", with_alias).unwrap();
-        s.insert("alice", nid("f2", constants::NAMEID_EMAIL, Some(SP_B)))
-            .unwrap();
-        s.get_or_insert_persistent("alice", persistent("f3", SP_A))
-            .unwrap();
-        s.insert("bob", nid("f4", constants::NAMEID_EMAIL, Some(SP_A)))
-            .unwrap();
-
-        let values = |filter: NameIdFilter| -> Vec<String> {
-            let mut v: Vec<String> = s
-                .find("alice", &filter)
-                .unwrap()
-                .into_iter()
-                .map(|n| n.value)
-                .collect();
-            v.sort();
-            v
-        };
-        assert_eq!(
-            values(NameIdFilter::default()),
-            ["f1", "f2", "f3"],
-            "an empty filter matches every record of the user, and no one else's"
-        );
-        assert_eq!(
-            values(NameIdFilter {
-                format: Some(constants::NAMEID_EMAIL.to_string()),
-                ..Default::default()
-            }),
-            ["f1", "f2"],
-            "format filters"
-        );
-        assert_eq!(
-            values(NameIdFilter {
-                sp_name_qualifier: Some(SP_A.to_string()),
-                ..Default::default()
-            }),
-            ["f1", "f3"],
-            "sp_name_qualifier filters"
-        );
-        assert_eq!(
-            values(NameIdFilter {
-                name_qualifier: Some(IDP.to_string()),
-                ..Default::default()
-            }),
-            ["f1", "f2", "f3"],
-            "name_qualifier filters"
-        );
-        assert_eq!(
-            values(NameIdFilter {
-                sp_provided_id: Some("alias".to_string()),
-                ..Default::default()
-            }),
-            ["f1"],
-            "sp_provided_id filters, and a record without one does not match"
-        );
-        assert_eq!(
-            values(NameIdFilter {
-                format: Some(constants::NAMEID_EMAIL.to_string()),
-                sp_name_qualifier: Some(SP_A.to_string()),
-                ..Default::default()
-            }),
-            ["f1"],
-            "fields combine with AND"
-        );
-        assert!(values(NameIdFilter {
-            sp_name_qualifier: Some("https://nobody.example.com".to_string()),
-            ..Default::default()
-        })
-        .is_empty());
-    }
-
-    fn replace_upserts_by_value<S: IdentityStore>(s: &S) {
-        s.replace("alice", nid("r1", constants::NAMEID_EMAIL, Some(SP_A)))
-            .unwrap();
-        let mut updated = nid("r1", constants::NAMEID_EMAIL, Some(SP_A));
-        updated.sp_provided_id = Some("alias".to_string());
-        s.replace("alice", updated.clone()).unwrap();
-        assert_eq!(
-            s.for_user("alice").unwrap(),
-            vec![updated],
-            "replace must update in place, not add a second record for the value"
-        );
-        s.replace("bob", nid("r1", constants::NAMEID_EMAIL, Some(SP_A)))
-            .unwrap();
-        assert_eq!(
-            s.user_for("r1").unwrap().as_deref(),
-            Some("bob"),
-            "replace reassigns"
-        );
-        assert!(s.for_user("alice").unwrap().is_empty());
-    }
-
-    fn removal_is_scoped<S: IdentityStore>(s: &S) {
-        s.insert("alice", nid("x1", constants::NAMEID_EMAIL, Some(SP_A)))
-            .unwrap();
-        s.insert("alice", nid("x2", constants::NAMEID_EMAIL, Some(SP_B)))
-            .unwrap();
-        s.insert("bob", nid("x3", constants::NAMEID_EMAIL, Some(SP_A)))
-            .unwrap();
-        s.remove("x1").unwrap();
-        assert_eq!(s.user_for("x1").unwrap(), None);
-        assert_eq!(
-            s.for_user("alice").unwrap().len(),
-            1,
-            "remove drops one record only"
-        );
-        s.remove("no-such-value").unwrap(); // absent value is not an error
-        s.remove_all("alice").unwrap();
-        assert!(s.for_user("alice").unwrap().is_empty());
-        assert_eq!(
-            s.user_for("x2").unwrap(),
-            None,
-            "remove_all clears the value lookup too"
-        );
-        assert_eq!(
-            s.user_for("x3").unwrap().as_deref(),
-            Some("bob"),
-            "other users untouched"
-        );
-    }
-
-    fn concurrent_get_or_insert_converges_on_one_identifier<S>(store: S)
-    where
-        S: IdentityStore + 'static,
-    {
-        let store = Arc::new(store);
-        let handles: Vec<_> = (0..THREADS)
-            .map(|i| {
-                let store = Arc::clone(&store);
-                thread::spawn(move || {
-                    // Retry on ValueTaken exactly as IdentDb does.
-                    loop {
-                        let candidate = persistent(&format!("c{i}"), SP_A);
-                        match store.get_or_insert_persistent("alice", candidate) {
-                            Ok(winner) => return winner.value,
-                            Err(InsertError::ValueTaken) => continue,
-                            Err(e) => panic!("backend failure during conformance run: {e}"),
-                        }
-                    }
-                })
-            })
-            .collect();
-        let values: Vec<String> = handles.into_iter().map(|h| h.join().unwrap()).collect();
-        assert!(
-            values.iter().all(|v| v == &values[0]),
-            "concurrent first requests for one (user, SP) minted different \
-             persistent identifiers - the backend is missing its uniqueness \
-             constraint on (user, sp_name_qualifier, name_qualifier): {values:?}"
-        );
-        let stored = store
-            .for_user("alice")
-            .unwrap()
-            .into_iter()
-            .filter(|n| n.format.as_deref() == Some(constants::NAMEID_PERSISTENT))
-            .count();
-        assert_eq!(stored, 1, "exactly one persistent record must be stored");
-    }
-
-    fn concurrent_insert_of_one_value_has_one_winner<S>(store: S)
-    where
-        S: IdentityStore + 'static,
-    {
-        let store = Arc::new(store);
-        let handles: Vec<_> = (0..THREADS)
-            .map(|i| {
-                let store = Arc::clone(&store);
-                thread::spawn(move || {
-                    store
-                        .insert(
-                            &format!("user{i}"),
-                            nid("same", constants::NAMEID_EMAIL, Some(SP_A)),
-                        )
-                        .is_ok()
-                })
-            })
-            .collect();
-        let winners = handles
-            .into_iter()
-            .map(|h| h.join().unwrap())
-            .filter(|ok| *ok)
-            .count();
-        assert_eq!(
-            winners, 1,
-            "exactly one concurrent insert of a value may succeed - the \
-             backend is missing its uniqueness constraint on the NameID value"
-        );
-    }
-}
+pub mod conformance;
 
 #[cfg(test)]
 mod tests {
@@ -1357,6 +1012,90 @@ mod tests {
         let db = IdentDb::new(DownStore, IDP);
         let nid = db.transient_nameid("alice", Some(SP)).unwrap();
         assert_eq!(nid.format.as_deref(), Some(constants::NAMEID_TRANSIENT));
+    }
+
+    #[test]
+    fn check_returns_the_violation_instead_of_panicking() {
+        let err = conformance::check(|| BrokenStore {
+            no_value_uniqueness: true,
+            ..Default::default()
+        })
+        .unwrap_err();
+        assert_eq!(err.check, "value_is_unique");
+        assert!(
+            err.message
+                .contains("a value already in use must be rejected"),
+            "{err}"
+        );
+        // Displays as `check: message`, and is a std error.
+        assert!(err.to_string().starts_with("value_is_unique: "));
+        let _: &dyn std::error::Error = &err;
+    }
+
+    #[test]
+    fn every_listed_check_can_be_run_by_name() {
+        let options = conformance::Options::default();
+        for name in conformance::CHECKS {
+            conformance::check_one(name, InMemoryIdentityStore::new, &options)
+                .unwrap_or_else(|e| panic!("{e}"));
+        }
+        let err = conformance::check_one("no_such_check", InMemoryIdentityStore::new, &options)
+            .unwrap_err();
+        assert!(
+            err.message.contains("value_is_unique"),
+            "lists known checks: {err}"
+        );
+    }
+
+    #[test]
+    fn a_single_check_names_the_constraint_a_backend_is_missing() {
+        let options = conformance::Options::default();
+        let broken = || BrokenStore {
+            check_then_insert: true,
+            ..Default::default()
+        };
+        // Only the persistent-tuple check fails; the value-uniqueness one passes.
+        assert!(conformance::check_one("value_is_unique", broken, &options).is_ok());
+        let err = conformance::check_one(
+            "concurrent_get_or_insert_converges_on_one_identifier",
+            broken,
+            &options,
+        )
+        .unwrap_err();
+        assert!(err
+            .message
+            .contains("minted different persistent identifiers"));
+    }
+
+    #[test]
+    fn a_backend_failure_is_a_failed_check_not_a_panic_or_a_lost_race() {
+        let options = conformance::Options::default();
+        let err = conformance::check_one("value_is_unique", || DownStore, &options).unwrap_err();
+        assert!(
+            err.message.contains("backend call `insert` failed"),
+            "{err}"
+        );
+        // The concurrent check must not count an outage as "someone lost the
+        // race", which would make a dead backend look like it has one winner.
+        let err = conformance::check_one(
+            "concurrent_insert_of_one_value_has_one_winner",
+            || DownStore,
+            &options,
+        )
+        .unwrap_err();
+        assert!(
+            err.message.contains("backend call `insert` failed"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn the_concurrent_checks_honour_the_thread_count() {
+        let options = conformance::Options { threads: 2 };
+        conformance::check_with(InMemoryIdentityStore::new, &options).unwrap();
+        // A count below the minimum still races at least two workers.
+        let options = conformance::Options { threads: 0 };
+        conformance::check_with(InMemoryIdentityStore::new, &options).unwrap();
     }
 
     #[test]

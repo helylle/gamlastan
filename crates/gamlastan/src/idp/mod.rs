@@ -79,12 +79,13 @@
 //!     "https://idp.example.org/metadata",
 //!     "https://sp.example.org/metadata",
 //!     "alice",
-//! );
+//! )?;
 //!
 //! assert_eq!(
 //!     name_id.sp_name_qualifier.as_deref(),
 //!     Some("https://sp.example.org/metadata")
 //! );
+//! # Ok::<(), gamlastan::idp::StoreError>(())
 //! ```
 
 pub mod assertion_store;
@@ -99,8 +100,8 @@ pub use assertion_store::{AssertionStore, InMemoryAssertionStore};
 pub use authn_broker::{AuthnBroker, AuthnMethod};
 pub use eptid::Eptid;
 pub use ident::{
-    IdentDb, IdentError, IdentityStore, InMemoryIdentityStore, InMemoryKeyValueStore,
-    KeyValueStore, NameIdConstructor, ValueTaken,
+    IdentDb, IdentError, IdentityStore, InMemoryIdentityStore, InMemoryKeyValueStore, InsertError,
+    KeyValueStore, NameIdConstructor, StoreError,
 };
 pub use orchestrator::{
     check_request, create_authn_response, create_denial_response, AttributeRelease,

@@ -155,4 +155,9 @@ pub enum ProfileError {
 
     #[error("{0}")]
     Other(String),
+
+    /// An identity or assertion store backend failed. An operational fault,
+    /// not a protocol refusal: it must surface as an error, never as a denial.
+    #[error(transparent)]
+    Store(#[from] crate::idp::ident::StoreError),
 }

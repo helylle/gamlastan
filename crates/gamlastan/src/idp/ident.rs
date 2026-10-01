@@ -42,6 +42,41 @@ pub enum IdentError {
     /// The operation is not supported (e.g. NewEncryptedID).
     #[error("unsupported operation: {0}")]
     Unsupported(&'static str),
+
+    /// The storage backend failed. This is an operational fault, not a
+    /// refusal: callers must not turn it into a protocol denial.
+    #[error(transparent)]
+    Store(#[from] StoreError),
+}
+
+/// A storage backend failed (connection lost, timeout, query error, ...).
+///
+/// Distinct from a *conflict*: a NameID value that is already taken is an
+/// expected outcome of the uniqueness constraints and is reported as
+/// [`InsertError::ValueTaken`], which callers retry with a fresh value. A
+/// `StoreError` is never retried blindly; it means the store could not answer,
+/// and treating it as "not found" would, for example, mint a second
+/// "stable" persistent identifier for a user who already has one.
+#[derive(Debug, thiserror::Error)]
+#[error("store backend error: {0}")]
+pub struct StoreError(#[source] pub Box<dyn std::error::Error + Send + Sync>);
+
+impl StoreError {
+    /// Wrap a backend error.
+    pub fn new(source: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> Self {
+        StoreError(source.into())
+    }
+}
+
+/// Why an insert into an [`IdentityStore`] did not happen.
+#[derive(Debug, thiserror::Error)]
+pub enum InsertError {
+    /// The NameID value is already in use by another record.
+    #[error("NameID value already in use")]
+    ValueTaken,
+    /// The backend failed.
+    #[error(transparent)]
+    Store(#[from] StoreError),
 }
 
 /// Plain key/value backend.
@@ -51,11 +86,11 @@ pub enum IdentError {
 /// NameID storage needs stronger guarantees and uses [`IdentityStore`].
 pub trait KeyValueStore: Send + Sync {
     /// Fetch a value.
-    fn get(&self, key: &str) -> Option<String>;
+    fn get(&self, key: &str) -> Result<Option<String>, StoreError>;
     /// Store a value.
-    fn set(&self, key: &str, value: String);
+    fn set(&self, key: &str, value: String) -> Result<(), StoreError>;
     /// Remove a value.
-    fn remove(&self, key: &str);
+    fn remove(&self, key: &str) -> Result<(), StoreError>;
 }
 
 /// In-memory [`KeyValueStore`].
@@ -72,22 +107,20 @@ impl InMemoryKeyValueStore {
 }
 
 impl KeyValueStore for InMemoryKeyValueStore {
-    fn get(&self, key: &str) -> Option<String> {
-        self.map.lock().unwrap().get(key).cloned()
+    fn get(&self, key: &str) -> Result<Option<String>, StoreError> {
+        Ok(self.map.lock().unwrap().get(key).cloned())
     }
 
-    fn set(&self, key: &str, value: String) {
+    fn set(&self, key: &str, value: String) -> Result<(), StoreError> {
         self.map.lock().unwrap().insert(key.to_string(), value);
+        Ok(())
     }
 
-    fn remove(&self, key: &str) {
+    fn remove(&self, key: &str) -> Result<(), StoreError> {
         self.map.lock().unwrap().remove(key);
+        Ok(())
     }
 }
-
-/// A NameID value is already in use by another record.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ValueTaken;
 
 /// Pluggable backend for [`IdentDb`]: one record per (user, NameID)
 /// association.
@@ -109,12 +142,17 @@ pub struct ValueTaken;
 ///
 /// There are deliberately no default write methods: a non-atomic default
 /// would silently leave those races open on a multi-instance deployment.
+///
+/// Every method is fallible. A backend that cannot answer must return
+/// [`StoreError`], never an empty result: "no record" and "could not look"
+/// are different answers, and conflating them would mint a second persistent
+/// identifier for a user who already has one.
 pub trait IdentityStore: Send + Sync {
     /// Every NameID associated with `user_id`, in unspecified order.
-    fn for_user(&self, user_id: &str) -> Vec<NameId>;
+    fn for_user(&self, user_id: &str) -> Result<Vec<NameId>, StoreError>;
 
     /// The user a NameID value belongs to.
-    fn user_for(&self, value: &str) -> Option<String>;
+    fn user_for(&self, value: &str) -> Result<Option<String>, StoreError>;
 
     /// The user's persistent NameID for `(sp_name_qualifier,
     /// name_qualifier)`, if one exists. `None` for a qualifier means the
@@ -125,38 +163,39 @@ pub trait IdentityStore: Send + Sync {
         user_id: &str,
         sp_name_qualifier: Option<&str>,
         name_qualifier: Option<&str>,
-    ) -> Option<NameId> {
-        self.for_user(user_id)
+    ) -> Result<Option<NameId>, StoreError> {
+        Ok(self
+            .for_user(user_id)?
             .into_iter()
-            .find(|n| is_persistent_match(n, sp_name_qualifier, name_qualifier))
+            .find(|n| is_persistent_match(n, sp_name_qualifier, name_qualifier)))
     }
 
     /// Atomically return the user's existing persistent NameID with the same
     /// `(sp_name_qualifier, name_qualifier)` as `candidate`, or insert
-    /// `candidate` and return it. `Err(ValueTaken)` if the record would be
-    /// inserted but its value is already in use.
+    /// `candidate` and return it. `Err(InsertError::ValueTaken)` if the record
+    /// would be inserted but its value is already in use.
     fn get_or_insert_persistent(
         &self,
         user_id: &str,
         candidate: NameId,
-    ) -> Result<NameId, ValueTaken>;
+    ) -> Result<NameId, InsertError>;
 
-    /// Insert a freshly minted NameID. `Err(ValueTaken)` if any record
-    /// already has this value.
-    fn insert(&self, user_id: &str, name_id: NameId) -> Result<(), ValueTaken>;
+    /// Insert a freshly minted NameID. `Err(InsertError::ValueTaken)` if any
+    /// record already has this value.
+    fn insert(&self, user_id: &str, name_id: NameId) -> Result<(), InsertError>;
 
     /// Insert or overwrite the record with this value, assigning it to
     /// `user_id`. Used to update an existing association (e.g. a
     /// ManageNameID `NewID`). Callers must not use it to create a second
     /// persistent record for a `(user, sp_name_qualifier, name_qualifier)`
     /// that already has one.
-    fn replace(&self, user_id: &str, name_id: NameId);
+    fn replace(&self, user_id: &str, name_id: NameId) -> Result<(), StoreError>;
 
     /// Remove the record with this value, if any.
-    fn remove(&self, value: &str);
+    fn remove(&self, value: &str) -> Result<(), StoreError>;
 
     /// Remove every record belonging to `user_id`.
-    fn remove_all(&self, user_id: &str);
+    fn remove_all(&self, user_id: &str) -> Result<(), StoreError>;
 }
 
 /// Whether `nid` is a persistent NameID with exactly these qualifiers
@@ -187,28 +226,28 @@ impl InMemoryIdentityStore {
 }
 
 impl IdentityStore for InMemoryIdentityStore {
-    fn for_user(&self, user_id: &str) -> Vec<NameId> {
+    fn for_user(&self, user_id: &str) -> Result<Vec<NameId>, StoreError> {
         let records = self.records.lock().unwrap();
-        records
+        Ok(records
             .iter()
             .filter(|(user, _)| user == user_id)
             .map(|(_, nid)| nid.clone())
-            .collect()
+            .collect())
     }
 
-    fn user_for(&self, value: &str) -> Option<String> {
+    fn user_for(&self, value: &str) -> Result<Option<String>, StoreError> {
         let records = self.records.lock().unwrap();
-        records
+        Ok(records
             .iter()
             .find(|(_, nid)| nid.value == value)
-            .map(|(user, _)| user.clone())
+            .map(|(user, _)| user.clone()))
     }
 
     fn get_or_insert_persistent(
         &self,
         user_id: &str,
         candidate: NameId,
-    ) -> Result<NameId, ValueTaken> {
+    ) -> Result<NameId, InsertError> {
         let mut records = self.records.lock().unwrap();
         if let Some((_, existing)) = records.iter().find(|(user, nid)| {
             user == user_id
@@ -221,22 +260,22 @@ impl IdentityStore for InMemoryIdentityStore {
             return Ok(existing.clone());
         }
         if records.iter().any(|(_, nid)| nid.value == candidate.value) {
-            return Err(ValueTaken);
+            return Err(InsertError::ValueTaken);
         }
         records.push((user_id.to_string(), candidate.clone()));
         Ok(candidate)
     }
 
-    fn insert(&self, user_id: &str, name_id: NameId) -> Result<(), ValueTaken> {
+    fn insert(&self, user_id: &str, name_id: NameId) -> Result<(), InsertError> {
         let mut records = self.records.lock().unwrap();
         if records.iter().any(|(_, nid)| nid.value == name_id.value) {
-            return Err(ValueTaken);
+            return Err(InsertError::ValueTaken);
         }
         records.push((user_id.to_string(), name_id));
         Ok(())
     }
 
-    fn replace(&self, user_id: &str, name_id: NameId) {
+    fn replace(&self, user_id: &str, name_id: NameId) -> Result<(), StoreError> {
         let mut records = self.records.lock().unwrap();
         match records
             .iter_mut()
@@ -245,20 +284,23 @@ impl IdentityStore for InMemoryIdentityStore {
             Some(slot) => *slot = (user_id.to_string(), name_id),
             None => records.push((user_id.to_string(), name_id)),
         }
+        Ok(())
     }
 
-    fn remove(&self, value: &str) {
+    fn remove(&self, value: &str) -> Result<(), StoreError> {
         self.records
             .lock()
             .unwrap()
             .retain(|(_, nid)| nid.value != value);
+        Ok(())
     }
 
-    fn remove_all(&self, user_id: &str) {
+    fn remove_all(&self, user_id: &str) -> Result<(), StoreError> {
         self.records
             .lock()
             .unwrap()
             .retain(|(user, _)| user != user_id);
+        Ok(())
     }
 }
 
@@ -394,18 +436,18 @@ impl<S: IdentityStore> IdentDb<S> {
     }
 
     /// All NameIDs stored for a local user.
-    pub fn name_ids_for(&self, user_id: &str) -> Vec<NameId> {
+    pub fn name_ids_for(&self, user_id: &str) -> Result<Vec<NameId>, StoreError> {
         self.store.for_user(user_id)
     }
 
     /// Associate a NameID with a local user (pysaml2 `store()`), replacing
     /// any record that already has the same value.
-    pub fn store(&self, user_id: &str, name_id: &NameId) {
-        self.store.replace(user_id, name_id.clone());
+    pub fn store(&self, user_id: &str, name_id: &NameId) -> Result<(), StoreError> {
+        self.store.replace(user_id, name_id.clone())
     }
 
     /// The local user a NameID was issued to (pysaml2 `find_local_id()`).
-    pub fn find_local_id(&self, name_id: &NameId) -> Option<String> {
+    pub fn find_local_id(&self, name_id: &NameId) -> Result<Option<String>, StoreError> {
         self.store.user_for(&name_id.value)
     }
 
@@ -424,7 +466,7 @@ impl<S: IdentityStore> IdentDb<S> {
         user_id: &str,
         sp_name_qualifier: Option<&str>,
         name_qualifier: Option<&str>,
-    ) -> Option<NameId> {
+    ) -> Result<Option<NameId>, StoreError> {
         self.store
             .find_persistent(user_id, sp_name_qualifier, name_qualifier)
     }
@@ -433,13 +475,16 @@ impl<S: IdentityStore> IdentDb<S> {
     ///
     /// The free-check here is only an optimisation: the store's `insert` /
     /// `get_or_insert_persistent` enforce value uniqueness atomically, and a
-    /// collision that slips in between is retried by the caller.
+    /// collision that slips in between is retried by the caller. It is skipped
+    /// (`check_free = false`) for identifiers that are never stored, so issuing
+    /// one does not depend on the store being reachable.
     fn create_id(
         &self,
         format: &str,
         name_qualifier: Option<&str>,
         sp_name_qualifier: Option<&str>,
-    ) -> String {
+        check_free: bool,
+    ) -> Result<String, StoreError> {
         loop {
             let mut seed = [0u8; 32];
             rand::fill(&mut seed);
@@ -458,8 +503,8 @@ impl<S: IdentityStore> IdentDb<S> {
             } else {
                 id
             };
-            if self.store.user_for(&value).is_none() {
-                return value;
+            if !check_free || self.store.user_for(&value)?.is_none() {
+                return Ok(value);
             }
         }
     }
@@ -482,7 +527,7 @@ impl<S: IdentityStore> IdentDb<S> {
         format: &str,
         sp_name_qualifier: Option<&str>,
         name_qualifier: Option<&str>,
-    ) -> NameId {
+    ) -> Result<NameId, StoreError> {
         // Persistent identifiers must stay stable per (user, SP): reuse an
         // existing association instead of minting a new value (E78). The
         // read is the fast path for a returning user; the atomic
@@ -491,14 +536,15 @@ impl<S: IdentityStore> IdentDb<S> {
         if format == constants::NAMEID_PERSISTENT {
             if let Some(existing) =
                 self.store
-                    .find_persistent(user_id, sp_name_qualifier, name_qualifier)
+                    .find_persistent(user_id, sp_name_qualifier, name_qualifier)?
             {
-                return existing;
+                return Ok(existing);
             }
         }
 
+        let stored = format != constants::NAMEID_TRANSIENT;
         loop {
-            let value = self.create_id(format, name_qualifier, sp_name_qualifier);
+            let value = self.create_id(format, name_qualifier, sp_name_qualifier, stored)?;
             let name_id = NameId {
                 value,
                 format: Some(format.to_string()),
@@ -509,21 +555,28 @@ impl<S: IdentityStore> IdentDb<S> {
 
             if format == constants::NAMEID_PERSISTENT {
                 match self.store.get_or_insert_persistent(user_id, name_id) {
-                    Ok(winner) => return winner,
-                    Err(ValueTaken) => continue,
+                    Ok(winner) => return Ok(winner),
+                    Err(InsertError::ValueTaken) => continue,
+                    Err(InsertError::Store(e)) => return Err(e),
                 }
             }
-            if format == constants::NAMEID_TRANSIENT {
-                return name_id;
+            if !stored {
+                return Ok(name_id);
             }
-            if self.store.insert(user_id, name_id.clone()).is_ok() {
-                return name_id;
+            match self.store.insert(user_id, name_id.clone()) {
+                Ok(()) => return Ok(name_id),
+                Err(InsertError::ValueTaken) => continue,
+                Err(InsertError::Store(e)) => return Err(e),
             }
         }
     }
 
     /// Generate a transient NameID (pysaml2 `transient_nameid()`).
-    pub fn transient_nameid(&self, user_id: &str, sp_name_qualifier: Option<&str>) -> NameId {
+    pub fn transient_nameid(
+        &self,
+        user_id: &str,
+        sp_name_qualifier: Option<&str>,
+    ) -> Result<NameId, StoreError> {
         self.get_nameid(
             user_id,
             constants::NAMEID_TRANSIENT,
@@ -533,7 +586,11 @@ impl<S: IdentityStore> IdentDb<S> {
     }
 
     /// Get-or-create a persistent NameID (pysaml2 `persistent_nameid()`).
-    pub fn persistent_nameid(&self, user_id: &str, sp_name_qualifier: Option<&str>) -> NameId {
+    pub fn persistent_nameid(
+        &self,
+        user_id: &str,
+        sp_name_qualifier: Option<&str>,
+    ) -> Result<NameId, StoreError> {
         self.get_nameid(
             user_id,
             constants::NAMEID_PERSISTENT,
@@ -583,7 +640,7 @@ impl<S: IdentityStore> IdentDb<S> {
                 user_id,
                 Some(sp_name_qualifier),
                 Some(self.name_qualifier.as_str()),
-            );
+            )?;
             match existing {
                 Some(nid) => return Ok(nid),
                 None if !allow_create => return Err(IdentError::CreateNotAllowed),
@@ -596,17 +653,17 @@ impl<S: IdentityStore> IdentDb<S> {
             format,
             Some(sp_name_qualifier),
             Some(self.name_qualifier.as_str()),
-        ))
+        )?)
     }
 
     /// Forget a NameID (pysaml2 `remove_remote()`).
-    pub fn remove_remote(&self, name_id: &NameId) {
-        self.store.remove(&name_id.value);
+    pub fn remove_remote(&self, name_id: &NameId) -> Result<(), StoreError> {
+        self.store.remove(&name_id.value)
     }
 
     /// Forget every NameID for a local user (pysaml2 `remove_local()`).
-    pub fn remove_local(&self, user_id: &str) {
-        self.store.remove_all(user_id);
+    pub fn remove_local(&self, user_id: &str) -> Result<(), StoreError> {
+        self.store.remove_all(user_id)
     }
 
     /// Apply a ManageNameIDRequest to the database (pysaml2
@@ -621,7 +678,7 @@ impl<S: IdentityStore> IdentDb<S> {
         operation: &NewIdOrTerminate,
     ) -> Result<NameId, IdentError> {
         let user_id = self
-            .find_local_id(name_id)
+            .find_local_id(name_id)?
             .ok_or_else(|| IdentError::UnknownNameId(name_id.value.clone()))?;
 
         let mut updated = name_id.clone();
@@ -637,12 +694,12 @@ impl<S: IdentityStore> IdentDb<S> {
             }
             NewIdOrTerminate::Terminate => {
                 updated.sp_provided_id = None;
-                self.remove_remote(name_id);
+                self.remove_remote(name_id)?;
                 return Ok(updated);
             }
         }
 
-        self.store.replace(&user_id, updated.clone());
+        self.store.replace(&user_id, updated.clone())?;
         Ok(updated)
     }
 
@@ -657,12 +714,12 @@ impl<S: IdentityStore> IdentDb<S> {
         name_id_policy: &NameIdPolicy,
     ) -> Result<NameId, IdentError> {
         let user_id = self
-            .find_local_id(name_id)
+            .find_local_id(name_id)?
             .ok_or_else(|| IdentError::UnknownNameId(name_id.value.clone()))?;
 
         let wanted_format = name_id_policy.format.as_deref();
         let wanted_spq = name_id_policy.sp_name_qualifier.as_deref();
-        if let Some(existing) = self.name_ids_for(&user_id).into_iter().find(|nid| {
+        if let Some(existing) = self.name_ids_for(&user_id)?.into_iter().find(|nid| {
             (wanted_format.is_none() || nid.format.as_deref() == wanted_format)
                 && (wanted_spq.is_none() || nid.sp_name_qualifier.as_deref() == wanted_spq)
         }) {
@@ -679,7 +736,7 @@ impl<S: IdentityStore> IdentDb<S> {
             format,
             wanted_spq,
             Some(self.name_qualifier.as_str()),
-        ))
+        )?)
     }
 }
 
@@ -780,15 +837,21 @@ pub mod conformance {
 
     fn value_is_unique<S: IdentityStore>(s: &S) {
         let first = nid("v1", constants::NAMEID_EMAIL, Some(SP_A));
-        assert_eq!(s.insert("alice", first.clone()), Ok(()));
-        assert_eq!(
-            s.insert("bob", nid("v1", constants::NAMEID_EMAIL, Some(SP_B))),
-            Err(ValueTaken),
+        s.insert("alice", first.clone()).unwrap();
+        assert!(
+            matches!(
+                s.insert("bob", nid("v1", constants::NAMEID_EMAIL, Some(SP_B))),
+                Err(InsertError::ValueTaken)
+            ),
             "a value already in use must be rejected, for any user"
         );
-        assert_eq!(s.user_for("v1").as_deref(), Some("alice"));
-        assert_eq!(s.for_user("alice"), vec![first], "loser must not overwrite");
-        assert!(s.for_user("bob").is_empty());
+        assert_eq!(s.user_for("v1").unwrap().as_deref(), Some("alice"));
+        assert_eq!(
+            s.for_user("alice").unwrap(),
+            vec![first],
+            "loser must not overwrite"
+        );
+        assert!(s.for_user("bob").unwrap().is_empty());
     }
 
     fn lookups_round_trip_and_isolate_users<S: IdentityStore>(s: &S) {
@@ -796,12 +859,12 @@ pub mod conformance {
             .unwrap();
         s.insert("bob", nid("b1", constants::NAMEID_EMAIL, Some(SP_A)))
             .unwrap();
-        assert_eq!(s.user_for("a1").as_deref(), Some("alice"));
-        assert_eq!(s.user_for("b1").as_deref(), Some("bob"));
-        assert_eq!(s.user_for("nobody"), None);
-        assert_eq!(s.for_user("alice").len(), 1);
-        assert_eq!(s.for_user("alice")[0].value, "a1");
-        assert!(s.for_user("carol").is_empty());
+        assert_eq!(s.user_for("a1").unwrap().as_deref(), Some("alice"));
+        assert_eq!(s.user_for("b1").unwrap().as_deref(), Some("bob"));
+        assert_eq!(s.user_for("nobody").unwrap(), None);
+        assert_eq!(s.for_user("alice").unwrap().len(), 1);
+        assert_eq!(s.for_user("alice").unwrap()[0].value, "a1");
+        assert!(s.for_user("carol").unwrap().is_empty());
     }
 
     fn persistent_is_get_or_insert<S: IdentityStore>(s: &S) {
@@ -817,7 +880,7 @@ pub mod conformance {
             "a second candidate for the same (user, SP) must return the existing one"
         );
         assert!(
-            s.user_for("p2").is_none(),
+            s.user_for("p2").unwrap().is_none(),
             "the losing candidate must not be stored"
         );
         let other_sp = s
@@ -836,49 +899,62 @@ pub mod conformance {
     fn persistent_insert_reports_a_taken_value<S: IdentityStore>(s: &S) {
         s.insert("alice", nid("taken", constants::NAMEID_EMAIL, Some(SP_A)))
             .unwrap();
-        assert_eq!(
-            s.get_or_insert_persistent("bob", persistent("taken", SP_A)),
-            Err(ValueTaken),
+        assert!(
+            matches!(
+                s.get_or_insert_persistent("bob", persistent("taken", SP_A)),
+                Err(InsertError::ValueTaken)
+            ),
             "no existing persistent record, but the value is taken by another user"
         );
-        assert_eq!(s.user_for("taken").as_deref(), Some("alice"));
+        assert_eq!(s.user_for("taken").unwrap().as_deref(), Some("alice"));
     }
 
     fn find_persistent_is_format_and_qualifier_exact<S: IdentityStore>(s: &S) {
         s.insert("alice", nid("e1", constants::NAMEID_EMAIL, Some(SP_A)))
             .unwrap();
         assert!(
-            s.find_persistent("alice", Some(SP_A), Some(IDP)).is_none(),
+            s.find_persistent("alice", Some(SP_A), Some(IDP))
+                .unwrap()
+                .is_none(),
             "a non-persistent record must never satisfy a persistent lookup"
         );
         s.get_or_insert_persistent("alice", persistent("p1", SP_A))
             .unwrap();
         assert_eq!(
             s.find_persistent("alice", Some(SP_A), Some(IDP))
+                .unwrap()
                 .map(|n| n.value),
             Some("p1".to_string())
         );
-        assert!(s.find_persistent("alice", Some(SP_B), Some(IDP)).is_none());
-        assert!(s.find_persistent("alice", None, Some(IDP)).is_none());
+        assert!(s
+            .find_persistent("alice", Some(SP_B), Some(IDP))
+            .unwrap()
+            .is_none());
+        assert!(s
+            .find_persistent("alice", None, Some(IDP))
+            .unwrap()
+            .is_none());
     }
 
     fn replace_upserts_by_value<S: IdentityStore>(s: &S) {
-        s.replace("alice", nid("r1", constants::NAMEID_EMAIL, Some(SP_A)));
+        s.replace("alice", nid("r1", constants::NAMEID_EMAIL, Some(SP_A)))
+            .unwrap();
         let mut updated = nid("r1", constants::NAMEID_EMAIL, Some(SP_A));
         updated.sp_provided_id = Some("alias".to_string());
-        s.replace("alice", updated.clone());
+        s.replace("alice", updated.clone()).unwrap();
         assert_eq!(
-            s.for_user("alice"),
+            s.for_user("alice").unwrap(),
             vec![updated],
             "replace must update in place, not add a second record for the value"
         );
-        s.replace("bob", nid("r1", constants::NAMEID_EMAIL, Some(SP_A)));
+        s.replace("bob", nid("r1", constants::NAMEID_EMAIL, Some(SP_A)))
+            .unwrap();
         assert_eq!(
-            s.user_for("r1").as_deref(),
+            s.user_for("r1").unwrap().as_deref(),
             Some("bob"),
             "replace reassigns"
         );
-        assert!(s.for_user("alice").is_empty());
+        assert!(s.for_user("alice").unwrap().is_empty());
     }
 
     fn removal_is_scoped<S: IdentityStore>(s: &S) {
@@ -888,19 +964,23 @@ pub mod conformance {
             .unwrap();
         s.insert("bob", nid("x3", constants::NAMEID_EMAIL, Some(SP_A)))
             .unwrap();
-        s.remove("x1");
-        assert_eq!(s.user_for("x1"), None);
-        assert_eq!(s.for_user("alice").len(), 1, "remove drops one record only");
-        s.remove("no-such-value"); // must not panic
-        s.remove_all("alice");
-        assert!(s.for_user("alice").is_empty());
+        s.remove("x1").unwrap();
+        assert_eq!(s.user_for("x1").unwrap(), None);
         assert_eq!(
-            s.user_for("x2"),
+            s.for_user("alice").unwrap().len(),
+            1,
+            "remove drops one record only"
+        );
+        s.remove("no-such-value").unwrap(); // absent value is not an error
+        s.remove_all("alice").unwrap();
+        assert!(s.for_user("alice").unwrap().is_empty());
+        assert_eq!(
+            s.user_for("x2").unwrap(),
             None,
             "remove_all clears the value lookup too"
         );
         assert_eq!(
-            s.user_for("x3").as_deref(),
+            s.user_for("x3").unwrap().as_deref(),
             Some("bob"),
             "other users untouched"
         );
@@ -918,8 +998,10 @@ pub mod conformance {
                     // Retry on ValueTaken exactly as IdentDb does.
                     loop {
                         let candidate = persistent(&format!("c{i}"), SP_A);
-                        if let Ok(winner) = store.get_or_insert_persistent("alice", candidate) {
-                            return winner.value;
+                        match store.get_or_insert_persistent("alice", candidate) {
+                            Ok(winner) => return winner.value,
+                            Err(InsertError::ValueTaken) => continue,
+                            Err(e) => panic!("backend failure during conformance run: {e}"),
                         }
                     }
                 })
@@ -934,6 +1016,7 @@ pub mod conformance {
         );
         let stored = store
             .for_user("alice")
+            .unwrap()
             .into_iter()
             .filter(|n| n.format.as_deref() == Some(constants::NAMEID_PERSISTENT))
             .count();
@@ -997,17 +1080,17 @@ mod tests {
     }
 
     impl IdentityStore for BrokenStore {
-        fn for_user(&self, user_id: &str) -> Vec<NameId> {
+        fn for_user(&self, user_id: &str) -> Result<Vec<NameId>, StoreError> {
             self.inner.for_user(user_id)
         }
-        fn user_for(&self, value: &str) -> Option<String> {
+        fn user_for(&self, value: &str) -> Result<Option<String>, StoreError> {
             self.inner.user_for(value)
         }
         fn get_or_insert_persistent(
             &self,
             user_id: &str,
             candidate: NameId,
-        ) -> Result<NameId, ValueTaken> {
+        ) -> Result<NameId, InsertError> {
             if self.check_then_insert {
                 // Look, release, then write: what a backend without a unique
                 // index does. Widen the window so the race is certain.
@@ -1015,7 +1098,7 @@ mod tests {
                     user_id,
                     candidate.sp_name_qualifier.as_deref(),
                     candidate.name_qualifier.as_deref(),
-                ) {
+                )? {
                     return Ok(existing);
                 }
                 std::thread::sleep(std::time::Duration::from_millis(20));
@@ -1026,22 +1109,85 @@ mod tests {
             }
             self.inner.get_or_insert_persistent(user_id, candidate)
         }
-        fn insert(&self, user_id: &str, name_id: NameId) -> Result<(), ValueTaken> {
+        fn insert(&self, user_id: &str, name_id: NameId) -> Result<(), InsertError> {
             if self.no_value_uniqueness {
-                self.inner.replace(user_id, name_id);
+                self.inner.replace(user_id, name_id)?;
                 return Ok(());
             }
             self.inner.insert(user_id, name_id)
         }
-        fn replace(&self, user_id: &str, name_id: NameId) {
+        fn replace(&self, user_id: &str, name_id: NameId) -> Result<(), StoreError> {
             self.inner.replace(user_id, name_id)
         }
-        fn remove(&self, value: &str) {
+        fn remove(&self, value: &str) -> Result<(), StoreError> {
             self.inner.remove(value)
         }
-        fn remove_all(&self, user_id: &str) {
+        fn remove_all(&self, user_id: &str) -> Result<(), StoreError> {
             self.inner.remove_all(user_id)
         }
+    }
+
+    /// A backend that cannot answer: every operation fails. Models an outage.
+    struct DownStore;
+
+    fn down() -> StoreError {
+        StoreError::new("backend unreachable")
+    }
+
+    impl IdentityStore for DownStore {
+        fn for_user(&self, _: &str) -> Result<Vec<NameId>, StoreError> {
+            Err(down())
+        }
+        fn user_for(&self, _: &str) -> Result<Option<String>, StoreError> {
+            Err(down())
+        }
+        fn get_or_insert_persistent(&self, _: &str, _: NameId) -> Result<NameId, InsertError> {
+            Err(down().into())
+        }
+        fn insert(&self, _: &str, _: NameId) -> Result<(), InsertError> {
+            Err(down().into())
+        }
+        fn replace(&self, _: &str, _: NameId) -> Result<(), StoreError> {
+            Err(down())
+        }
+        fn remove(&self, _: &str) -> Result<(), StoreError> {
+            Err(down())
+        }
+        fn remove_all(&self, _: &str) -> Result<(), StoreError> {
+            Err(down())
+        }
+    }
+
+    #[test]
+    fn an_outage_is_an_error_not_a_missing_record() {
+        let db = IdentDb::new(DownStore, IDP);
+        // The lookup that decides "does this user already have a persistent
+        // identifier?" must fail, not answer "no" and let a second one be minted.
+        assert!(db.persistent_nameid("alice", Some(SP)).is_err());
+        assert!(db.match_local_id("alice", Some(SP), Some(IDP)).is_err());
+        assert!(db
+            .find_local_id(&NameId {
+                value: "v".into(),
+                format: None,
+                name_qualifier: None,
+                sp_name_qualifier: None,
+                sp_provided_id: None
+            })
+            .is_err());
+        assert!(db.name_ids_for("alice").is_err());
+        assert!(db.remove_local("alice").is_err());
+        assert!(matches!(
+            db.construct_nameid("alice", SP, None, Some(constants::NAMEID_PERSISTENT)),
+            Err(IdentError::Store(_))
+        ));
+    }
+
+    #[test]
+    fn issuing_a_transient_nameid_does_not_need_the_store() {
+        // Transients are never stored, so an outage must not block them.
+        let db = IdentDb::new(DownStore, IDP);
+        let nid = db.transient_nameid("alice", Some(SP)).unwrap();
+        assert_eq!(nid.format.as_deref(), Some(constants::NAMEID_TRANSIENT));
     }
 
     #[test]
@@ -1088,26 +1234,26 @@ mod tests {
             sp_provided_id: Some("sp alias".to_string()),
         };
 
-        db.store("alice", &nid);
+        db.store("alice", &nid).unwrap();
 
-        assert_eq!(db.name_ids_for("alice"), vec![nid.clone()]);
-        assert_eq!(db.find_local_id(&nid).as_deref(), Some("alice"));
+        assert_eq!(db.name_ids_for("alice").unwrap(), vec![nid.clone()]);
+        assert_eq!(db.find_local_id(&nid).unwrap().as_deref(), Some("alice"));
     }
 
     #[test]
     fn test_transient_unique_each_time() {
         let db = db();
-        let a = db.transient_nameid("alice", Some(SP));
-        let b = db.transient_nameid("alice", Some(SP));
+        let a = db.transient_nameid("alice", Some(SP)).unwrap();
+        let b = db.transient_nameid("alice", Some(SP)).unwrap();
         assert_ne!(a.value, b.value);
         assert_eq!(a.format.as_deref(), Some(constants::NAMEID_TRANSIENT));
         // Transient identifiers are one-time-use and not persisted, so they
         // must not be reverse-looked-up and must not accumulate in the store
         // (the default per-SP format is transient, so every response would
         // otherwise grow the identity store without bound).
-        assert_eq!(db.find_local_id(&a), None);
-        assert_eq!(db.find_local_id(&b), None);
-        assert!(db.name_ids_for("alice").is_empty());
+        assert_eq!(db.find_local_id(&a).unwrap(), None);
+        assert_eq!(db.find_local_id(&b).unwrap(), None);
+        assert!(db.name_ids_for("alice").unwrap().is_empty());
     }
 
     #[test]
@@ -1137,17 +1283,19 @@ mod tests {
         let unique = values.iter().collect::<std::collections::HashSet<_>>();
         assert_eq!(values.len(), unique.len());
         // ...and none of them accumulated in either index.
-        assert!(db.name_ids_for("alice").is_empty());
+        assert!(db.name_ids_for("alice").unwrap().is_empty());
     }
 
     #[test]
     fn test_persistent_is_stable() {
         let db = db();
-        let a = db.persistent_nameid("alice", Some(SP));
-        let b = db.persistent_nameid("alice", Some(SP));
+        let a = db.persistent_nameid("alice", Some(SP)).unwrap();
+        let b = db.persistent_nameid("alice", Some(SP)).unwrap();
         assert_eq!(a.value, b.value);
         // different SP gets a different persistent id
-        let c = db.persistent_nameid("alice", Some("https://other.example.com"));
+        let c = db
+            .persistent_nameid("alice", Some("https://other.example.com"))
+            .unwrap();
         assert_ne!(a.value, c.value);
     }
 
@@ -1197,7 +1345,9 @@ mod tests {
         // SP) pair. Sequential format requests against one shared store -
         // the realistic production shape, unlike a fresh store per format.
         let db = db();
-        let email = db.get_nameid("alice", constants::NAMEID_EMAIL, Some(SP), Some(IDP));
+        let email = db
+            .get_nameid("alice", constants::NAMEID_EMAIL, Some(SP), Some(IDP))
+            .unwrap();
         assert_eq!(email.format.as_deref(), Some(constants::NAMEID_EMAIL));
 
         let create = NameIdPolicy {
@@ -1263,7 +1413,7 @@ mod tests {
         let threads: Vec<_> = (0..16)
             .map(|_| {
                 let db = Arc::clone(&db);
-                thread::spawn(move || db.persistent_nameid("alice", Some(SP)))
+                thread::spawn(move || db.persistent_nameid("alice", Some(SP)).unwrap())
             })
             .collect();
 
@@ -1283,6 +1433,7 @@ mod tests {
         // per thread that lost the race.
         let persistent_entries: Vec<_> = db
             .name_ids_for("alice")
+            .unwrap()
             .into_iter()
             .filter(|nid| nid.format.as_deref() == Some(constants::NAMEID_PERSISTENT))
             .collect();
@@ -1311,7 +1462,7 @@ mod tests {
         for _ in 0..8 {
             let db = Arc::clone(&db);
             threads.push(thread::spawn(move || {
-                db.persistent_nameid("alice", Some(SP));
+                db.persistent_nameid("alice", Some(SP)).unwrap();
             }));
         }
         for i in 0..8 {
@@ -1322,14 +1473,15 @@ mod tests {
                     constants::NAMEID_EMAIL,
                     Some(&format!("{SP}/{i}")),
                     Some(IDP),
-                );
+                )
+                .unwrap();
             }));
         }
         for t in threads {
             t.join().unwrap();
         }
 
-        let entries = db.name_ids_for("alice");
+        let entries = db.name_ids_for("alice").unwrap();
         let persistent: Vec<_> = entries
             .iter()
             .filter(|nid| nid.format.as_deref() == Some(constants::NAMEID_PERSISTENT))
@@ -1369,11 +1521,11 @@ mod tests {
 
         for round in 0..20 {
             let db = Arc::new(db());
-            db.persistent_nameid("alice", Some(SP));
+            db.persistent_nameid("alice", Some(SP)).unwrap();
 
             let remover = {
                 let db = Arc::clone(&db);
-                thread::spawn(move || db.remove_local("alice"))
+                thread::spawn(move || db.remove_local("alice").unwrap())
             };
             let writers: Vec<_> = (0..4)
                 .map(|i| {
@@ -1385,6 +1537,7 @@ mod tests {
                             Some(&format!("{SP}/{round}/{i}")),
                             Some(IDP),
                         )
+                        .unwrap()
                     })
                 })
                 .collect();
@@ -1394,12 +1547,14 @@ mod tests {
 
             let present: Vec<String> = db
                 .name_ids_for("alice")
+                .unwrap()
                 .into_iter()
                 .map(|nid| nid.value)
                 .collect();
             for nid in &written {
                 let in_forward_list = present.contains(&nid.value);
-                let reverse_points_here = db.find_local_id(nid).as_deref() == Some("alice");
+                let reverse_points_here =
+                    db.find_local_id(nid).unwrap().as_deref() == Some("alice");
                 assert_eq!(
                     in_forward_list, reverse_points_here,
                     "round {round}: NameID {:?} must be either fully present (forward + \
@@ -1450,34 +1605,42 @@ mod tests {
     #[test]
     fn test_remove_remote_and_local() {
         let db = db();
-        let nid = db.persistent_nameid("alice", Some(SP));
-        db.remove_remote(&nid);
-        assert!(db.find_local_id(&nid).is_none());
-        assert!(db.name_ids_for("alice").is_empty());
+        let nid = db.persistent_nameid("alice", Some(SP)).unwrap();
+        db.remove_remote(&nid).unwrap();
+        assert!(db.find_local_id(&nid).unwrap().is_none());
+        assert!(db.name_ids_for("alice").unwrap().is_empty());
 
-        let n1 = db.persistent_nameid("alice", Some(SP));
-        let n2 = db.get_nameid("alice", constants::NAMEID_EMAIL, Some(SP), Some(IDP));
-        db.remove_local("alice");
-        assert!(db.find_local_id(&n1).is_none());
-        assert!(db.find_local_id(&n2).is_none());
+        let n1 = db.persistent_nameid("alice", Some(SP)).unwrap();
+        let n2 = db
+            .get_nameid("alice", constants::NAMEID_EMAIL, Some(SP), Some(IDP))
+            .unwrap();
+        db.remove_local("alice").unwrap();
+        assert!(db.find_local_id(&n1).unwrap().is_none());
+        assert!(db.find_local_id(&n2).unwrap().is_none());
     }
 
     #[test]
     fn test_manage_name_id_new_id_and_terminate() {
         let db = db();
-        let nid = db.persistent_nameid("alice", Some(SP));
+        let nid = db.persistent_nameid("alice", Some(SP)).unwrap();
 
         let updated = db
             .handle_manage_name_id_request(&nid, &NewIdOrTerminate::NewId("sp-alias".to_string()))
             .unwrap();
         assert_eq!(updated.sp_provided_id.as_deref(), Some("sp-alias"));
-        assert_eq!(db.find_local_id(&updated).as_deref(), Some("alice"));
-        let stored = db.match_local_id("alice", Some(SP), Some(IDP)).unwrap();
+        assert_eq!(
+            db.find_local_id(&updated).unwrap().as_deref(),
+            Some("alice")
+        );
+        let stored = db
+            .match_local_id("alice", Some(SP), Some(IDP))
+            .unwrap()
+            .unwrap();
         assert_eq!(stored.sp_provided_id.as_deref(), Some("sp-alias"));
 
         db.handle_manage_name_id_request(&updated, &NewIdOrTerminate::Terminate)
             .unwrap();
-        assert!(db.find_local_id(&updated).is_none());
+        assert!(db.find_local_id(&updated).unwrap().is_none());
     }
 
     #[test]
@@ -1499,7 +1662,7 @@ mod tests {
     #[test]
     fn test_name_id_mapping() {
         let db = db();
-        let nid = db.persistent_nameid("alice", Some(SP));
+        let nid = db.persistent_nameid("alice", Some(SP)).unwrap();
 
         // Map to another SP, creation allowed
         let policy = NameIdPolicy {
@@ -1533,7 +1696,9 @@ mod tests {
     #[test]
     fn test_email_format_uses_domain() {
         let db = IdentDb::in_memory(IDP).with_domain("example.org");
-        let nid = db.get_nameid("alice", constants::NAMEID_EMAIL, Some(SP), Some(IDP));
+        let nid = db
+            .get_nameid("alice", constants::NAMEID_EMAIL, Some(SP), Some(IDP))
+            .unwrap();
         assert!(nid.value.ends_with("@example.org"));
     }
 
@@ -1543,8 +1708,10 @@ mod tests {
         // final `local-part@domain` value, so the issued email NameID resolves
         // back to its local principal.
         let db = IdentDb::in_memory(IDP).with_domain("example.org");
-        let nid = db.get_nameid("alice", constants::NAMEID_EMAIL, Some(SP), Some(IDP));
+        let nid = db
+            .get_nameid("alice", constants::NAMEID_EMAIL, Some(SP), Some(IDP))
+            .unwrap();
         assert!(nid.value.contains('@'));
-        assert_eq!(db.find_local_id(&nid).as_deref(), Some("alice"));
+        assert_eq!(db.find_local_id(&nid).unwrap().as_deref(), Some("alice"));
     }
 }

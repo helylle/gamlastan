@@ -93,7 +93,13 @@ existing primitives into the profile flow, and move the semantics proven in
    `InMemoryIdentityStore` takes one lock per call; a Mongo/SQL-backed store
    must back the two constraints with real unique indexes (a partial unique
    index for the persistent tuple). The plain `get`/`set`/`remove` shape
-   remains as `KeyValueStore`, which `Eptid` uses.
+   remains as `KeyValueStore`, which `Eptid` uses. Every store method is
+   fallible (`StoreError`; `InsertError` for the two insert paths, which also
+   reports a `ValueTaken` conflict): a backend that cannot answer must not
+   return an empty result, because reading an outage as "no record" would mint
+   a second persistent identifier for a user who already has one. A store
+   failure surfaces from the orchestrator as `Err(ProfileError::Store)`, never
+   as a signed denial.
 
    The forward-list CAS alone was not sufficient: `store()` and
    `get_or_create_persistent()` wrote a NameID's reverse-index entry as a

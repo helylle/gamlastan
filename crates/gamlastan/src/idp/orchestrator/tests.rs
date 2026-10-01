@@ -16,7 +16,7 @@ use crate::core::protocol::request::AuthnContextComparison;
 use crate::crypto::keys::loader;
 use crate::crypto::{KeyUsage, KeysManager, SamlSigner};
 use crate::idp::authn_broker::AuthnBroker;
-use crate::idp::ident::{IdentDb, IdentityStore, ValueTaken};
+use crate::idp::ident::{IdentDb, IdentityStore, InsertError, StoreError};
 use crate::idp::orchestrator::release::PassThroughRelease;
 use crate::idp::orchestrator::{
     check_request, create_authn_response, AuthnMethodRef, Disposition, EstablishedSession,
@@ -1036,29 +1036,29 @@ fn subject_id_req_reads_the_full_metadata_attribute_name() {
 struct CustomStore(crate::idp::ident::InMemoryIdentityStore);
 
 impl IdentityStore for CustomStore {
-    fn for_user(&self, user_id: &str) -> Vec<NameId> {
+    fn for_user(&self, user_id: &str) -> Result<Vec<NameId>, StoreError> {
         self.0.for_user(user_id)
     }
-    fn user_for(&self, value: &str) -> Option<String> {
+    fn user_for(&self, value: &str) -> Result<Option<String>, StoreError> {
         self.0.user_for(value)
     }
     fn get_or_insert_persistent(
         &self,
         user_id: &str,
         candidate: NameId,
-    ) -> Result<NameId, ValueTaken> {
+    ) -> Result<NameId, InsertError> {
         self.0.get_or_insert_persistent(user_id, candidate)
     }
-    fn insert(&self, user_id: &str, name_id: NameId) -> Result<(), ValueTaken> {
+    fn insert(&self, user_id: &str, name_id: NameId) -> Result<(), InsertError> {
         self.0.insert(user_id, name_id)
     }
-    fn replace(&self, user_id: &str, name_id: NameId) {
+    fn replace(&self, user_id: &str, name_id: NameId) -> Result<(), StoreError> {
         self.0.replace(user_id, name_id)
     }
-    fn remove(&self, value: &str) {
+    fn remove(&self, value: &str) -> Result<(), StoreError> {
         self.0.remove(value)
     }
-    fn remove_all(&self, user_id: &str) {
+    fn remove_all(&self, user_id: &str) -> Result<(), StoreError> {
         self.0.remove_all(user_id)
     }
 }
@@ -1082,6 +1082,143 @@ fn response_engine_accepts_a_non_default_identity_store() {
     let p = params(processed(false, false, vec![], None));
     let outcome = create_authn_response(&engine, &p, &subject_without_mail()).unwrap();
     assert!(matches!(outcome, ResponseOutcome::Issued(_)));
+}
+
+// ── Store outages ───────────────────────────────────────────────────────────
+
+fn outage() -> StoreError {
+    StoreError::new("backend unreachable")
+}
+
+/// An identity store that is down: every operation fails.
+struct DownIdentityStore;
+
+impl IdentityStore for DownIdentityStore {
+    fn for_user(&self, _: &str) -> Result<Vec<NameId>, StoreError> {
+        Err(outage())
+    }
+    fn user_for(&self, _: &str) -> Result<Option<String>, StoreError> {
+        Err(outage())
+    }
+    fn get_or_insert_persistent(&self, _: &str, _: NameId) -> Result<NameId, InsertError> {
+        Err(outage().into())
+    }
+    fn insert(&self, _: &str, _: NameId) -> Result<(), InsertError> {
+        Err(outage().into())
+    }
+    fn replace(&self, _: &str, _: NameId) -> Result<(), StoreError> {
+        Err(outage())
+    }
+    fn remove(&self, _: &str) -> Result<(), StoreError> {
+        Err(outage())
+    }
+    fn remove_all(&self, _: &str) -> Result<(), StoreError> {
+        Err(outage())
+    }
+}
+
+/// An assertion store that is down: every operation fails.
+struct DownAssertionStore;
+
+impl crate::idp::assertion_store::AssertionStore for DownAssertionStore {
+    fn store_assertion(
+        &self,
+        _: crate::core::assertion::types::Assertion,
+    ) -> Result<(), StoreError> {
+        Err(outage())
+    }
+    fn get_assertion(
+        &self,
+        _: &str,
+    ) -> Result<Option<crate::core::assertion::types::Assertion>, StoreError> {
+        Err(outage())
+    }
+    fn assertions_for_subject(
+        &self,
+        _: &str,
+    ) -> Result<Vec<crate::core::assertion::types::Assertion>, StoreError> {
+        Err(outage())
+    }
+    fn remove_assertion(&self, _: &str) -> Result<(), StoreError> {
+        Err(outage())
+    }
+}
+
+#[test]
+fn identity_store_outage_is_an_error_not_a_denial() {
+    let idents = IdentDb::new(DownIdentityStore, IDP);
+    let broker = broker();
+    let decisions = ReleasePolicy::new();
+    let engine = ResponseEngine {
+        idp_entity_id: IDP,
+        decisions: &decisions,
+        release: &decisions,
+        idents: &idents,
+        broker: &broker,
+        assertions: None,
+        signer: &SamlSigner::new(KeysManager::new()),
+        cert_der_b64: "",
+    };
+
+    // A persistent NameID needs a store lookup. The outage must not look like
+    // "no existing identifier" (which would mint a second one) and must not be
+    // blamed on the SP with a signed denial: it is an operational fault.
+    let p = params(processed_with_name_id_policy(
+        Some(constants::NAMEID_PERSISTENT),
+        None,
+        true,
+    ));
+    let result = create_authn_response(&engine, &p, &subject_without_mail());
+    assert!(
+        matches!(result, Err(crate::profiles::error::ProfileError::Store(_))),
+        "expected a store error, got {result:?}"
+    );
+}
+
+#[test]
+fn transient_issuance_survives_an_identity_store_outage() {
+    // Transient identifiers are never stored, so they do not depend on the
+    // store being reachable.
+    let idents = IdentDb::new(DownIdentityStore, IDP);
+    let broker = broker();
+    let decisions = ReleasePolicy::new(); // default format: transient
+    let engine = ResponseEngine {
+        idp_entity_id: IDP,
+        decisions: &decisions,
+        release: &decisions,
+        idents: &idents,
+        broker: &broker,
+        assertions: None,
+        signer: &SamlSigner::new(KeysManager::new()),
+        cert_der_b64: "",
+    };
+    let p = params(processed(false, false, vec![], None));
+    let outcome = create_authn_response(&engine, &p, &subject_without_mail()).unwrap();
+    assert!(matches!(outcome, ResponseOutcome::Issued(_)));
+}
+
+#[test]
+fn assertion_store_outage_is_an_error_not_a_silent_skip() {
+    let idents = IdentDb::in_memory(IDP);
+    let broker = broker();
+    let decisions = ReleasePolicy::new();
+    let assertions = DownAssertionStore;
+    let engine = ResponseEngine {
+        idp_entity_id: IDP,
+        decisions: &decisions,
+        release: &decisions,
+        idents: &idents,
+        broker: &broker,
+        assertions: Some(&assertions),
+        signer: &SamlSigner::new(KeysManager::new()),
+        cert_der_b64: "",
+    };
+    let p = params(processed(false, false, vec![], None));
+    let result = create_authn_response(&engine, &p, &subject_without_mail());
+    assert!(
+        matches!(result, Err(crate::profiles::error::ProfileError::Store(_))),
+        "an assertion that could not be recorded must not be reported as issued: {result:?}"
+    );
 }
 
 // ── NameID construction through create_authn_response ──────────────────────

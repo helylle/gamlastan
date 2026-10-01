@@ -16,7 +16,8 @@ where needed to correct protocol handling.
   RequestedAuthnContext decision matrix), `create_authn_response` /
   `create_denial_response`, the pluggable `AttributeRelease` seam
   (`ReleasePolicy`, `PassThroughRelease`, `ChainedRelease`), and a closed
-  `Denial` enum with a fixed SAML `Status` mapping. Denials are always signed
+  `Denial` enum with a fixed SAML `Status` mapping, including `AuthnFailed` and
+  `Cancelled` for a failed or user-cancelled login. Denials are always signed
   unconditionally. `example-idp` is rewritten onto this engine, replacing its
   hand-rolled response-assembly and NameID/authn-context negotiation code.
   With no `RequestedAuthnContext`, any session/method is accepted regardless
@@ -165,6 +166,19 @@ where needed to correct protocol handling.
   (`InMemoryKeyValueStore`), which `Eptid` uses. `IdentityStore` has no
   implementors outside this crate yet, so this is a design decision, not a
   disruption.
+- **Breaking:** the store traits are fallible. `IdentityStore`, `KeyValueStore`
+  and `AssertionStore` methods return `Result<_, StoreError>` (the two insert
+  paths return `InsertError`, which separates a `ValueTaken` conflict from a
+  backend failure), and `IdentDb`, `Eptid`, `get_authn_statements`,
+  `create_assertion_id_request_response` and `create_authn_query_response`
+  propagate it. A backend that cannot answer must return an error, never an
+  empty result: reading an outage as "no record" would mint a second "stable"
+  persistent NameID for a user who already has one, and make `Eptid` recompute
+  a value that may differ from the one already issued. In `idp::orchestrator`
+  a store failure is `Err(ProfileError::Store)`, not a signed denial, since the
+  SP did not cause it. Transient NameIDs no longer consult the store at all, so
+  issuing one does not depend on it being reachable. `IdentError` gains a
+  `Store` variant. No implementors exist outside this crate yet.
 - `idp::orchestrator`'s NameIDPolicy handling only honours
   `NameIDPolicy/@SPNameQualifier` when it equals the requester's own
   (verified) entity ID. Per saml-core-2.0-os 8.3.7, SPNameQualifier may

@@ -1969,17 +1969,26 @@ mod tests {
     struct CustomStore(gamlastan::idp::ident::InMemoryIdentityStore);
 
     impl gamlastan::idp::ident::IdentityStore for CustomStore {
-        fn for_user(&self, user_id: &str) -> Vec<gamlastan::core::assertion::name_id::NameId> {
+        fn for_user(
+            &self,
+            user_id: &str,
+        ) -> Result<
+            Vec<gamlastan::core::assertion::name_id::NameId>,
+            gamlastan::idp::ident::StoreError,
+        > {
             self.0.for_user(user_id)
         }
-        fn user_for(&self, value: &str) -> Option<String> {
+        fn user_for(
+            &self,
+            value: &str,
+        ) -> Result<Option<String>, gamlastan::idp::ident::StoreError> {
             self.0.user_for(value)
         }
         fn get_or_insert_persistent(
             &self,
             user_id: &str,
             candidate: gamlastan::core::assertion::name_id::NameId,
-        ) -> Result<gamlastan::core::assertion::name_id::NameId, gamlastan::idp::ident::ValueTaken>
+        ) -> Result<gamlastan::core::assertion::name_id::NameId, gamlastan::idp::ident::InsertError>
         {
             self.0.get_or_insert_persistent(user_id, candidate)
         }
@@ -1987,16 +1996,20 @@ mod tests {
             &self,
             user_id: &str,
             name_id: gamlastan::core::assertion::name_id::NameId,
-        ) -> Result<(), gamlastan::idp::ident::ValueTaken> {
+        ) -> Result<(), gamlastan::idp::ident::InsertError> {
             self.0.insert(user_id, name_id)
         }
-        fn replace(&self, user_id: &str, name_id: gamlastan::core::assertion::name_id::NameId) {
+        fn replace(
+            &self,
+            user_id: &str,
+            name_id: gamlastan::core::assertion::name_id::NameId,
+        ) -> Result<(), gamlastan::idp::ident::StoreError> {
             self.0.replace(user_id, name_id)
         }
-        fn remove(&self, value: &str) {
+        fn remove(&self, value: &str) -> Result<(), gamlastan::idp::ident::StoreError> {
             self.0.remove(value)
         }
-        fn remove_all(&self, user_id: &str) {
+        fn remove_all(&self, user_id: &str) -> Result<(), gamlastan::idp::ident::StoreError> {
             self.0.remove_all(user_id)
         }
     }

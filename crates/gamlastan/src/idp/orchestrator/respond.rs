@@ -284,7 +284,10 @@ pub fn create_authn_response(
     //    IdP's default format. A NameID refusal is a protocol denial.
     let name_id = match construct_name_id(engine, params, subject) {
         Ok(name_id) => name_id,
-        Err(denial) => return denied(engine, params, &denial),
+        Err(NameIdFailure::Denied(denial)) => return denied(engine, params, &denial),
+        // A backend failure is an operational fault, not something the SP
+        // caused: surface it as an error rather than a signed denial.
+        Err(NameIdFailure::Fault(e)) => return Err(e),
     };
 
     // 5. Resolve the authn context from the subject's method, and verify it
@@ -372,7 +375,7 @@ pub fn create_authn_response(
     // 8. Store the assertion for back-channel queries, if a store is present.
     if let Some(store) = engine.assertions {
         if let Some(assertion) = response.assertions.first() {
-            store.store_assertion(assertion.clone());
+            store.store_assertion(assertion.clone())?;
         }
     }
 
@@ -457,13 +460,22 @@ fn denied(
     })
 }
 
+/// Why NameID construction did not produce a NameID.
+enum NameIdFailure {
+    /// The request asked for something the IdP refuses: a protocol denial.
+    Denied(Denial),
+    /// The identity store failed: an operational fault, not a denial.
+    Fault(ProfileError),
+}
+
 /// Construct the NameID for the subject, honouring the request's NameIDPolicy
-/// and the IdP's default format. Maps `IdentError` to the appropriate denial.
+/// and the IdP's default format. Maps `IdentError` to the appropriate denial,
+/// except a store failure, which stays an error.
 fn construct_name_id(
     engine: &ResponseEngine,
     params: &ResponseParams,
     subject: &AuthenticatedSubject,
-) -> Result<NameId, Denial> {
+) -> Result<NameId, NameIdFailure> {
     let policy = params.name_id_policy();
 
     // Per saml-core-2.0-os 8.3.7, SPNameQualifier names "the service
@@ -479,7 +491,7 @@ fn construct_name_id(
     // requester's own (verified) entity ID.
     if let Some(spq) = policy.as_ref().and_then(|p| p.sp_name_qualifier.as_deref()) {
         if spq != params.processed.sp_entity_id {
-            return Err(Denial::InvalidNameIdPolicy);
+            return Err(NameIdFailure::Denied(Denial::InvalidNameIdPolicy));
         }
     }
 
@@ -502,7 +514,10 @@ fn construct_name_id(
             Some(default_format.as_str()),
         )
         .map_err(|e| match e {
-            crate::idp::ident::IdentError::CreateNotAllowed => Denial::NameIdCreationNotAllowed,
-            _ => Denial::InvalidNameIdPolicy,
+            crate::idp::ident::IdentError::CreateNotAllowed => {
+                NameIdFailure::Denied(Denial::NameIdCreationNotAllowed)
+            }
+            crate::idp::ident::IdentError::Store(e) => NameIdFailure::Fault(e.into()),
+            _ => NameIdFailure::Denied(Denial::InvalidNameIdPolicy),
         })
 }

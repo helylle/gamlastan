@@ -86,15 +86,13 @@ where needed to correct protocol handling.
   no `IdpSigningContext`) produced signed responses while metadata
   advertised no key at all - or a *different* key, if `IdpSigningContext`
   also happened to be registered with its own certificate.
-- Added `IdentDb::with_persist_transient` (default off). Transient NameIDs are
-  one-time-use and the default per-SP format is transient, so by default they
-  are minted without being stored; the cost is that `find_local_id` cannot
-  resolve one, which a back-channel (SOAP) LogoutRequest carrying a transient
-  NameID needs in order to find the user. Opting in stores each transient
-  NameID so it resolves. The record trait has no expiry, so the backend must
-  expire them (a TTL index, a periodic purge); issuing a transient NameID then
-  needs the store to be reachable. A stored transient is still never reused by
-  a NameIDMapping request.
+- Added `IdentDb::with_persist_transient` (default off; see "Changed" for why
+  transient NameIDs are no longer stored by default). Opting in stores each
+  transient NameID so `find_local_id` resolves it, which a back-channel (SOAP)
+  LogoutRequest carrying one needs. The record trait has no expiry, so the
+  backend must expire them (a TTL index, a periodic purge); issuing a
+  transient NameID then needs the store to be reachable. A stored transient is
+  still never reused by a NameIDMapping request.
 - Added `IdentityStore::find` and `IdentDb::find_nameid` (pysaml2
   `find_nameid`): the NameIDs of a user matching a `NameIdFilter` on format,
   `SPNameQualifier`, `NameQualifier` and `SPProvidedID`, where an unset field
@@ -180,6 +178,48 @@ where needed to correct protocol handling.
   never invoked for it) — previously the handler bypassed `check_request`
   entirely, so a callback could redirect to a login form for `IsPassive` or
   reuse a session `ForceAuthn` should have defeated.
+- **Breaking:** `IdentityStore` is now a record-shaped backend: one record per
+  (user, NameID) association (`for_user`, `user_for`, `find_persistent`,
+  `get_or_insert_persistent`, `insert`, `replace`, `remove`, `remove_all`).
+  In 0.9.x it was a plain `get`/`set`/`remove` trait; that shape is now
+  `KeyValueStore` (`InMemoryKeyValueStore`), which `Eptid` uses.
+  `IdentDb`'s atomicity comes from two uniqueness constraints the backend
+  enforces - the NameID value is unique across all records, and among
+  persistent records `(user, sp_name_qualifier, name_qualifier)` is unique -
+  so two concurrent first requests for the same (user, SP) converge on one
+  persistent identifier instead of minting different ones, and a removal
+  cannot orphan a reverse mapping because there is no separate reverse key.
+  The constraints live in the store, so the trait has no default write
+  methods (a non-atomic default would silently leave the race open on a
+  multi-instance deployment) and `ident::conformance::run` is provided to
+  check that a backend honours them. `InMemoryIdentityStore` takes one lock
+  per call; a Mongo/SQL-backed store must back the two constraints with real
+  unique indexes (a partial unique index for the persistent tuple).
+  Migration: an external implementor of the 0.9.x trait (pygamlastan's
+  `PyIdentityStore` is one) implements `KeyValueStore` for the `Eptid` cache
+  and the new `IdentityStore` for `IdentDb`; code still implementing the old
+  three methods as `IdentityStore` fails to compile rather than misbehaving.
+- **Breaking:** the store traits are fallible. `IdentityStore`, `KeyValueStore`
+  and `AssertionStore` methods return `Result<_, StoreError>` (the two insert
+  paths return `InsertError`, which separates a `ValueTaken` conflict from a
+  backend failure), and `IdentDb`, `Eptid`, `get_authn_statements`,
+  `create_assertion_id_request_response` and `create_authn_query_response`
+  propagate it. A backend that cannot answer must return an error, never an
+  empty result: reading an outage as "no record" would mint a second "stable"
+  persistent NameID for a user who already has one, and make `Eptid` recompute
+  a value that may differ from the one already issued. In `idp::orchestrator`
+  a store failure is `Err(ProfileError::Store)`, not a signed denial, since the
+  SP did not cause it. `IdentError` gains a `Store` variant.
+- **Behaviour change:** `IdentDb` no longer stores transient NameIDs by
+  default. 0.9.x stored every non-persistent NameID, transient ones included;
+  they are one-time-use (SAML Core §8.3.7) and the default per-SP format is
+  transient, so every response added a record that was never read back and the
+  store grew without bound. As a result `find_local_id` on a transient NameID
+  now finds nothing, which matters to a back-channel (SOAP) LogoutRequest that
+  carries one; such a deployment opts in with
+  `IdentDb::with_persist_transient`. Issuing a transient NameID no longer
+  consults the store at all, so it does not depend on the store being
+  reachable.
 
 ### Fixed
 
@@ -199,38 +239,11 @@ where needed to correct protocol handling.
   own `AuthnBroker` has the same broadening; gamlastan diverges from it
   here). Added `AuthnBroker::allow_exact_level_matching` to opt back into the
   looser, pysaml2-compatible behavior.
-- **Breaking:** `IdentityStore` is now a record-shaped backend: one record per
-  (user, NameID) association (`for_user`, `user_for`, `find_persistent`,
-  `get_or_insert_persistent`, `insert`, `replace`, `remove`, `remove_all`).
-  `IdentDb`'s atomicity comes from two uniqueness constraints the backend
-  enforces - the NameID value is unique across all records, and among
-  persistent records `(user, sp_name_qualifier, name_qualifier)` is unique -
-  so two concurrent first requests for the same (user, SP) converge on one
-  persistent identifier instead of minting different ones, and a removal
-  cannot orphan a reverse mapping because there is no separate reverse key.
-  The constraints live in the store, so the trait has no default write
-  methods (a non-atomic default would silently leave the race open on a
-  multi-instance deployment) and `ident::conformance::run` is provided to
-  check that a backend honours them. `InMemoryIdentityStore` takes one lock
-  per call; a Mongo/SQL-backed store must back the two constraints with real
-  unique indexes (a partial unique index for the persistent tuple). The plain
-  `get`/`set`/`remove` shape is kept as `KeyValueStore`
-  (`InMemoryKeyValueStore`), which `Eptid` uses. `IdentityStore` has no
-  implementors outside this crate yet, so this is a design decision, not a
-  disruption.
-- **Breaking:** the store traits are fallible. `IdentityStore`, `KeyValueStore`
-  and `AssertionStore` methods return `Result<_, StoreError>` (the two insert
-  paths return `InsertError`, which separates a `ValueTaken` conflict from a
-  backend failure), and `IdentDb`, `Eptid`, `get_authn_statements`,
-  `create_assertion_id_request_response` and `create_authn_query_response`
-  propagate it. A backend that cannot answer must return an error, never an
-  empty result: reading an outage as "no record" would mint a second "stable"
-  persistent NameID for a user who already has one, and make `Eptid` recompute
-  a value that may differ from the one already issued. In `idp::orchestrator`
-  a store failure is `Err(ProfileError::Store)`, not a signed denial, since the
-  SP did not cause it. Transient NameIDs no longer consult the store at all, so
-  issuing one does not depend on it being reachable. `IdentError` gains a
-  `Store` variant. No implementors exist outside this crate yet.
+- Closed a check-then-create race on persistent NameID minting: two concurrent
+  first requests for the same (user, SP) could each find no existing
+  association and mint two different "stable" persistent identifiers. The
+  store's `get_or_insert_persistent` is now atomic, backed by the uniqueness
+  constraints described under "Changed".
 - `idp::orchestrator`'s NameIDPolicy handling only honours
   `NameIDPolicy/@SPNameQualifier` when it equals the requester's own
   (verified) entity ID. Per saml-core-2.0-os 8.3.7, SPNameQualifier may

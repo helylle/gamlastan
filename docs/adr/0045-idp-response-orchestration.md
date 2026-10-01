@@ -59,7 +59,7 @@ existing primitives into the profile flow, and move the semantics proven in
    | NameID construction / lookup | `IdentDb` (+ `Eptid`) behind `IdentityStore` | Injected store, fixed mechanics |
    | RequestedAuthnContext match | `AuthnBroker` | Injected broker, fixed comparison semantics |
    | Request-constraint handling | `IsPassive`, `ForceAuthn`, requested NameID format, session expiry | Fixed (`check_request`) |
-   | Assemble + sign | `ResponseOptions` -> `create_signed_response` (ADR 0033) | Fixed |
+   | Assemble + sign | `ResponseOptions` -> `create_signed_response` (ADR 0033) | Fixed; algorithms from the per-SP `SigningPreference` |
    | Record for back-channel queries | `AssertionStore` | Injected store |
 
    `RequestedAuthnContext` matching for `Comparison="exact"` is a literal
@@ -101,18 +101,17 @@ existing primitives into the profile flow, and move the semantics proven in
    failure surfaces from the orchestrator as `Err(ProfileError::Store)`, never
    as a signed denial.
 
-   The forward-list CAS alone was not sufficient: `store()` and
-   `get_or_create_persistent()` wrote a NameID's reverse-index entry as a
-   separate operation *after* committing it to the forward list, so a
-   `remove_local` landing in that window could see the entry already
-   forward-listed, find no reverse key yet (removing an absent key is a
-   no-op), and finish before the late reverse-key write landed -
-   permanently orphaning it, surviving an explicit "forget this user" call.
-   Both now write the reverse key before attempting the forward commit
-   (reusing the same candidate across `get_or_create_persistent`'s retries,
-   rolling its reverse key back only if a retry finds an existing match
-   instead), so a forward-list-visible entry always already has a working
-   reverse key.
+   Transient NameIDs are one-time-use (SAML Core §8.3.7) and the default
+   per-SP format is transient, so by default `IdentDb` mints them without
+   storing them: storing every one would add a record per response that is
+   never read back. The consequence is that `find_local_id` cannot resolve a
+   transient NameID, which a back-channel (SOAP) LogoutRequest carrying one
+   needs in order to find the user. A deployment that needs that opts in with
+   `IdentDb::with_persist_transient`. The record trait has no expiry, so such
+   a backend must expire the records itself (a TTL index, a periodic purge),
+   and issuing a transient NameID then needs the store to be reachable. A
+   stored transient is still never handed out again, e.g. by a NameIDMapping
+   request. 0.9.x stored them, so this default is a behaviour change.
 
    Attribute release is a seam, not a hardwired step, because deployments
    legitimately source the released set differently: an originating IdP
@@ -231,11 +230,18 @@ failure is a real protocol error rather than a silent per-integrator choice.
   changed from level-based matching to literal class-ref matching (see
   above). Any integrator relying on the old broadened behaviour must pass
   `allow_exact_level_matching(true)` explicitly.
-- Breaking (pre-release): `IdentityStore` is now the record-shaped NameID
-  backend; the former get/set/remove trait is `KeyValueStore` (used by
-  `Eptid`). A custom implementor (there are none outside this crate yet) must
-  implement the record methods and enforce the two uniqueness constraints
-  (see above).
+- Breaking: `IdentityStore` is now the record-shaped NameID backend; the
+  get/set/remove trait of 0.9.x is `KeyValueStore` (used by `Eptid`). An
+  external implementor of the old trait exists (pygamlastan's
+  `PyIdentityStore`); it must implement `KeyValueStore` for the `Eptid` cache
+  and the new `IdentityStore`, including the two uniqueness constraints (see
+  above). Code that still implements the old methods as `IdentityStore` fails
+  to compile rather than misbehaving.
+- Breaking: every store method is fallible, so `IdentDb`, `Eptid` and the
+  assertion-query helpers return `Result` (see above).
+- Behaviour change: transient NameIDs are no longer stored by default (see
+  above), so `find_local_id` on one finds nothing unless
+  `IdentDb::with_persist_transient` is set.
 
 ## Alternatives considered
 
@@ -273,13 +279,34 @@ failure is a real protocol error rather than a silent per-integrator choice.
   proxy shape produces a compliant response without `ReleasePolicy::filter`
   ever running.
 - `idp/ident.rs`: concurrent persistent-NameID minting for the same
-  (user, SP) resolves to one identifier; concurrent persistent + transient
-  issuance don't clobber each other's forward-list entry; `remove_local`
-  racing a concurrent writer never leaves an orphaned reverse-key entry;
-  a deterministic (channel-synchronized, not scheduling-dependent) test
-  forces `remove_local` to run in the exact window between a concurrent
-  `get_or_create_persistent`'s reverse-key write and its forward commit,
-  proving the reverse mapping still resolves afterward.
+  (user, SP) resolves to one identifier; concurrent persistent and durable
+  non-persistent issuance don't affect each other; a store outage is an error
+  and never a missing record (no second persistent identifier is minted), and
+  issuing a transient NameID works while the store is down; with
+  `with_persist_transient` a stored transient resolves through
+  `find_local_id`, is removable, never satisfies a persistent lookup, and is
+  never reused by a NameIDMapping request; `find_nameid` filters on every
+  field.
+- `ident::conformance`: the backend contract suite (value uniqueness,
+  persistent get-or-insert, filtered lookup, replace, scoped removal, and two
+  concurrent checks) passes on `InMemoryIdentityStore` and is verified to fail
+  against a backend with no value uniqueness and against a check-then-insert
+  backend. The non-panicking `check` / `check_one` entry points return the
+  violation, run a check by name, and report a failing backend call as a
+  failed check rather than a lost race.
+- `idp/orchestrator/tests.rs` (store and signing): an identity-store outage
+  during NameID construction is `Err(ProfileError::Store)` and not a signed
+  denial; an assertion store that cannot record is an error, not "issued";
+  `Denial::AuthnFailed` / `Cancelled` are signed `Responder/AuthnFailed`
+  responses; a configured `SigningPreference` is used for an issued response
+  and for a denial, and the signer's defaults apply without one.
+- `crypto::algorithms` and `crypto::signer`: weak and unknown algorithm URIs
+  are not representable; the first IdP preference the SP also advertises wins,
+  an SP advertising nothing usable gets the IdP's first choice, and an SP
+  cannot introduce an algorithm the IdP did not list; an HSM-backed signer
+  refuses a signature method other than its token's. `tests/response_signing.rs`
+  signs a response and its assertion with RSA-SHA512 and a SHA-512 digest and
+  verifies both signatures.
 - `idp/authn_broker.rs`: exact matching excludes a method registered at the
   same security level under a different, unrequested class ref by default;
   `allow_exact_level_matching` restores the old pysaml2-compatible

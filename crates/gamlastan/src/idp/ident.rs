@@ -1416,18 +1416,11 @@ mod tests {
 
     #[test]
     fn concurrent_persistent_and_durable_issuance_do_not_clobber_each_other() {
-        // Regression: get_or_create_persistent's CAS loop only coordinated
-        // with other CAS writers on the forward key; store() (used for
-        // durable non-persistent formats like email) still did a plain
-        // get-then-set on that same key. A store() write could read the list
-        // before the persistent CAS committed and then overwrite it with a
-        // stale value, silently dropping the persistent entry even though its
-        // own CAS "succeeded". Both paths now go through the same
-        // atomic get_or_insert_persistent / insert.
-        //
-        // (Transient identifiers are not stored at all, so they no longer
-        // exercise this path; email is a durable non-persistent format that
-        // does.)
+        // A persistent mint and the durable non-persistent formats (email) are
+        // separate records. Running them concurrently for one user must leave
+        // exactly one persistent record and every email record: neither kind
+        // may drop or merge the other. (Transient identifiers are not stored
+        // by default, so they do not exercise this path.)
         use std::sync::Arc;
         use std::thread;
 
@@ -1474,69 +1467,6 @@ mod tests {
             8,
             "every durable non-persistent issuance must survive: {entries:?}"
         );
-    }
-
-    #[test]
-    fn concurrent_remove_local_does_not_orphan_a_racing_writers_reverse_key() {
-        // Regression: remove_local read name_ids_for(user) (forward key),
-        // then unconditionally removed each entry's reverse key followed by
-        // the forward key itself - all as plain, non-CAS operations, unlike
-        // every other forward-key writer (store/get_or_create_persistent/
-        // remove_remote). A concurrent store() for a *different* SP could
-        // commit a brand-new forward-list entry (and its reverse key) in the
-        // window between remove_local's read and its final forward-key
-        // removal; remove_local's unconditional removal then wiped that
-        // fresh entry out of the forward list while its reverse-key mapping
-        // was never cleaned up (it didn't exist yet when remove_local read
-        // the list) - a permanently orphaned reverse-key entry, and a
-        // "stable" persistent identifier that silently stops being stable.
-        use std::sync::Arc;
-        use std::thread;
-
-        for round in 0..20 {
-            let db = Arc::new(db());
-            db.persistent_nameid("alice", Some(SP)).unwrap();
-
-            let remover = {
-                let db = Arc::clone(&db);
-                thread::spawn(move || db.remove_local("alice").unwrap())
-            };
-            let writers: Vec<_> = (0..4)
-                .map(|i| {
-                    let db = Arc::clone(&db);
-                    thread::spawn(move || {
-                        db.get_nameid(
-                            "alice",
-                            constants::NAMEID_EMAIL,
-                            Some(&format!("{SP}/{round}/{i}")),
-                            Some(IDP),
-                        )
-                        .unwrap()
-                    })
-                })
-                .collect();
-
-            remover.join().unwrap();
-            let written: Vec<_> = writers.into_iter().map(|t| t.join().unwrap()).collect();
-
-            let present: Vec<String> = db
-                .name_ids_for("alice")
-                .unwrap()
-                .into_iter()
-                .map(|nid| nid.value)
-                .collect();
-            for nid in &written {
-                let in_forward_list = present.contains(&nid.value);
-                let reverse_points_here =
-                    db.find_local_id(nid).unwrap().as_deref() == Some("alice");
-                assert_eq!(
-                    in_forward_list, reverse_points_here,
-                    "round {round}: NameID {:?} must be either fully present (forward + \
-                     reverse) or fully absent, never a dangling reverse-key entry",
-                    nid.value
-                );
-            }
-        }
     }
 
     #[test]

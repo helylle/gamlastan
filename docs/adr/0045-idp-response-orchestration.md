@@ -273,7 +273,11 @@ failure is a real protocol error rather than a silent per-integrator choice.
   them from the original request, since `ProcessedAuthnRequest` does not carry
   them. A `Subject` is checked only for the forbidden `SubjectConfirmation`;
   the assertion is issued for the authenticated subject whatever principal it
-  names. The request parser rejects what it used to repair: an `IDPEntry`
+  names, as in pysaml2, which leaves that comparison to the application too
+  (eduID's re-login and MFA step-up flows send a subject and enforce it in
+  application code, for allowlisted SPs only).
+  `AuthnRequest::requested_subject` reads it for an application that supports
+  a requested subject. The request parser rejects what it used to repair: an `IDPEntry`
   without `ProviderID`, and a repeated singleton child, so what a consumer
   reads is what the SP sent.
 - Breaking (pre-release): `AuthnBroker::pick` with `Comparison="exact"`

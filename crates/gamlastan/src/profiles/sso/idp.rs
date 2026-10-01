@@ -61,7 +61,10 @@ use crate::xml::serialize::SamlSerialize;
 /// - **`Subject`**. It is checked only for the forbidden `SubjectConfirmation`
 ///   (see [`ProfileError::SubjectConfirmationInAuthnRequest`]); the principal it
 ///   names is not compared with the authenticated subject, so an assertion is
-///   issued for whoever authenticated.
+///   issued for whoever authenticated. Read it with
+///   [`AuthnRequest::requested_subject`] and compare it yourself if you support
+///   a requested subject (a re-login as the same user, MFA step-up); pysaml2
+///   leaves this to the application too.
 /// - **`Conditions`**, which the responder may modify or supplement.
 #[derive(Debug, Clone)]
 pub struct ProcessedAuthnRequest {
@@ -913,6 +916,61 @@ mod tests {
         );
         assert!(result.allow_create);
         assert_eq!(result.requested_authn_context_class_refs.len(), 1);
+    }
+
+    #[test]
+    fn requested_subject_reads_the_principal_named_in_subject() {
+        use crate::core::assertion::name_id::NameIdOrEncryptedId;
+        let name_id = NameId {
+            value: "alice".to_string(),
+            format: Some(constants::NAMEID_UNSPECIFIED.to_string()),
+            name_qualifier: None,
+            sp_name_qualifier: None,
+            sp_provided_id: None,
+        };
+        let mut request = make_authn_request();
+
+        // No Subject at all.
+        request.subject = None;
+        assert!(request.requested_subject().is_none());
+        assert!(request.requested_subject_name_id().is_none());
+
+        // A Subject that names no principal.
+        request.subject = Some(Subject {
+            name_id: None,
+            subject_confirmations: vec![],
+        });
+        assert!(request.requested_subject().is_none());
+
+        // A plaintext NameID.
+        request.subject = Some(Subject {
+            name_id: Some(NameIdOrEncryptedId::NameId(name_id.clone())),
+            subject_confirmations: vec![],
+        });
+        assert_eq!(request.requested_subject_name_id(), Some(&name_id));
+        assert!(matches!(
+            request.requested_subject(),
+            Some(NameIdOrEncryptedId::NameId(_))
+        ));
+    }
+
+    #[test]
+    fn an_encrypted_requested_subject_is_not_mistaken_for_no_subject() {
+        use crate::core::assertion::name_id::{EncryptedId, NameIdOrEncryptedId};
+        let mut request = make_authn_request();
+        request.subject = Some(Subject {
+            name_id: Some(NameIdOrEncryptedId::EncryptedId(EncryptedId {
+                raw: b"<saml:EncryptedID/>".to_vec(),
+            })),
+            subject_confirmations: vec![],
+        });
+        // It cannot be read as a plaintext NameID...
+        assert!(request.requested_subject_name_id().is_none());
+        // ...but the request does name a principal, and the caller can tell.
+        assert!(matches!(
+            request.requested_subject(),
+            Some(NameIdOrEncryptedId::EncryptedId(_))
+        ));
     }
 
     #[test]

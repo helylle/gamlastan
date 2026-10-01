@@ -165,6 +165,14 @@ where needed to correct protocol handling.
   `ISSUABLE_NAMEID_FORMATS` (transient, persistent, emailAddress, unspecified)
   is a reasonable set to pass; it leaves out `encrypted`, a request to encrypt
   the NameID, which is not supported.
+- Added `AuthnRequest::requested_subject` and `requested_subject_name_id`
+  (pysaml2 `Request.subject_id()`): the principal an AuthnRequest names in
+  `Subject`, with an `EncryptedID` returned as such, not as "no subject". The
+  orchestrator still does not compare it with the authenticated principal, as
+  in pysaml2: mapping a NameID to a local user is deployment-specific (eduID's
+  "re-login as the same user" and MFA step-up flows send an eppn in an
+  `unspecified`-format NameID and honor it only for allowlisted SPs). A
+  deployment that supports a requested subject must compare it itself.
 
 ### Changed
 

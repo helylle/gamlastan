@@ -241,61 +241,78 @@ pub fn process_authn_request(
 
 /// Resolve the ACS endpoint URL and binding from the AuthnRequest and SP metadata.
 ///
-/// Priority:
-/// 1. AssertionConsumerServiceURL + ProtocolBinding from request (must be verified against metadata)
-/// 2. AssertionConsumerServiceIndex from request
-/// 3. Default ACS from SP metadata
+/// The response only ever goes to an endpoint registered in the SP's metadata:
+///
+/// - **`AssertionConsumerServiceURL`**: the URL must be a registered location.
+///   With a `ProtocolBinding` the (URL, binding) pair must be registered
+///   together. Without one, the binding is the one the URL is registered under
+///   (the first, in metadata order, if it is registered under several), as in
+///   pysaml2; it is not assumed to be HTTP-POST.
+/// - **`AssertionConsumerServiceIndex`**: the endpoint with that index. A
+///   `ProtocolBinding` given as well must agree with that endpoint's binding.
+/// - **Neither**: the SP's default endpoint, chosen among the endpoints
+///   registered with the requested `ProtocolBinding` when one was given (an
+///   error if there are none), as pysaml2 does, and among all of them otherwise.
+///
+/// If a URL and an index are both present the URL wins and the index is ignored,
+/// as in pysaml2; the URL must still be registered, so this is not exploitable.
 fn resolve_acs_endpoint(
     request: &AuthnRequest,
     sp_metadata: &SpSsoDescriptor,
 ) -> Result<(String, String), ProfileError> {
+    let endpoints = &sp_metadata.assertion_consumer_services;
+    let requested_binding = request.protocol_binding.as_deref();
+
     // Option 1: URL directly specified in request
     if let Some(url) = &request.assertion_consumer_service_url {
-        let binding = request
-            .protocol_binding
-            .as_deref()
-            .unwrap_or("urn:oasis:names:tc:SAML:2.0:bindings:HTTP-POST");
-
         // Location and binding are one registered endpoint. Verifying only the
         // URL and then returning the request-controlled binding creates a
         // protocol-confusion gap.
-        let found = sp_metadata
-            .assertion_consumer_services
-            .iter()
-            .any(|ep| ep.endpoint.location == *url && ep.endpoint.binding == binding);
-        if !found {
-            return Err(ProfileError::AcsUrlMismatch);
-        }
-
-        return Ok((url.clone(), binding.to_string()));
+        let mut at_url = endpoints.iter().filter(|ep| ep.endpoint.location == *url);
+        let found = match requested_binding {
+            Some(binding) => at_url.find(|ep| ep.endpoint.binding == binding),
+            None => at_url.next(),
+        };
+        return found
+            .map(|ep| (ep.endpoint.location.clone(), ep.endpoint.binding.clone()))
+            .ok_or(ProfileError::AcsUrlMismatch);
     }
 
     // Option 2: Index specified in request
     if let Some(index) = request.assertion_consumer_service_index {
-        if let Some(ep) = sp_metadata
-            .assertion_consumer_services
-            .iter()
-            .find(|e| e.index == index)
-        {
-            return Ok((ep.endpoint.location.clone(), ep.endpoint.binding.clone()));
+        let Some(ep) = endpoints.iter().find(|e| e.index == index) else {
+            return Err(ProfileError::NoAcsEndpoint(format!(
+                "index {} not found in SP metadata",
+                index
+            )));
+        };
+        if requested_binding.is_some_and(|binding| ep.endpoint.binding != binding) {
+            return Err(ProfileError::AcsUrlMismatch);
         }
-        return Err(ProfileError::NoAcsEndpoint(format!(
-            "index {} not found in SP metadata",
-            index
-        )));
-    }
-
-    // Option 3: Default from SP metadata
-    let default = crate::profiles::sso::sp::find_default_acs_endpoint(
-        &sp_metadata.assertion_consumer_services,
-    );
-    if let Some(ep) = default {
         return Ok((ep.endpoint.location.clone(), ep.endpoint.binding.clone()));
     }
 
-    Err(ProfileError::NoAcsEndpoint(
-        "no ACS endpoint could be resolved".to_string(),
-    ))
+    // Option 3: Default from SP metadata, among the endpoints of the requested
+    // binding if the request named one.
+    let default = match requested_binding {
+        Some(binding) => {
+            let of_binding: Vec<_> = endpoints
+                .iter()
+                .filter(|ep| ep.endpoint.binding == binding)
+                .cloned()
+                .collect();
+            crate::profiles::sso::sp::find_default_acs_endpoint(&of_binding).cloned()
+        }
+        None => crate::profiles::sso::sp::find_default_acs_endpoint(endpoints).cloned(),
+    };
+    if let Some(ep) = default {
+        return Ok((ep.endpoint.location, ep.endpoint.binding));
+    }
+
+    Err(ProfileError::NoAcsEndpoint(match requested_binding {
+        Some(binding) => format!("no ACS endpoint is registered for binding {binding}"),
+        None => "no ACS endpoint could be resolved".to_string(),
+    }))
 }
 
 /// Create a SAML Response for SP-initiated SSO.
@@ -1033,6 +1050,143 @@ mod tests {
             vec!["urn:example:decl".to_string()],
             "a declaration-only constraint must survive processing"
         );
+    }
+
+    const POST: &str = "urn:oasis:names:tc:SAML:2.0:bindings:HTTP-POST";
+    const REDIRECT: &str = "urn:oasis:names:tc:SAML:2.0:bindings:HTTP-Redirect";
+    const ARTIFACT: &str = "urn:oasis:names:tc:SAML:2.0:bindings:HTTP-Artifact";
+
+    /// `make_sp_metadata()` (POST default at index 0, Redirect at index 1) plus
+    /// an Artifact endpoint at index 2 and the POST location also registered
+    /// under Artifact at index 3.
+    fn metadata_with_artifact() -> SpSsoDescriptor {
+        let mut sp = make_sp_metadata();
+        sp.assertion_consumer_services.push(IndexedEndpoint::new(
+            Endpoint::new(ARTIFACT, "https://sp.example.com/acs/artifact"),
+            2,
+        ));
+        sp.assertion_consumer_services.push(IndexedEndpoint::new(
+            Endpoint::new(ARTIFACT, "https://sp.example.com/acs/post"),
+            3,
+        ));
+        sp
+    }
+
+    /// A request that names its ACS only through the given attributes.
+    fn acs_request(url: Option<&str>, index: Option<u16>, binding: Option<&str>) -> AuthnRequest {
+        let mut request = make_authn_request();
+        request.assertion_consumer_service_url = url.map(str::to_string);
+        request.assertion_consumer_service_index = index;
+        request.protocol_binding = binding.map(str::to_string);
+        request
+    }
+
+    fn acs(request: &AuthnRequest) -> Result<(String, String), ProfileError> {
+        process_authn_request(request, &metadata_with_artifact(), false)
+            .map(|p| (p.acs_url, p.acs_binding))
+    }
+
+    #[test]
+    fn an_acs_url_without_a_protocol_binding_uses_the_binding_it_is_registered_under() {
+        // Used to assume HTTP-POST and fail with AcsUrlMismatch for a URL
+        // registered only under another binding.
+        let (url, binding) = acs(&acs_request(
+            Some("https://sp.example.com/acs/artifact"),
+            None,
+            None,
+        ))
+        .unwrap();
+        assert_eq!(url, "https://sp.example.com/acs/artifact");
+        assert_eq!(binding, ARTIFACT);
+
+        // Registered under several bindings: the first in metadata order,
+        // unless the request names one.
+        let post_url = Some("https://sp.example.com/acs/post");
+        assert_eq!(acs(&acs_request(post_url, None, None)).unwrap().1, POST);
+        assert_eq!(
+            acs(&acs_request(post_url, None, Some(ARTIFACT))).unwrap().1,
+            ARTIFACT
+        );
+    }
+
+    #[test]
+    fn an_acs_url_must_still_be_registered_with_the_requested_binding() {
+        // The pair is one endpoint: the Redirect location is not registered
+        // under POST, and an unregistered URL is never accepted.
+        assert!(matches!(
+            acs(&acs_request(
+                Some("https://sp.example.com/acs/redirect"),
+                None,
+                Some(POST)
+            )),
+            Err(ProfileError::AcsUrlMismatch)
+        ));
+        assert!(matches!(
+            acs(&acs_request(
+                Some("https://evil.example.com/acs"),
+                None,
+                None
+            )),
+            Err(ProfileError::AcsUrlMismatch)
+        ));
+    }
+
+    #[test]
+    fn a_protocol_binding_alone_picks_the_default_endpoint_of_that_binding() {
+        // Used to be ignored: the response went to the default (POST) endpoint
+        // whatever binding the SP asked for.
+        let (url, binding) = acs(&acs_request(None, None, Some(REDIRECT))).unwrap();
+        assert_eq!(url, "https://sp.example.com/acs/redirect");
+        assert_eq!(binding, REDIRECT);
+        assert_eq!(
+            acs(&acs_request(None, None, Some(ARTIFACT))).unwrap().0,
+            "https://sp.example.com/acs/artifact",
+            "lowest index among the Artifact endpoints"
+        );
+        // Nothing requested: the SP's default, as before.
+        assert_eq!(acs(&acs_request(None, None, None)).unwrap().1, POST);
+        // A binding with no registered endpoint is an error, not a fallback to
+        // the default endpoint in a binding the SP did not ask for.
+        assert!(matches!(
+            acs(&acs_request(
+                None,
+                None,
+                Some("urn:example:no-such-binding")
+            )),
+            Err(ProfileError::NoAcsEndpoint(_))
+        ));
+    }
+
+    #[test]
+    fn an_acs_index_and_a_protocol_binding_must_agree() {
+        assert_eq!(
+            acs(&acs_request(None, Some(1), None)).unwrap().1,
+            REDIRECT,
+            "index alone is unchanged"
+        );
+        assert_eq!(
+            acs(&acs_request(None, Some(1), Some(REDIRECT))).unwrap().1,
+            REDIRECT
+        );
+        assert!(matches!(
+            acs(&acs_request(None, Some(1), Some(POST))),
+            Err(ProfileError::AcsUrlMismatch)
+        ));
+        assert!(matches!(
+            acs(&acs_request(None, Some(99), None)),
+            Err(ProfileError::NoAcsEndpoint(_))
+        ));
+    }
+
+    #[test]
+    fn when_an_acs_url_and_index_are_both_given_the_url_wins_as_in_pysaml2() {
+        let (url, _) = acs(&acs_request(
+            Some("https://sp.example.com/acs/post"),
+            Some(1),
+            None,
+        ))
+        .unwrap();
+        assert_eq!(url, "https://sp.example.com/acs/post");
     }
 
     #[test]

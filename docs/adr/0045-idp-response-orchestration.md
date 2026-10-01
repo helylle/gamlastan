@@ -267,6 +267,11 @@ failure is a real protocol error rather than a silent per-integrator choice.
   `saml2_frontend.rs`, `saml2_backend.rs`, `stepup.rs`, and four test
   files) need a one-line compat patch, prepared separately and offered to
   SUNET alongside this ADR rather than discovered via a failed build.
+- Behaviour change: ACS endpoint selection honours `ProtocolBinding` as
+  pysaml2 does (a binding alone narrows the default endpoint; a URL without a
+  binding uses the one it is registered under instead of assuming HTTP-POST; a
+  binding given with an index must agree with it). The response still goes only
+  to an endpoint registered in the SP's metadata.
 - Not handled by the engine: `Scoping` and the principal named by an
   AuthnRequest `Subject`. An originating IdP can ignore `Scoping`, but a proxy
   must enforce `ProxyCount` and `IDPList` itself (SAML Core 3.4.1.2), reading
@@ -376,6 +381,12 @@ failure is a real protocol error rather than a silent per-integrator choice.
   holds one record, not one per response. `idp/ident.rs`: email and
   unspecified are stable per (user, SP, format), concurrent first requests for
   one converge, and `store` refuses a second record of a durable format.
+- `profiles/sso/idp.rs` (ACS resolution): a URL registered only under a
+  non-POST binding resolves without a `ProtocolBinding`; a URL registered under
+  several bindings picks the first, or the requested one; the (URL, binding)
+  pair and an unregistered URL are still refused; a binding alone picks the
+  default of that binding and errors when none is registered; an index and a
+  binding must agree.
 - `crypto::algorithms` and `crypto::signer`: weak and unknown algorithm URIs
   are not representable; the first IdP preference the SP also advertises wins,
   an SP advertising nothing usable gets the IdP's first choice, and an SP

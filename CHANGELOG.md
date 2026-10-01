@@ -283,6 +283,18 @@ where needed to correct protocol handling.
   (`find_durable` takes the format), and `InsertError::PersistentExists`
   became `DurableExists`. `AllowCreate=false` still gates only the persistent
   format.
+- **Behaviour change:** ACS endpoint selection honours `ProtocolBinding`, as
+  pysaml2 does. A `ProtocolBinding` with no URL or index picks the default
+  endpoint among those registered with that binding (it used to be ignored, so
+  the response went to the default endpoint in whatever binding that was; it is
+  an error now if none is registered). An `AssertionConsumerServiceURL` without
+  a `ProtocolBinding` uses the binding the URL is registered under, the first in
+  metadata order if it is registered under several (it used to assume
+  HTTP-POST, so a URL registered only under another binding failed with
+  `AcsUrlMismatch`). A `ProtocolBinding` given with an index must match that
+  endpoint's binding. The response still only goes to an endpoint registered in
+  the SP's metadata, and a URL and an index given together still resolve by the
+  URL, as in pysaml2.
 - **Breaking:** the store traits are fallible. `IdentityStore`, `KeyValueStore`
   and `AssertionStore` methods return `Result<_, StoreError>` (the two insert
   paths return `InsertError`, which separates a `ValueTaken` conflict from a

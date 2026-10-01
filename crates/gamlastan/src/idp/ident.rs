@@ -264,13 +264,19 @@ pub trait IdentityStore: Send + Sync {
     fn insert(&self, user_id: &str, name_id: NameId) -> Result<(), InsertError>;
 
     /// Insert or overwrite the record with this value, assigning it to
-    /// `user_id`. Used to update an existing association (e.g. a
-    /// ManageNameID `NewID`). It never reports `ValueTaken`, since it upserts
-    /// by value, but it holds the same persistent constraint as
-    /// [`insert`](Self::insert): `Err(InsertError::PersistentExists)` if the
-    /// write would leave `user_id` with a second persistent record (a different
-    /// value) for the same `(sp_name_qualifier, name_qualifier)`. Updating the
-    /// existing persistent record in place is fine.
+    /// `user_id`. Records are keyed by value, so this changes a record's *other*
+    /// fields in place (e.g. a ManageNameID `NewID` sets `SPProvidedID` on the
+    /// same NameID value). It cannot give a persistent record a new value: a
+    /// different value is a different record. Persistent identifiers are meant
+    /// to stay stable, and rotating one is not an operation this trait offers
+    /// (`remove` followed by `insert` is not atomic).
+    ///
+    /// It never reports `ValueTaken`, since it upserts by value, but it holds
+    /// the same persistent constraint as [`insert`](Self::insert):
+    /// `Err(InsertError::PersistentExists)` if the write would leave `user_id`
+    /// with a second persistent record (a different value) for the same
+    /// `(sp_name_qualifier, name_qualifier)`. Updating the existing persistent
+    /// record in place is fine.
     fn replace(&self, user_id: &str, name_id: NameId) -> Result<(), InsertError>;
 
     /// Remove the record with this value, if any.
@@ -583,12 +589,14 @@ impl<S: IdentityStore> IdentDb<S> {
     }
 
     /// Associate a NameID with a local user (pysaml2 `store()`), replacing
-    /// any record that already has the same value.
+    /// any record that already has the same value, so it updates that
+    /// NameID's other fields in place rather than changing its value.
     ///
     /// Fails with [`IdentError::PersistentExists`] if `name_id` is persistent
     /// and the user already has a different persistent NameID for the same
     /// `(SPNameQualifier, NameQualifier)`; use
-    /// [`persistent_nameid`](Self::persistent_nameid) to obtain that one.
+    /// [`persistent_nameid`](Self::persistent_nameid) to obtain that one. A
+    /// persistent identifier cannot be rotated through this method.
     pub fn store(&self, user_id: &str, name_id: &NameId) -> Result<(), IdentError> {
         Ok(self.store.replace(user_id, name_id.clone())?)
     }

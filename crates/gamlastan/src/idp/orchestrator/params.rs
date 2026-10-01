@@ -13,6 +13,7 @@ use crate::core::assertion::name_id::NameId;
 use crate::idp::authn_broker::AuthnMethod;
 use crate::metadata::types::entity_descriptor::EntityDescriptor;
 use crate::metadata::types::sp::SpSsoDescriptor;
+use crate::profiles::error::ProfileError;
 use crate::profiles::sso::idp::ProcessedAuthnRequest;
 
 use super::denial::Denial;
@@ -126,6 +127,61 @@ pub struct ResponseParams {
 }
 
 impl ResponseParams {
+    /// Build parameters, checking that `sp_entity` (when given) is the SP the
+    /// request was validated for.
+    ///
+    /// The engine reads entity categories and `subject-id:req` from the
+    /// descriptor, and they decide what is released, so a descriptor for a
+    /// different SP would release attributes under the wrong policy. The
+    /// fields are public, so [`create_authn_response`] and
+    /// [`create_denial_response`] repeat this check; this constructor reports
+    /// the mistake where the parameters are built.
+    ///
+    /// [`create_authn_response`]: super::create_authn_response
+    /// [`create_denial_response`]: super::create_denial_response
+    pub fn new(
+        processed: ProcessedAuthnRequest,
+        sp_sso: SpSsoDescriptor,
+        sp_entity: Option<EntityDescriptor>,
+    ) -> Result<Self, ProfileError> {
+        let params = ResponseParams {
+            processed,
+            sp_sso,
+            sp_entity,
+        };
+        params.check_bound()?;
+        Ok(params)
+    }
+
+    /// Build parameters from the trusted SP entity descriptor alone, taking the
+    /// SAML 2.0 SP role from that same descriptor, so the role and the entity
+    /// cannot come from different SPs. Errors if the descriptor is not the SP
+    /// the request was validated for, or has no SAML 2.0 SP role.
+    pub fn from_entity(
+        processed: ProcessedAuthnRequest,
+        entity: EntityDescriptor,
+    ) -> Result<Self, ProfileError> {
+        let sp_sso = entity
+            .saml2_sp_sso_descriptor()
+            .cloned()
+            .ok_or_else(|| ProfileError::NoAcsEndpoint(entity.entity_id.clone()))?;
+        ResponseParams::new(processed, sp_sso, Some(entity))
+    }
+
+    /// Check that the entity descriptor, if present, is for the SP the request
+    /// came from.
+    pub(super) fn check_bound(&self) -> Result<(), ProfileError> {
+        match &self.sp_entity {
+            Some(entity) if entity.entity_id != self.processed.sp_entity_id => {
+                Err(ProfileError::SpEntityMismatch {
+                    request: self.processed.sp_entity_id.clone(),
+                    descriptor: entity.entity_id.clone(),
+                })
+            }
+            _ => Ok(()),
+        }
+    }
+
     /// The SP's published entity categories (empty when no entity descriptor).
     pub fn sp_entity_categories(&self) -> Vec<String> {
         self.sp_entity
@@ -161,16 +217,21 @@ impl ResponseParams {
         })
     }
 
-    /// The raw AuthnRequest's `RequestedAuthnContext`, if any.
+    /// The raw AuthnRequest's `RequestedAuthnContext`, if any, including any
+    /// `AuthnContextDeclRef`s. A request that names only declarations is still a
+    /// constraint, so this does not return `None` for it (the engine denies such
+    /// a request: see [`ProcessedAuthnRequest::requested_authn_context_decl_refs`]).
     pub fn requested_authn_context(
         &self,
     ) -> Option<crate::core::protocol::request::RequestedAuthnContext> {
-        if self.processed.requested_authn_context_class_refs.is_empty() {
+        if self.processed.requested_authn_context_class_refs.is_empty()
+            && self.processed.requested_authn_context_decl_refs.is_empty()
+        {
             return None;
         }
         Some(crate::core::protocol::request::RequestedAuthnContext {
             authn_context_class_refs: self.processed.requested_authn_context_class_refs.clone(),
-            authn_context_decl_refs: Vec::new(),
+            authn_context_decl_refs: self.processed.requested_authn_context_decl_refs.clone(),
             comparison: self
                 .processed
                 .authn_context_comparison

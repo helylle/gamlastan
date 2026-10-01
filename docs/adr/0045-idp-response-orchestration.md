@@ -96,9 +96,14 @@ existing primitives into the profile flow, and move the semantics proven in
    converge on one persistent identifier. Nothing in this crate can detect a
    missing constraint, so the trait has no default write methods and
    `ident::conformance::run` checks that a backend honours the contract.
+   Both constraints hold on every write path -- `insert` and `replace` refuse
+   a second persistent record for the same `(user, sp_name_qualifier,
+   name_qualifier)` (`InsertError::PersistentExists`) just as
+   `get_or_insert_persistent` returns the existing one -- and the suite checks
+   each path, since a backend can guard one and forget another.
    `InMemoryIdentityStore` takes one lock per call; a Mongo/SQL-backed store
    must back the two constraints with real unique indexes (a partial unique
-   index for the persistent tuple). The plain `get`/`set`/`remove` shape
+   index for the persistent tuple), applied to every write. The plain `get`/`set`/`remove` shape
    remains as `KeyValueStore`, which `Eptid` uses. Every store method is
    fallible (`StoreError`; `InsertError` for the two insert paths, which also
    reports a `ValueTaken` conflict): a backend that cannot answer must not
@@ -195,6 +200,11 @@ existing primitives into the profile flow, and move the semantics proven in
    registration-key field, so the two cannot drift apart) -- entity
    categories and other entity-level extensions need to reach
    `ResponseParams::sp_entity` for the attribute-release seam to see them.
+   Because that descriptor's entity categories and `subject-id:req` decide what
+   is released, `ResponseParams::new` / `from_entity` check that it is the SP the
+   request was validated for, and `create_authn_response` /
+   `create_denial_response` repeat the check (the fields are public), so one
+   SP's request cannot be released under another SP's policy.
 
 4. In-crate module, not a new crate, consistent with ADR 0008's reasoning: it
    depends only on `gamlastan` internals.
@@ -300,10 +310,11 @@ failure is a real protocol error rather than a silent per-integrator choice.
   never reused by a NameIDMapping request; `find_nameid` filters on every
   field.
 - `ident::conformance`: the backend contract suite (value uniqueness,
-  persistent get-or-insert, filtered lookup, replace, scoped removal, and two
-  concurrent checks) passes on `InMemoryIdentityStore` and is verified to fail
-  against a backend with no value uniqueness and against a check-then-insert
-  backend. The non-panicking `check` / `check_one` entry points return the
+  persistent get-or-insert, the persistent constraint on `insert` and
+  `replace`, filtered lookup, scoped removal, and two concurrent checks) passes
+  on `InMemoryIdentityStore` and is verified to fail against a backend with no
+  value uniqueness, a check-then-insert backend, a backend that guards only
+  `get_or_insert_persistent`, and one that guards `insert` but not `replace`. The non-panicking `check` / `check_one` entry points return the
   violation, run a check by name, and report a failing backend call as a
   failed check rather than a lost race.
 - `idp/orchestrator/tests.rs` (store and signing): an identity-store outage
@@ -315,7 +326,8 @@ failure is a real protocol error rather than a silent per-integrator choice.
   declaration-only `RequestedAuthnContext` is denied (never treated as
   unconstrained); `allow_exact_level_matching` is consistent between
   `check_request` and the response; the advertised algorithms come from the
-  entity and the requested role only. `gamlastan-actix`: `/saml/metadata`
+  entity and the requested role only; a descriptor for a different SP is
+  refused by `ResponseParams::new` and by both response paths. `gamlastan-actix`: `/saml/metadata`
   advertises the certificate of the path that signs (the engine's only with an
   `AuthnSubjectCallback`).
 - `crypto::algorithms` and `crypto::signer`: weak and unknown algorithm URIs

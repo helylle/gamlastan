@@ -37,6 +37,14 @@ where needed to correct protocol handling.
   requested class refs directly, rather than requiring the broker to have a
   registration for it (which `AuthnBroker::pick`'s exact branch needs, but
   satisfying an already-resolved method's literal class ref does not).
+- Added `ResponseParams::new` and `ResponseParams::from_entity`, which check
+  that the SP entity descriptor is the SP the request was validated for
+  (`ProfileError::SpEntityMismatch`), and `from_entity` takes the SAML 2.0 SP
+  role from that same descriptor. The descriptor's entity categories and
+  `subject-id:req` decide what is released, so pairing one SP's request with
+  another SP's descriptor would release attributes under the wrong policy. The
+  fields are public, so `create_authn_response` and `create_denial_response`
+  repeat the check; the Actix handler builds its parameters through `new`.
 - Added `gamlastan-actix`'s `AuthnSubjectCallback`, a higher-level companion
   to the existing `AuthnCallback`, returning an `AuthnSubjectResult` of
   `Authenticated(AuthenticatedSubject) | Redirect(HttpResponse) |
@@ -161,7 +169,8 @@ where needed to correct protocol handling.
   all and the engine would reuse any session or issue any class ref. An
   `AuthnMethod` carries a class ref only, so a declaration cannot be shown to be
   met: `check_request` and `create_authn_response` now deny such a request with
-  `NoAuthnContext`.
+  `NoAuthnContext`, and `ResponseParams::requested_authn_context()` no longer
+  reports it as no constraint.
 - **Breaking:** `gamlastan-actix`'s `TrustedSp.sp_sso: SpSsoDescriptor` field
   is now `entity: EntityDescriptor`, with no separate registration-key field:
   `IdpConfig::with_trusted_sp(entity_id, sp_sso)` is now
@@ -207,9 +216,15 @@ where needed to correct protocol handling.
   The constraints live in the store, so the trait has no default write
   methods (a non-atomic default would silently leave the race open on a
   multi-instance deployment) and `ident::conformance::run` is provided to
-  check that a backend honours them. `InMemoryIdentityStore` takes one lock
-  per call; a Mongo/SQL-backed store must back the two constraints with real
-  unique indexes (a partial unique index for the persistent tuple).
+  check that a backend honours them. Both constraints hold on every write
+  path, not only on `get_or_insert_persistent`: `insert` and `replace` refuse
+  a second persistent record for the same `(user, sp_name_qualifier,
+  name_qualifier)` with `InsertError::PersistentExists` (`replace` now returns
+  `InsertError`, and `IdentDb::store` returns `IdentError`, which gains
+  `PersistentExists`), and the conformance suite checks each path.
+  `InMemoryIdentityStore` takes one lock per call; a Mongo/SQL-backed store
+  must back the two constraints with real unique indexes (a partial unique
+  index for the persistent tuple), applied to every write.
   Migration: an external implementor of the 0.9.x trait (pygamlastan's
   `PyIdentityStore` is one) implements `KeyValueStore` for the `Eptid` cache
   and the new `IdentityStore` for `IdentDb`; code still implementing the old

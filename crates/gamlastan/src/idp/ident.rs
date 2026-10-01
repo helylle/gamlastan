@@ -49,6 +49,28 @@ pub enum IdentError {
     /// refusal: callers must not turn it into a protocol denial.
     #[error(transparent)]
     Store(#[from] StoreError),
+
+    /// A persistent NameID already exists for this user and
+    /// `(SPNameQualifier, NameQualifier)`; a second cannot be recorded.
+    #[error(
+        "a persistent NameID already exists for this user and (SPNameQualifier, NameQualifier)"
+    )]
+    PersistentExists,
+}
+
+impl From<InsertError> for IdentError {
+    /// For a write that can only conflict on the persistent tuple
+    /// ([`IdentityStore::replace`]). `ValueTaken` is outside that contract
+    /// (`replace` upserts by value), so it is reported as a backend fault.
+    fn from(e: InsertError) -> Self {
+        match e {
+            InsertError::PersistentExists => IdentError::PersistentExists,
+            InsertError::Store(e) => IdentError::Store(e),
+            InsertError::ValueTaken => IdentError::Store(StoreError::new(
+                "the backend reported ValueTaken from a write that upserts by value",
+            )),
+        }
+    }
 }
 
 /// A storage backend failed (connection lost, timeout, query error, ...).
@@ -76,6 +98,13 @@ pub enum InsertError {
     /// The NameID value is already in use by another record.
     #[error("NameID value already in use")]
     ValueTaken,
+    /// The record is persistent, and the user already has a persistent record
+    /// for the same `(SPNameQualifier, NameQualifier)`. There can be only one:
+    /// `get_or_insert_persistent` is how to obtain it.
+    #[error(
+        "a persistent NameID already exists for this user and (SPNameQualifier, NameQualifier)"
+    )]
+    PersistentExists,
     /// The backend failed.
     #[error(transparent)]
     Store(#[from] StoreError),
@@ -227,15 +256,22 @@ pub trait IdentityStore: Send + Sync {
     ) -> Result<NameId, InsertError>;
 
     /// Insert a freshly minted NameID. `Err(InsertError::ValueTaken)` if any
-    /// record already has this value.
+    /// record already has this value. `Err(InsertError::PersistentExists)` if
+    /// the record is persistent and `user_id` already has a persistent record
+    /// for the same `(sp_name_qualifier, name_qualifier)`: the second uniqueness
+    /// constraint holds on every write path, not only on
+    /// [`get_or_insert_persistent`](Self::get_or_insert_persistent).
     fn insert(&self, user_id: &str, name_id: NameId) -> Result<(), InsertError>;
 
     /// Insert or overwrite the record with this value, assigning it to
     /// `user_id`. Used to update an existing association (e.g. a
-    /// ManageNameID `NewID`). Callers must not use it to create a second
-    /// persistent record for a `(user, sp_name_qualifier, name_qualifier)`
-    /// that already has one.
-    fn replace(&self, user_id: &str, name_id: NameId) -> Result<(), StoreError>;
+    /// ManageNameID `NewID`). It never reports `ValueTaken`, since it upserts
+    /// by value, but it holds the same persistent constraint as
+    /// [`insert`](Self::insert): `Err(InsertError::PersistentExists)` if the
+    /// write would leave `user_id` with a second persistent record (a different
+    /// value) for the same `(sp_name_qualifier, name_qualifier)`. Updating the
+    /// existing persistent record in place is fine.
+    fn replace(&self, user_id: &str, name_id: NameId) -> Result<(), InsertError>;
 
     /// Remove the record with this value, if any.
     fn remove(&self, value: &str) -> Result<(), StoreError>;
@@ -254,6 +290,22 @@ pub(crate) fn is_persistent_match(
     nid.format.as_deref() == Some(constants::NAMEID_PERSISTENT)
         && nid.sp_name_qualifier.as_deref() == sp_name_qualifier
         && nid.name_qualifier.as_deref() == name_qualifier
+}
+
+/// Whether writing `name_id` for `user_id` would leave the user with a second
+/// persistent record for the same `(sp_name_qualifier, name_qualifier)`: it is
+/// persistent, and a *different* value already holds that slot.
+fn persistent_tuple_taken(records: &[(String, NameId)], user_id: &str, name_id: &NameId) -> bool {
+    name_id.format.as_deref() == Some(constants::NAMEID_PERSISTENT)
+        && records.iter().any(|(user, existing)| {
+            user == user_id
+                && existing.value != name_id.value
+                && is_persistent_match(
+                    existing,
+                    name_id.sp_name_qualifier.as_deref(),
+                    name_id.name_qualifier.as_deref(),
+                )
+        })
 }
 
 /// In-memory [`IdentityStore`] for tests, examples and single-instance
@@ -317,12 +369,18 @@ impl IdentityStore for InMemoryIdentityStore {
         if records.iter().any(|(_, nid)| nid.value == name_id.value) {
             return Err(InsertError::ValueTaken);
         }
+        if persistent_tuple_taken(&records, user_id, &name_id) {
+            return Err(InsertError::PersistentExists);
+        }
         records.push((user_id.to_string(), name_id));
         Ok(())
     }
 
-    fn replace(&self, user_id: &str, name_id: NameId) -> Result<(), StoreError> {
+    fn replace(&self, user_id: &str, name_id: NameId) -> Result<(), InsertError> {
         let mut records = self.records.lock().unwrap();
+        if persistent_tuple_taken(&records, user_id, &name_id) {
+            return Err(InsertError::PersistentExists);
+        }
         match records
             .iter_mut()
             .find(|(_, nid)| nid.value == name_id.value)
@@ -526,8 +584,13 @@ impl<S: IdentityStore> IdentDb<S> {
 
     /// Associate a NameID with a local user (pysaml2 `store()`), replacing
     /// any record that already has the same value.
-    pub fn store(&self, user_id: &str, name_id: &NameId) -> Result<(), StoreError> {
-        self.store.replace(user_id, name_id.clone())
+    ///
+    /// Fails with [`IdentError::PersistentExists`] if `name_id` is persistent
+    /// and the user already has a different persistent NameID for the same
+    /// `(SPNameQualifier, NameQualifier)`; use
+    /// [`persistent_nameid`](Self::persistent_nameid) to obtain that one.
+    pub fn store(&self, user_id: &str, name_id: &NameId) -> Result<(), IdentError> {
+        Ok(self.store.replace(user_id, name_id.clone())?)
     }
 
     /// The local user a NameID was issued to (pysaml2 `find_local_id()`).
@@ -644,6 +707,12 @@ impl<S: IdentityStore> IdentDb<S> {
                     Ok(winner) => return Ok(winner),
                     Err(InsertError::ValueTaken) => continue,
                     Err(InsertError::Store(e)) => return Err(e),
+                    // It must hand back the existing record, never refuse.
+                    Err(InsertError::PersistentExists) => {
+                        return Err(StoreError::new(
+                            "the backend reported PersistentExists from get_or_insert_persistent",
+                        ))
+                    }
                 }
             }
             if !stored {
@@ -653,6 +722,13 @@ impl<S: IdentityStore> IdentDb<S> {
                 Ok(()) => return Ok(name_id),
                 Err(InsertError::ValueTaken) => continue,
                 Err(InsertError::Store(e)) => return Err(e),
+                // Only a persistent record can hit this, and those take the
+                // get_or_insert_persistent path above.
+                Err(InsertError::PersistentExists) => {
+                    return Err(StoreError::new(
+                        "the backend reported PersistentExists for a non-persistent record",
+                    ))
+                }
             }
         }
     }
@@ -894,11 +970,13 @@ mod tests {
         conformance::run(InMemoryIdentityStore::new);
     }
 
-    /// Delegates to the in-memory store, except where a test overrides a
+    /// Delegates to a store that does not enforce the persistent tuple on
+    /// `insert`/`replace` (the reference in-memory store now does, which would
+    /// mask the race these doubles model), except where a test overrides a
     /// method to model a backend that forgot a uniqueness constraint.
     #[derive(Default)]
     struct BrokenStore {
-        inner: InMemoryIdentityStore,
+        inner: PartialConstraintStore,
         no_value_uniqueness: bool,
         check_then_insert: bool,
     }
@@ -940,7 +1018,7 @@ mod tests {
             }
             self.inner.insert(user_id, name_id)
         }
-        fn replace(&self, user_id: &str, name_id: NameId) -> Result<(), StoreError> {
+        fn replace(&self, user_id: &str, name_id: NameId) -> Result<(), InsertError> {
             self.inner.replace(user_id, name_id)
         }
         fn remove(&self, value: &str) -> Result<(), StoreError> {
@@ -971,8 +1049,8 @@ mod tests {
         fn insert(&self, _: &str, _: NameId) -> Result<(), InsertError> {
             Err(down().into())
         }
-        fn replace(&self, _: &str, _: NameId) -> Result<(), StoreError> {
-            Err(down())
+        fn replace(&self, _: &str, _: NameId) -> Result<(), InsertError> {
+            Err(down().into())
         }
         fn remove(&self, _: &str) -> Result<(), StoreError> {
             Err(down())
@@ -1012,6 +1090,182 @@ mod tests {
         let db = IdentDb::new(DownStore, IDP);
         let nid = db.transient_nameid("alice", Some(SP)).unwrap();
         assert_eq!(nid.format.as_deref(), Some(constants::NAMEID_TRANSIENT));
+    }
+
+    /// A backend that enforces the persistent `(user, SP, NameQualifier)`
+    /// constraint only in `get_or_insert_persistent`, as the in-memory store
+    /// once did: `insert` (when `guard_insert` is off) and `replace` accept a
+    /// second persistent record. Value uniqueness holds.
+    #[derive(Default)]
+    struct PartialConstraintStore {
+        records: Mutex<Vec<(String, NameId)>>,
+        guard_insert: bool,
+    }
+
+    impl IdentityStore for PartialConstraintStore {
+        fn for_user(&self, user_id: &str) -> Result<Vec<NameId>, StoreError> {
+            let records = self.records.lock().unwrap();
+            Ok(records
+                .iter()
+                .filter(|(user, _)| user == user_id)
+                .map(|(_, nid)| nid.clone())
+                .collect())
+        }
+        fn user_for(&self, value: &str) -> Result<Option<String>, StoreError> {
+            let records = self.records.lock().unwrap();
+            Ok(records
+                .iter()
+                .find(|(_, nid)| nid.value == value)
+                .map(|(user, _)| user.clone()))
+        }
+        fn get_or_insert_persistent(
+            &self,
+            user_id: &str,
+            candidate: NameId,
+        ) -> Result<NameId, InsertError> {
+            let mut records = self.records.lock().unwrap();
+            if let Some((_, existing)) = records.iter().find(|(user, nid)| {
+                user == user_id
+                    && is_persistent_match(
+                        nid,
+                        candidate.sp_name_qualifier.as_deref(),
+                        candidate.name_qualifier.as_deref(),
+                    )
+            }) {
+                return Ok(existing.clone());
+            }
+            if records.iter().any(|(_, nid)| nid.value == candidate.value) {
+                return Err(InsertError::ValueTaken);
+            }
+            records.push((user_id.to_string(), candidate.clone()));
+            Ok(candidate)
+        }
+        fn insert(&self, user_id: &str, name_id: NameId) -> Result<(), InsertError> {
+            let mut records = self.records.lock().unwrap();
+            if records.iter().any(|(_, nid)| nid.value == name_id.value) {
+                return Err(InsertError::ValueTaken);
+            }
+            if self.guard_insert && persistent_tuple_taken(&records, user_id, &name_id) {
+                return Err(InsertError::PersistentExists);
+            }
+            records.push((user_id.to_string(), name_id));
+            Ok(())
+        }
+        fn replace(&self, user_id: &str, name_id: NameId) -> Result<(), InsertError> {
+            let mut records = self.records.lock().unwrap();
+            match records
+                .iter_mut()
+                .find(|(_, nid)| nid.value == name_id.value)
+            {
+                Some(slot) => *slot = (user_id.to_string(), name_id),
+                None => records.push((user_id.to_string(), name_id)),
+            }
+            Ok(())
+        }
+        fn remove(&self, value: &str) -> Result<(), StoreError> {
+            self.records
+                .lock()
+                .unwrap()
+                .retain(|(_, nid)| nid.value != value);
+            Ok(())
+        }
+        fn remove_all(&self, user_id: &str) -> Result<(), StoreError> {
+            self.records
+                .lock()
+                .unwrap()
+                .retain(|(user, _)| user != user_id);
+            Ok(())
+        }
+    }
+
+    fn persistent_nid(value: &str, sp: &str) -> NameId {
+        NameId {
+            value: value.to_string(),
+            format: Some(constants::NAMEID_PERSISTENT.to_string()),
+            name_qualifier: Some(IDP.to_string()),
+            sp_name_qualifier: Some(sp.to_string()),
+            sp_provided_id: None,
+        }
+    }
+
+    #[test]
+    fn the_reference_store_enforces_the_persistent_constraint_on_every_write_path() {
+        let store = InMemoryIdentityStore::new();
+        store
+            .get_or_insert_persistent("alice", persistent_nid("p1", SP))
+            .unwrap();
+        // A second persistent record for the same (user, SP, NameQualifier),
+        // by value-distinct `insert` or `replace`, is refused...
+        assert!(matches!(
+            store.insert("alice", persistent_nid("p2", SP)),
+            Err(InsertError::PersistentExists)
+        ));
+        assert!(matches!(
+            store.replace("alice", persistent_nid("p3", SP)),
+            Err(InsertError::PersistentExists)
+        ));
+        assert_eq!(store.for_user("alice").unwrap().len(), 1);
+        // ...while another SP, another user, another format, and an in-place
+        // update of the existing record are not.
+        store
+            .insert(
+                "alice",
+                persistent_nid("p4", "https://other-sp.example.com"),
+            )
+            .unwrap();
+        store.insert("bob", persistent_nid("p5", SP)).unwrap();
+        store.replace("alice", persistent_nid("p1", SP)).unwrap();
+        // Moving a persistent value to a user who already has one is refused too.
+        assert!(matches!(
+            store.replace("bob", persistent_nid("p4", "https://other-sp.example.com")),
+            Ok(())
+        ));
+        assert!(matches!(
+            store.replace("bob", persistent_nid("p1", SP)),
+            Err(InsertError::PersistentExists)
+        ));
+    }
+
+    #[test]
+    fn store_refuses_a_second_persistent_nameid_for_the_same_user_and_sp() {
+        let db = db();
+        let first = db.persistent_nameid("alice", Some(SP)).unwrap();
+        // pysaml2's `store()` must not be a way to mint a second "stable" id.
+        let second = NameId {
+            value: "another-value".to_string(),
+            ..first.clone()
+        };
+        assert!(matches!(
+            db.store("alice", &second),
+            Err(IdentError::PersistentExists)
+        ));
+        assert_eq!(db.name_ids_for("alice").unwrap(), vec![first.clone()]);
+        // Storing the existing identifier again (an update) is fine.
+        db.store("alice", &first).unwrap();
+    }
+
+    #[test]
+    fn conformance_catches_a_backend_that_only_guards_get_or_insert_persistent() {
+        let err = conformance::check(PartialConstraintStore::default).unwrap_err();
+        assert_eq!(err.check, "persistent_is_unique_on_every_write_path");
+        assert!(
+            err.message.contains("insert accepted a second persistent"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn conformance_catches_a_backend_that_guards_insert_but_not_replace() {
+        let err = conformance::check(|| PartialConstraintStore {
+            guard_insert: true,
+            ..Default::default()
+        })
+        .unwrap_err();
+        assert_eq!(err.check, "persistent_is_unique_on_every_write_path");
+        assert!(
+            err.message.contains("replace accepted a second persistent"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -1107,8 +1361,13 @@ mod tests {
         });
     }
 
+    // A check-then-insert backend has no persistent constraint on its write
+    // paths, so the whole suite now stops at the deterministic
+    // `persistent_is_unique_on_every_write_path` check before it reaches the
+    // racing ones. The race itself is still proven on its own by
+    // `a_single_check_names_the_constraint_a_backend_is_missing`.
     #[test]
-    #[should_panic(expected = "minted different persistent identifiers")]
+    #[should_panic(expected = "persistent_is_unique_on_every_write_path")]
     fn conformance_catches_a_check_then_insert_backend() {
         conformance::run(|| BrokenStore {
             check_then_insert: true,

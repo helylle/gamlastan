@@ -74,6 +74,7 @@ pub const CHECKS: &[&str] = &[
     "lookups_round_trip_and_isolate_users",
     "persistent_is_get_or_insert",
     "persistent_insert_reports_a_taken_value",
+    "persistent_is_unique_on_every_write_path",
     "find_persistent_is_format_and_qualifier_exact",
     "find_filters_on_every_field",
     "replace_upserts_by_value",
@@ -138,6 +139,9 @@ fn table<S: IdentityStore + 'static>() -> Vec<(&'static str, CheckFn<S>)> {
         }),
         ("persistent_insert_reports_a_taken_value", |s, _| {
             persistent_insert_reports_a_taken_value(&s)
+        }),
+        ("persistent_is_unique_on_every_write_path", |s, _| {
+            persistent_is_unique_on_every_write_path(&s)
         }),
         ("find_persistent_is_format_and_qualifier_exact", |s, _| {
             find_persistent_is_format_and_qualifier_exact(&s)
@@ -337,6 +341,79 @@ fn persistent_insert_reports_a_taken_value<S: IdentityStore>(s: &S) -> Outcome {
         Some("alice"),
         "the original owner keeps the value"
     );
+    Ok(())
+}
+
+fn persistent_is_unique_on_every_write_path<S: IdentityStore>(s: &S) -> Outcome {
+    step(
+        "get_or_insert_persistent",
+        s.get_or_insert_persistent("alice", persistent("p1", SP_A)),
+    )?;
+
+    // A second persistent record for the same (user, SP, NameQualifier), written
+    // with a different value, must be refused on `insert` and on `replace`, not
+    // only through `get_or_insert_persistent`. A backend whose partial unique
+    // index is missing, or whose other write paths bypass it, would otherwise
+    // hold two "stable" identifiers for one (user, SP).
+    match s.insert("alice", persistent("p2", SP_A)) {
+        Err(InsertError::PersistentExists) => {}
+        Ok(()) => {
+            return Err(
+                "insert accepted a second persistent record for the same (user, \
+                        SPNameQualifier, NameQualifier): the persistent uniqueness \
+                        constraint is missing or does not cover insert"
+                    .to_string(),
+            );
+        }
+        Err(InsertError::ValueTaken) => {
+            return Err("insert reported ValueTaken for a fresh value; expected \
+                        PersistentExists"
+                .to_string());
+        }
+        Err(e) => return Err(format!("backend call `insert` failed: {e}")),
+    }
+    match s.replace("alice", persistent("p3", SP_A)) {
+        Err(InsertError::PersistentExists) => {}
+        Ok(()) => {
+            return Err(
+                "replace accepted a second persistent record for the same (user, \
+                        SPNameQualifier, NameQualifier): the persistent uniqueness \
+                        constraint is missing or does not cover replace"
+                    .to_string(),
+            );
+        }
+        Err(InsertError::ValueTaken) => {
+            return Err("replace reported ValueTaken; it upserts by value".to_string());
+        }
+        Err(e) => return Err(format!("backend call `replace` failed: {e}")),
+    }
+
+    // Nothing was written by the refused attempts.
+    let alice = step("for_user", s.for_user("alice"))?;
+    ensure_eq!(
+        alice.len(),
+        1,
+        "a refused write must not leave a record behind"
+    );
+    ensure_eq!(alice[0].value.as_str(), "p1", "the original record is kept");
+    ensure!(
+        step("user_for", s.user_for("p2"))?.is_none()
+            && step("user_for", s.user_for("p3"))?.is_none(),
+        "a refused write must not be findable by its value"
+    );
+
+    // The constraint is exactly (user, SPNameQualifier, NameQualifier, persistent):
+    // other users, other SPs and other formats are unaffected...
+    step("insert", s.insert("alice", persistent("p4", SP_B)))?;
+    step("insert", s.insert("bob", persistent("p5", SP_A)))?;
+    step(
+        "insert",
+        s.insert("alice", nid("e1", constants::NAMEID_EMAIL, Some(SP_A))),
+    )?;
+    // ...and the existing persistent record can still be updated in place.
+    let mut updated = persistent("p1", SP_A);
+    updated.sp_provided_id = Some("alias".to_string());
+    step("replace", s.replace("alice", updated))?;
     Ok(())
 }
 

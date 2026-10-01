@@ -1053,7 +1053,7 @@ impl IdentityStore for CustomStore {
     fn insert(&self, user_id: &str, name_id: NameId) -> Result<(), InsertError> {
         self.0.insert(user_id, name_id)
     }
-    fn replace(&self, user_id: &str, name_id: NameId) -> Result<(), StoreError> {
+    fn replace(&self, user_id: &str, name_id: NameId) -> Result<(), InsertError> {
         self.0.replace(user_id, name_id)
     }
     fn remove(&self, value: &str) -> Result<(), StoreError> {
@@ -1259,6 +1259,66 @@ fn signing_algorithms_come_from_the_entity_and_the_requested_role_only() {
     assert_eq!(resolved.digest, Some(DigestMethod::Sha384));
 }
 
+#[test]
+fn the_requested_authn_context_helper_keeps_declaration_refs() {
+    let mut p = params(processed(false, false, vec![], None));
+    assert!(
+        p.requested_authn_context().is_none(),
+        "no constraint at all"
+    );
+
+    // A declaration-only request is still a constraint: the public helper must
+    // not report it as "none", or a caller using it would lose the constraint.
+    p.processed.requested_authn_context_decl_refs = vec!["urn:example:decl".to_string()];
+    let requested = p.requested_authn_context().expect("a constraint");
+    assert!(requested.authn_context_class_refs.is_empty());
+    assert_eq!(
+        requested.authn_context_decl_refs,
+        vec!["urn:example:decl".to_string()]
+    );
+}
+
+#[test]
+fn a_descriptor_for_a_different_sp_is_refused() {
+    use crate::idp::orchestrator::{create_denial_response, Denial};
+    use crate::metadata::types::entity_descriptor::EntityDescriptor;
+    use crate::profiles::error::ProfileError;
+
+    let decisions = ReleasePolicy::new();
+    let engine = engine_with_decisions(&decisions);
+    let request = || processed(false, false, vec![], None);
+    let other = EntityDescriptor::for_sp("https://other-sp.example.org/metadata", sp_sso());
+
+    // The constructor reports the mismatch where the parameters are built.
+    assert!(matches!(
+        ResponseParams::new(request(), sp_sso(), Some(other.clone())),
+        Err(ProfileError::SpEntityMismatch { .. })
+    ));
+    assert!(matches!(
+        ResponseParams::from_entity(request(), other.clone()),
+        Err(ProfileError::SpEntityMismatch { .. })
+    ));
+
+    // The fields are public, so the engine does not rely on the constructor:
+    // SP B's entity categories must not decide what SP A's request releases.
+    let mut p = params(request());
+    p.sp_entity = Some(other);
+    assert!(matches!(
+        create_authn_response(&engine, &p, &subject_without_mail()),
+        Err(ProfileError::SpEntityMismatch { .. })
+    ));
+    assert!(matches!(
+        create_denial_response(&engine, &p, &Denial::Cancelled),
+        Err(ProfileError::SpEntityMismatch { .. })
+    ));
+
+    // The SP's own descriptor is accepted, and from_entity takes the SAML 2.0
+    // role from that same descriptor.
+    let own = EntityDescriptor::for_sp(SP, sp_sso());
+    assert!(ResponseParams::new(request(), sp_sso(), Some(own.clone())).is_ok());
+    assert!(ResponseParams::from_entity(request(), own).is_ok());
+}
+
 // ── Per-SP signing algorithms ───────────────────────────────────────────────
 
 fn sha512_policy() -> ReleasePolicy {
@@ -1351,8 +1411,8 @@ impl IdentityStore for DownIdentityStore {
     fn insert(&self, _: &str, _: NameId) -> Result<(), InsertError> {
         Err(outage().into())
     }
-    fn replace(&self, _: &str, _: NameId) -> Result<(), StoreError> {
-        Err(outage())
+    fn replace(&self, _: &str, _: NameId) -> Result<(), InsertError> {
+        Err(outage().into())
     }
     fn remove(&self, _: &str) -> Result<(), StoreError> {
         Err(outage())

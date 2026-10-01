@@ -514,11 +514,9 @@ async fn idp_sso(
     // released attributes, and authn context, then assembles and signs the
     // response. This is preferred over the lower-level AuthnCallback.
     if let (Some(callback), Some(parts)) = (&authn_subject_callback, &response_engine) {
-        let params = ResponseParams {
-            processed: processed.clone(),
-            sp_sso: sp_sso.clone(),
-            sp_entity: Some(sp_entity.clone()),
-        };
+        let params =
+            ResponseParams::new(processed.clone(), sp_sso.clone(), Some(sp_entity.clone()))
+                .map_err(SamlActixError::Profile)?;
         let engine = parts.engine();
         let engine = &engine;
 
@@ -2110,7 +2108,7 @@ mod tests {
             &self,
             user_id: &str,
             name_id: gamlastan::core::assertion::name_id::NameId,
-        ) -> Result<(), gamlastan::idp::ident::StoreError> {
+        ) -> Result<(), gamlastan::idp::ident::InsertError> {
             self.0.replace(user_id, name_id)
         }
         fn remove(&self, value: &str) -> Result<(), gamlastan::idp::ident::StoreError> {

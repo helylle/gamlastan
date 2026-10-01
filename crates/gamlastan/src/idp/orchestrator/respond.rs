@@ -225,6 +225,7 @@ pub fn create_authn_response(
     params: &ResponseParams,
     subject: &AuthenticatedSubject,
 ) -> Result<super::ResponseOutcome, ProfileError> {
+    params.check_bound()?;
     let processed = &params.processed;
     let sp = &params.sp_sso;
 
@@ -426,6 +427,7 @@ pub fn create_denial_response(
     params: &ResponseParams,
     denial: &Denial,
 ) -> Result<IssuedResponse, ProfileError> {
+    params.check_bound()?;
     let processed = &params.processed;
     let now = Utc::now();
 

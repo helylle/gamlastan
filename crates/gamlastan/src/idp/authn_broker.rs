@@ -192,26 +192,25 @@ impl AuthnBroker {
             );
         };
 
+        // The listed refs are alternatives (saml-core-2.0-os 3.3.2.2.1:
+        // "one of the authentication contexts specified"), for every
+        // comparison: a method qualifies if it satisfies any of them. The
+        // result keeps the request's order, so earlier refs are preferred.
         let comparison = req.comparison;
-        if !req.authn_context_class_refs.is_empty() {
-            if comparison == AuthnContextComparison::Exact {
-                let mut result: Vec<&AuthnMethod> = Vec::new();
-                for class_ref in &req.authn_context_class_refs {
-                    for m in self.pick_by_class_ref(class_ref, comparison) {
-                        if !result.contains(&m) {
-                            result.push(m);
-                        }
-                    }
-                }
-                result
-            } else {
-                self.pick_by_class_ref(&req.authn_context_class_refs[0], comparison)
-            }
-        } else if !req.authn_context_decl_refs.is_empty() {
-            self.pick_by_class_ref(&req.authn_context_decl_refs[0], comparison)
+        let refs = if !req.authn_context_class_refs.is_empty() {
+            &req.authn_context_class_refs
         } else {
-            vec![]
+            &req.authn_context_decl_refs
+        };
+        let mut result: Vec<&AuthnMethod> = Vec::new();
+        for class_ref in refs {
+            for m in self.pick_by_class_ref(class_ref, comparison) {
+                if !result.contains(&m) {
+                    result.push(m);
+                }
+            }
         }
+        result
     }
 }
 
@@ -319,6 +318,47 @@ mod tests {
         )));
         let methods: Vec<_> = picked.iter().map(|m| m.method.as_str()).collect();
         assert_eq!(methods, vec!["/login/ppt", "/login/cert"]);
+    }
+
+    #[test]
+    fn every_listed_class_ref_is_an_alternative_for_every_comparison() {
+        let b = broker();
+        let unknown = "urn:example:unknown";
+        for comparison in [
+            AuthnContextComparison::Exact,
+            AuthnContextComparison::Minimum,
+            AuthnContextComparison::Maximum,
+            AuthnContextComparison::Better,
+        ] {
+            // An unknown first ref must not hide a satisfiable second one.
+            let single = b.pick(Some(&requested(
+                &[constants::AUTHN_CONTEXT_PASSWORD],
+                comparison,
+            )));
+            let listed = b.pick(Some(&requested(
+                &[unknown, constants::AUTHN_CONTEXT_PASSWORD],
+                comparison,
+            )));
+            assert_eq!(listed, single, "{comparison:?}");
+        }
+        // The union is deduplicated and keeps the request's order.
+        let picked = b.pick(Some(&requested(
+            &[
+                constants::AUTHN_CONTEXT_X509,
+                constants::AUTHN_CONTEXT_PASSWORD,
+            ],
+            AuthnContextComparison::Minimum,
+        )));
+        let methods: Vec<&str> = picked.iter().map(|m| m.method.as_str()).collect();
+        assert_eq!(methods.first(), Some(&"/login/cert"));
+        assert!(methods.contains(&"/login/password"));
+        assert_eq!(
+            methods.len(),
+            methods
+                .iter()
+                .collect::<std::collections::HashSet<_>>()
+                .len()
+        );
     }
 
     #[test]

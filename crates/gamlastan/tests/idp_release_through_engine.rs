@@ -85,7 +85,7 @@ fn sp_entity_with_refeds() -> EntityDescriptor {
         )),
         roles: EntityRoles::Roles {
             idp_sso: vec![],
-            sp_sso: vec![],
+            sp_sso: vec![sp_sso()],
             authn_authority: vec![],
             attr_authority: vec![],
             pdp: vec![],

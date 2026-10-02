@@ -290,6 +290,12 @@ failure is a real protocol error rather than a silent per-integrator choice.
   a requested subject. The request parser rejects what it used to repair: an `IDPEntry`
   without `ProviderID`, and a repeated singleton child, so what a consumer
   reads is what the SP sent.
+- `AuthnBroker::pick` treats every listed class ref (else decl ref) as an
+  alternative for every comparison and returns the deduplicated union in the
+  request's order (SAML Core 3.3.2.2.1); pysaml2 reads only the first ref for
+  `minimum`, `maximum` and `better`. `nameid-format:encrypted` is never issued
+  (it asks for an `EncryptedID` the response path cannot produce), even with
+  no supported-format set configured.
 - Breaking (pre-release): `AuthnBroker::pick` with `Comparison="exact"`
   changed from level-based matching to literal class-ref matching (see
   above). Any integrator relying on the old broadened behaviour must pass
@@ -374,8 +380,9 @@ failure is a real protocol error rather than a silent per-integrator choice.
   declaration-only or empty `RequestedAuthnContext` is denied (never treated as
   unconstrained); `allow_exact_level_matching` is consistent between
   `check_request` and the response; the advertised algorithms come from the
-  entity and the requested role only; a descriptor for a different SP is
-  refused by `ResponseParams::new` and by both response paths. `gamlastan-actix`: `/saml/metadata`
+  entity and the requested role only; a descriptor for a different SP, or an
+  SP role that is not one of the descriptor's own, is refused by
+  `ResponseParams::new` and by both response paths. `gamlastan-actix`: `/saml/metadata`
   advertises the certificate of the path that signs (the engine's only with an
   `AuthnSubjectCallback`).
 - `idp/orchestrator/tests.rs` (NameID formats): by default any requested

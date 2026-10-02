@@ -39,7 +39,8 @@ where needed to correct protocol handling.
   satisfying an already-resolved method's literal class ref does not).
 - Added `ResponseParams::new` and `ResponseParams::from_entity`, which check
   that the SP entity descriptor is the SP the request was validated for
-  (`ProfileError::SpEntityMismatch`), and `from_entity` takes the SAML 2.0 SP
+  (`ProfileError::SpEntityMismatch`), `new` also requires the supplied SP role to
+  be one of that descriptor's own (`ProfileError::SpRoleMismatch`), and `from_entity` takes the SAML 2.0 SP
   role from that same descriptor. The descriptor's entity categories and
   `subject-id:req` decide what is released, so pairing one SP's request with
   another SP's descriptor would release attributes under the wrong policy. The
@@ -159,6 +160,19 @@ where needed to correct protocol handling.
   insertion order for a map with several wire names per local name.
   `from_static` now goes through `from_directions` with identical results,
   which a test checks for every shipped map.
+- `AuthnBroker::pick` treats every listed `AuthnContextClassRef` (or, failing
+  those, `AuthnContextDeclRef`) as an alternative for every comparison, not
+  just `exact`: a method qualifies if it satisfies any of them, deduplicated
+  and in the request's order. Before, `minimum`, `maximum` and `better` read
+  only the first ref, so `[unknown, supported]` was denied. This follows SAML
+  Core 3.3.2.2.1 ("one of the authentication contexts specified") and differs
+  from pysaml2, which also reads only the first; it can only accept requests
+  that were refused before.
+- `nameid-format:encrypted` is never issued, with or without an opt-in
+  supported-format set: it asks for an `EncryptedID`, which the response path
+  cannot produce, and a plain NameID labelled that way would break the
+  requester's confidentiality requirement. The request is denied with
+  `InvalidNameIDPolicy`.
 - Added an opt-in supported-format set for requested NameIDs:
   `PolicyEntry::with_supported_nameid_formats`,
   `ReleasePolicy::supports_nameid_format` and `ISSUABLE_NAMEID_FORMATS`. With a

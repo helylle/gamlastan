@@ -177,6 +177,14 @@ pub enum ProfileError {
         descriptor: String,
     },
 
+    /// The SP role supplied for response assembly is not one of the supplied
+    /// entity descriptor's own SP roles.
+    #[error("the SP role is not one of the SP roles of entity descriptor {entity_id:?}")]
+    SpRoleMismatch {
+        /// The entity ID of the descriptor the role was checked against.
+        entity_id: String,
+    },
+
     /// An identity or assertion store backend failed. An operational fault,
     /// not a protocol refusal: it must surface as an error, never as a denial.
     #[error(transparent)]

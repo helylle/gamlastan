@@ -169,17 +169,25 @@ impl ResponseParams {
     }
 
     /// Check that the entity descriptor, if present, is for the SP the request
-    /// came from.
+    /// came from, and that `sp_sso` is one of that entity's own SP roles (the
+    /// role's `AttributeConsumingService`s, `WantAssertionsSigned` and
+    /// algorithm extensions are trusted, so it must not come from another SP).
     pub(super) fn check_bound(&self) -> Result<(), ProfileError> {
-        match &self.sp_entity {
-            Some(entity) if entity.entity_id != self.processed.sp_entity_id => {
-                Err(ProfileError::SpEntityMismatch {
-                    request: self.processed.sp_entity_id.clone(),
-                    descriptor: entity.entity_id.clone(),
-                })
-            }
-            _ => Ok(()),
+        let Some(entity) = &self.sp_entity else {
+            return Ok(());
+        };
+        if entity.entity_id != self.processed.sp_entity_id {
+            return Err(ProfileError::SpEntityMismatch {
+                request: self.processed.sp_entity_id.clone(),
+                descriptor: entity.entity_id.clone(),
+            });
         }
+        if !entity.sp_sso_descriptors().contains(&self.sp_sso) {
+            return Err(ProfileError::SpRoleMismatch {
+                entity_id: entity.entity_id.clone(),
+            });
+        }
+        Ok(())
     }
 
     /// The SP's published entity categories (empty when no entity descriptor).

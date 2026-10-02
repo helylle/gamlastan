@@ -420,10 +420,18 @@ impl ReleasePolicy {
     ///
     /// With no supported set configured
     /// ([`PolicyEntry::with_supported_nameid_formats`]) every format is
-    /// accepted, as in pysaml2. With one, the SP's own default format
+    /// accepted, as in pysaml2, except `nameid-format:encrypted`, which is
+    /// always refused because the response path cannot encrypt a NameID. With one, the SP's own default format
     /// ([`nameid_format`](Self::nameid_format)) is always allowed and any other
     /// format must be in the set.
     pub fn supports_nameid_format(&self, sp_entity_id: &str, format: &str) -> bool {
+        // `nameid-format:encrypted` asks for an `EncryptedID`, not an opaque
+        // identifier. The response path cannot encrypt, so issuing a plain
+        // NameID under that label would break the requester's
+        // confidentiality requirement: never supported, whatever is configured.
+        if format == constants::NAMEID_ENCRYPTED {
+            return false;
+        }
         match self.get_ref(sp_entity_id, |e| e.supported_nameid_formats.as_ref()) {
             None => true,
             Some(formats) => {
@@ -941,11 +949,28 @@ mod tests {
         let policy = ReleasePolicy::new();
         for format in [
             constants::NAMEID_TRANSIENT,
-            "urn:oasis:names:tc:SAML:2.0:nameid-format:encrypted",
+            "urn:oasis:names:tc:SAML:1.1:nameid-format:X509SubjectName",
             "urn:evil:made-up",
         ] {
             assert!(policy.supports_nameid_format("https://sp.example.org", format));
         }
+    }
+
+    #[test]
+    fn the_encrypted_format_is_never_supported() {
+        // It asks for an EncryptedID, which the response path cannot produce:
+        // refused with no set configured, and even when listed or SP-default.
+        let sp = "https://sp.example.org";
+        assert!(!ReleasePolicy::new().supports_nameid_format(sp, constants::NAMEID_ENCRYPTED));
+        let listed = ReleasePolicy::with_default(
+            PolicyEntry::new()
+                .with_supported_nameid_formats(vec![constants::NAMEID_ENCRYPTED.to_string()]),
+        );
+        assert!(!listed.supports_nameid_format(sp, constants::NAMEID_ENCRYPTED));
+        let as_default = ReleasePolicy::with_default(
+            PolicyEntry::new().with_nameid_format(constants::NAMEID_ENCRYPTED),
+        );
+        assert!(!as_default.supports_nameid_format(sp, constants::NAMEID_ENCRYPTED));
     }
 
     #[test]

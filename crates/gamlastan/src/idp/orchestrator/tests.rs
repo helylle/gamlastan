@@ -1439,6 +1439,37 @@ fn an_unsupported_requested_nameid_format_is_denied_and_nothing_is_minted() {
 }
 
 #[test]
+fn the_encrypted_nameid_format_is_denied_even_with_no_supported_set() {
+    use crate::idp::orchestrator::Denial;
+    with_engine(&ReleasePolicy::new(), |engine, idents| {
+        assert_eq!(
+            issued_name_id(engine, crate::core::constants::NAMEID_ENCRYPTED),
+            Err(Denial::InvalidNameIdPolicy)
+        );
+        assert!(idents
+            .name_ids_for(&subject_without_mail().subject_id)
+            .unwrap()
+            .is_empty());
+    });
+}
+
+#[test]
+fn the_sp_role_must_belong_to_the_supplied_entity() {
+    use crate::metadata::types::entity_descriptor::EntityDescriptor;
+    let mut foreign = sp_sso();
+    foreign.want_assertions_signed = Some(false);
+    let entity = EntityDescriptor::for_sp(SP, sp_sso());
+    let proc = processed(false, false, vec![], None);
+
+    // Its own role is accepted; another SP's role is not.
+    assert!(ResponseParams::new(proc.clone(), sp_sso(), Some(entity.clone())).is_ok());
+    assert!(matches!(
+        ResponseParams::new(proc, foreign, Some(entity)),
+        Err(crate::profiles::error::ProfileError::SpRoleMismatch { .. })
+    ));
+}
+
+#[test]
 fn by_default_any_requested_nameid_format_is_accepted_as_in_pysaml2() {
     // pysaml2 never validates the requested format, so by default neither does
     // this engine: restricting formats is opt-in.

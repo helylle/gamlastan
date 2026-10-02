@@ -499,8 +499,12 @@ mod orchestrator_attacks {
         let idents = IdentDb::in_memory(IDP);
         let broker = AuthnBroker::new();
         let decisions = ReleasePolicy::new();
-        let signer = gamlastan::crypto::SamlSigner::new(gamlastan::crypto::KeysManager::new());
-        let engine = engine(&idents, &broker, &decisions, &signer);
+        // The default policy signs the assertion, so this needs a real key.
+        let (signer, cert) = super::response_signing_fixture_signer();
+        let engine = ResponseEngine {
+            cert_der_b64: &cert,
+            ..engine(&idents, &broker, &decisions, &signer)
+        };
 
         const PAYLOAD: &str = "evil\"><saml:Evil xmlns:saml=\"x\"/>";
         let mut request = processed(PAYLOAD);

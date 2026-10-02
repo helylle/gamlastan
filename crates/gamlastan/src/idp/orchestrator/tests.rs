@@ -55,6 +55,13 @@ fn fixture_signer() -> (SamlSigner, &'static str) {
     (signer, Box::leak(cert_b64.into_boxed_str()))
 }
 
+/// One signer for tests that do not care about it. Responses are signed unless
+/// the policy says otherwise, so an engine needs a real key.
+fn shared_signer() -> &'static (SamlSigner, &'static str) {
+    static SIGNER: std::sync::OnceLock<(SamlSigner, &'static str)> = std::sync::OnceLock::new();
+    SIGNER.get_or_init(fixture_signer)
+}
+
 /// A broker with three methods at increasing strength.
 fn broker() -> AuthnBroker {
     let mut b = AuthnBroker::new();
@@ -122,12 +129,11 @@ fn engine() -> ResponseEngine<'static> {
     static BROKER: std::sync::OnceLock<AuthnBroker> = std::sync::OnceLock::new();
     static IDENTS: std::sync::OnceLock<IdentDb> = std::sync::OnceLock::new();
     static DECISIONS: std::sync::OnceLock<ReleasePolicy> = std::sync::OnceLock::new();
-    static SIGNER: std::sync::OnceLock<SamlSigner> = std::sync::OnceLock::new();
 
     let broker = BROKER.get_or_init(broker);
     let idents = IDENTS.get_or_init(|| IdentDb::in_memory(IDP));
     let decisions = DECISIONS.get_or_init(ReleasePolicy::new);
-    let signer = SIGNER.get_or_init(|| SamlSigner::new(KeysManager::new()));
+    let (signer, cert) = shared_signer();
 
     ResponseEngine {
         idp_entity_id: IDP,
@@ -137,7 +143,7 @@ fn engine() -> ResponseEngine<'static> {
         broker,
         assertions: None,
         signer,
-        cert_der_b64: "",
+        cert_der_b64: cert,
     }
 }
 
@@ -206,7 +212,7 @@ fn session_with_unregistered_inline_class_ref_is_reused_when_nothing_requested()
     let idents = IdentDb::in_memory(IDP);
     let mut broker = AuthnBroker::new();
     broker.add(constants::AUTHN_CONTEXT_UNSPECIFIED, "/login/any", 0, None);
-    let signer = SamlSigner::new(KeysManager::new());
+    let (signer, cert) = shared_signer();
     let engine = ResponseEngine {
         idp_entity_id: IDP,
         decisions: &decisions,
@@ -214,8 +220,8 @@ fn session_with_unregistered_inline_class_ref_is_reused_when_nothing_requested()
         idents: &idents,
         broker: &broker,
         assertions: None,
-        signer: &signer,
-        cert_der_b64: "",
+        signer,
+        cert_der_b64: cert,
     };
 
     let p = params(processed(false, false, vec![], None));
@@ -241,7 +247,7 @@ fn exact_request_for_an_unregistered_inline_class_ref_is_satisfied_by_literal_ma
     let decisions = ReleasePolicy::new();
     let idents = IdentDb::in_memory(IDP);
     let broker = AuthnBroker::new(); // deliberately empty - no registrations
-    let signer = SamlSigner::new(KeysManager::new());
+    let (signer, cert) = shared_signer();
     let engine = ResponseEngine {
         idp_entity_id: IDP,
         decisions: &decisions,
@@ -249,8 +255,8 @@ fn exact_request_for_an_unregistered_inline_class_ref_is_satisfied_by_literal_ma
         idents: &idents,
         broker: &broker,
         assertions: None,
-        signer: &signer,
-        cert_der_b64: "",
+        signer,
+        cert_der_b64: cert,
     };
 
     let unregistered = "urn:custom:inline-method-never-registered";
@@ -1124,8 +1130,8 @@ fn response_engine_accepts_a_non_default_identity_store() {
         idents: &idents, // &IdentDb<CustomStore> coerces to &dyn NameIdConstructor
         broker: &broker,
         assertions: None,
-        signer: &SamlSigner::new(KeysManager::new()),
-        cert_der_b64: "",
+        signer: &shared_signer().0,
+        cert_der_b64: shared_signer().1,
     };
 
     let p = params(processed(false, false, vec![], None));
@@ -1502,6 +1508,63 @@ fn the_encrypted_nameid_format_is_denied_even_with_no_supported_set() {
 }
 
 #[test]
+fn the_default_policy_signs_the_assertion() {
+    // Nothing configured: the response is not signed, so the assertion must be.
+    let decisions = ReleasePolicy::new();
+    with_engine(&decisions, |engine, _| {
+        let p = params(processed(false, false, vec![], None));
+        match create_authn_response(engine, &p, &subject_without_mail()).unwrap() {
+            ResponseOutcome::Issued(issued) => {
+                assert!(issued.xml.contains("<ds:SignatureValue>"), "{}", issued.xml)
+            }
+            other => panic!("expected Issued, got {other:?}"),
+        }
+    });
+}
+
+#[test]
+fn an_empty_broker_defers_an_exact_request_to_the_callback() {
+    let broker = AuthnBroker::new();
+    let decisions = ReleasePolicy::new();
+    let idents = IdentDb::in_memory(IDP);
+    let (signer, cert) = shared_signer();
+    let engine = ResponseEngine {
+        idp_entity_id: IDP,
+        decisions: &decisions,
+        release: &PassThroughRelease,
+        idents: &idents,
+        broker: &broker,
+        assertions: None,
+        signer,
+        cert_der_b64: cert,
+    };
+    let p = params(processed(
+        false,
+        false,
+        vec!["urn:custom:inline-method"],
+        Some(AuthnContextComparison::Exact),
+    ));
+    // No session and nothing registered: authenticate (the callback decides and
+    // the response-time check enforces), rather than a pre-login denial.
+    assert!(matches!(
+        check_request(&engine, &p, None),
+        Disposition::Authenticate { methods } if methods.is_empty()
+    ));
+    // With a registered method that does not match, it is still a denial.
+    let populated = self::broker();
+    let engine = ResponseEngine {
+        broker: &populated,
+        ..engine
+    };
+    assert!(matches!(
+        check_request(&engine, &p, None),
+        Disposition::Deny {
+            denial: crate::idp::orchestrator::Denial::NoAuthnContext
+        }
+    ));
+}
+
+#[test]
 fn an_encrypted_default_format_is_a_config_error_never_a_plaintext_nameid() {
     use crate::idp::policy::PolicyEntry;
     let decisions = ReleasePolicy::with_default(
@@ -1754,8 +1817,8 @@ fn identity_store_outage_is_an_error_not_a_denial() {
         idents: &idents,
         broker: &broker,
         assertions: None,
-        signer: &SamlSigner::new(KeysManager::new()),
-        cert_der_b64: "",
+        signer: &shared_signer().0,
+        cert_der_b64: shared_signer().1,
     };
 
     // A persistent NameID needs a store lookup. The outage must not look like
@@ -1787,8 +1850,8 @@ fn transient_issuance_survives_an_identity_store_outage() {
         idents: &idents,
         broker: &broker,
         assertions: None,
-        signer: &SamlSigner::new(KeysManager::new()),
-        cert_der_b64: "",
+        signer: &shared_signer().0,
+        cert_der_b64: shared_signer().1,
     };
     let p = params(processed(false, false, vec![], None));
     let outcome = create_authn_response(&engine, &p, &subject_without_mail()).unwrap();
@@ -1808,8 +1871,8 @@ fn assertion_store_outage_is_an_error_not_a_silent_skip() {
         idents: &idents,
         broker: &broker,
         assertions: Some(&assertions),
-        signer: &SamlSigner::new(KeysManager::new()),
-        cert_der_b64: "",
+        signer: &shared_signer().0,
+        cert_der_b64: shared_signer().1,
     };
     let p = params(processed(false, false, vec![], None));
     let result = create_authn_response(&engine, &p, &subject_without_mail());
@@ -1833,8 +1896,8 @@ fn persist_transient_lets_the_issued_nameid_resolve_to_its_user() {
         idents: &idents,
         broker: &broker,
         assertions: None,
-        signer: &SamlSigner::new(KeysManager::new()),
-        cert_der_b64: "",
+        signer: &shared_signer().0,
+        cert_der_b64: shared_signer().1,
     };
     let subject = subject_without_mail();
     let p = params(processed(false, false, vec![], None));

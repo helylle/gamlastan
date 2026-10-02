@@ -128,8 +128,9 @@ where needed to correct protocol handling.
   `sign_response_xml_with`, `signature_template_with_digest` and
   `SamlSigner::signature_method_uri_for`. An HSM-backed signer can only use its
   token's own signature algorithm, and asking for another is an error, but only
-  when something is actually signed: a response that signs nothing never
-  consults the signer. The SP's advertisement is read from the entity-level
+  when something is actually signed: `sign_response_xml_with`, asked to sign
+  nothing, never consults the signer (the orchestrator never asks that, see
+  below). The SP's advertisement is read from the entity-level
   extensions and the SAML 2.0 SP role the request was bound to, not from every
   IdP and SP role of the entity (which `EntityDescriptor::supported_algorithms`
   aggregates), so an algorithm advertised only by another role is not selected.
@@ -288,6 +289,19 @@ where needed to correct protocol handling.
   `PyIdentityStore` is one) implements `KeyValueStore` for the `Eptid` cache
   and the new `IdentityStore` for `IdentDb`; code still implementing the old
   three methods as `IdentityStore` fails to compile rather than misbehaving.
+- **Behaviour change:** `SignTargets::resolve` never resolves to "sign nothing".
+  The Web Browser SSO profile (SAML Profiles 4.1.4.5) requires a signed
+  Response or a signed Assertion, so when the response is not to be signed the
+  assertion is. A default `ReleasePolicy` (nothing configured) therefore signs
+  the assertion, and the engine needs a real signing key; before, it issued an
+  unsigned, forgeable response. pysaml2's default signs nothing; set
+  `SignTargets::response` to sign the envelope instead.
+- `AuthnBroker::is_empty` was added. `check_request` no longer denies a request
+  with `NoAuthnContext` before login when the broker has no registrations at
+  all: an `Inline`-only deployment (a proxy) has no capabilities to check, so it
+  gets `Authenticate` with no methods and `create_authn_response` checks the
+  method the callback reports. A broker with registrations that match nothing
+  still denies.
 - `create_authn_response` resolves and checks the authentication method before
   it constructs the NameID, so a stale `BrokerReference` or a method that does
   not satisfy the request is refused before anything is stored. It also

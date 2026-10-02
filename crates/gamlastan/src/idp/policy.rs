@@ -84,10 +84,19 @@ pub struct SignTargets {
 
 impl SignTargets {
     /// Resolve the on-demand part against the SP's metadata flag.
+    ///
+    /// Never resolves to "sign nothing": the Web Browser SSO profile
+    /// (SAML Profiles 4.1.4.5) requires the Response or the Assertion carrying
+    /// the `AuthnStatement` to be signed, and an unsigned one is forgeable. If
+    /// the response is not signed the assertion is, so the default (nothing
+    /// configured) signs the assertion. This is stricter than pysaml2, whose
+    /// default signs nothing.
     pub fn resolve(self, sp_wants_assertions_signed: bool) -> ResolvedSignTargets {
         ResolvedSignTargets {
             sign_response: self.response,
-            sign_assertion: self.assertion || (self.on_demand && sp_wants_assertions_signed),
+            sign_assertion: self.assertion
+                || (self.on_demand && sp_wants_assertions_signed)
+                || !self.response,
         }
     }
 }
@@ -470,7 +479,8 @@ impl ReleasePolicy {
         now + self.lifetime(sp_entity_id)
     }
 
-    /// Signing targets for the SP (default: nothing).
+    /// Signing targets for the SP (default: none configured, which
+    /// [`SignTargets::resolve`] turns into signing the assertion).
     pub fn sign(&self, sp_entity_id: &str) -> SignTargets {
         self.get(sp_entity_id, |e| e.sign).unwrap_or_default()
     }
@@ -1676,6 +1686,31 @@ mod tests {
         assert!(resolved.sign_assertion);
         let resolved = targets.resolve(false);
         assert!(!resolved.sign_assertion);
+    }
+
+    #[test]
+    fn a_response_is_never_left_entirely_unsigned() {
+        // Nothing configured, or on-demand an SP that does not ask: the
+        // assertion is signed, since the response is not.
+        for targets in [
+            SignTargets::default(),
+            SignTargets {
+                on_demand: true,
+                ..SignTargets::default()
+            },
+        ] {
+            for wants in [true, false] {
+                let r = targets.resolve(wants);
+                assert!(r.sign_assertion, "{targets:?} wants={wants}");
+            }
+        }
+        // A signed response alone is enough, as configured.
+        let r = SignTargets {
+            response: true,
+            ..SignTargets::default()
+        }
+        .resolve(false);
+        assert!(r.sign_response && !r.sign_assertion);
     }
 
     #[test]

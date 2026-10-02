@@ -166,8 +166,12 @@ existing primitives into the profile flow, and move the semantics proven in
    read from the entity-level extensions and the SAML 2.0 SP role the request
    was bound to, not from every role of the entity; signatures are matched
    against `alg:SigningMethod` entries and digests against `alg:DigestMethod`
-   entries separately. A response that signs
-   nothing never consults the signer.
+   entries separately. The orchestrator never issues an unsigned success
+   response: `SignTargets::resolve` signs the assertion when the response is
+   not signed (SAML Profiles 4.1.4.5), so the default policy signs the
+   assertion. An empty `AuthnBroker` means an `Inline`-only deployment with no
+   capabilities to check, so `check_request` leaves the decision to the
+   response-time check instead of denying before login.
 
 2. Invert the application contract. The application supplies what only it
    knows -- subject identifier, raw attribute values, which authentication

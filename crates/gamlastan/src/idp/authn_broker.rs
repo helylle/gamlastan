@@ -58,6 +58,11 @@ impl AuthnBroker {
         AuthnBroker::default()
     }
 
+    /// Whether no method is registered.
+    pub fn is_empty(&self) -> bool {
+        self.methods.is_empty()
+    }
+
     /// Restore pysaml2's looser `exact` semantics (matching by security
     /// level rather than literal class-ref membership). See
     /// [`AuthnBroker`]'s field docs for why the default (`false`) differs

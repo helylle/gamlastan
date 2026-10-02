@@ -340,6 +340,17 @@ pub fn create_authn_response(
         return denied(engine, params, &Denial::NoAuthnContext);
     }
 
+    // `check_request` approved a reused session against its own clock reading;
+    // the application callback may have run past the session's absolute expiry
+    // since. An assertion whose SessionNotOnOrAfter is already past is rejected
+    // by every SP validator, so refuse it here, before anything is stored.
+    if let Some(authn_instant) = subject.authn_instant {
+        let session_lifetime = engine.decisions.session_lifetime(&processed.sp_entity_id);
+        if authn_instant + session_lifetime <= Utc::now() {
+            return denied(engine, params, &Denial::AuthnFailed);
+        }
+    }
+
     // 5. Construct the NameID, honouring the request's NameIDPolicy and the
     //    IdP's default format. A NameID refusal is a protocol denial.
     let name_id = match construct_name_id(engine, params, subject) {

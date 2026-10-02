@@ -54,7 +54,8 @@ use crate::xml::serialize::SamlSerialize;
 ///   `ProxyCount` and `IDPList` constraints on whether and where the request
 ///   may be forwarded, and a proxy that never reads them forwards requests it
 ///   was told not to. Such a deployment must read `request.scoping` from the
-///   original `AuthnRequest` itself and enforce it. The request parser rejects a
+///   original `AuthnRequest` itself and enforce it (the `gamlastan-actix`
+///   `AuthnSubjectCallback` receives the parsed `AuthnRequest` for this). The request parser rejects a
 ///   malformed `Scoping` (an `IDPEntry` without `ProviderID`, a repeated
 ///   `IDPList`) instead of repairing it, so what a proxy reads is what the SP
 ///   sent.

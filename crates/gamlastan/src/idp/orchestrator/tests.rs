@@ -921,6 +921,31 @@ fn a_bad_authn_method_is_refused_before_a_durable_nameid_is_stored() {
 }
 
 #[test]
+fn a_session_that_expired_before_issuance_is_refused_and_nothing_is_stored() {
+    use crate::idp::orchestrator::{AuthenticatedSubject, Denial};
+    let decisions = ReleasePolicy::with_default(
+        crate::idp::policy::PolicyEntry::new().with_session_lifetime(TimeDelta::hours(8)),
+    );
+    with_engine(&decisions, |engine, idents| {
+        // Approved by `check_request` earlier, but past its absolute expiry now.
+        let p = params(processed_with_name_id_policy(
+            Some(constants::NAMEID_PERSISTENT),
+            None,
+            true,
+        ));
+        let subject = AuthenticatedSubject {
+            authn_instant: Some(Utc::now() - TimeDelta::hours(9)),
+            ..subject_without_mail()
+        };
+        match create_authn_response(engine, &p, &subject).unwrap() {
+            ResponseOutcome::Denied { denial, .. } => assert_eq!(denial, Denial::AuthnFailed),
+            other => panic!("an expired session must not be issued: {other:?}"),
+        }
+        assert!(idents.name_ids_for(&subject.subject_id).unwrap().is_empty());
+    });
+}
+
+#[test]
 fn reused_session_asserts_its_original_absolute_expiry_not_a_sliding_one() {
     // Regression: SessionNotOnOrAfter was computed as `now + session_lifetime`
     // unconditionally, so reusing an old session pushed its asserted expiry

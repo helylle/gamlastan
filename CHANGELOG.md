@@ -243,9 +243,12 @@ where needed to correct protocol handling.
   filters each entity's roles by SAML 2.0 protocol support before collecting
   signing certificates, so a certificate published only for a non-SAML-2.0
   role can no longer become trusted for verifying SAML 2.0 messages.
-- **Breaking:** `gamlastan-actix`'s `AuthnSubjectCallback` gains a
-  `&Disposition` parameter (between the processed request and the
-  `HttpRequest`). The SSO handler now calls
+- **Breaking:** `gamlastan-actix`'s `AuthnSubjectCallback` gains the parsed
+  `&AuthnRequest` (second parameter) and a `&Disposition` (third, before the
+  `HttpRequest`). The request carries what `ProcessedAuthnRequest` leaves out -
+  `Scoping` (a proxy must enforce `ProxyCount` / `IDPList`) and the requested
+  `Subject` - which a POST callback could not otherwise read, as the form body
+  is already consumed. The SSO handler now calls
   `idp::orchestrator::check_request` before invoking the callback and handles
   a `Deny` disposition directly (a signed protocol error; the callback is
   never invoked for it) — previously the handler bypassed `check_request`
@@ -287,7 +290,11 @@ where needed to correct protocol handling.
   three methods as `IdentityStore` fails to compile rather than misbehaving.
 - `create_authn_response` resolves and checks the authentication method before
   it constructs the NameID, so a stale `BrokerReference` or a method that does
-  not satisfy the request is refused before anything is stored.
+  not satisfy the request is refused before anything is stored. It also
+  re-checks a reused session's absolute expiry (`authn_instant +
+  session_lifetime`) at that point: a session `check_request` approved but that
+  expired while the application callback ran is denied (`AuthnFailed`) instead
+  of issuing an assertion whose `SessionNotOnOrAfter` is already past.
 - `gamlastan-actix`'s SSO handler returns a `Configuration` error when
   `ResponseEngineParts::idp_entity_id` differs from `IdpConfig::entity_id`,
   instead of signing responses whose Issuer every SP would reject.

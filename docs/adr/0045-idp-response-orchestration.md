@@ -188,6 +188,12 @@ existing primitives into the profile flow, and move the semantics proven in
    that actually inverts the contract: the callback no longer has to
    (mis)judge `ForceAuthn`/`IsPassive`/`RequestedAuthnContext` itself, it only
    supplies attributes and performs the login `check_request` says is needed.
+   The callback also receives the parsed `AuthnRequest`, because the processed
+   request leaves out `Scoping` and the requested `Subject` and a POST body is
+   already consumed: a proxy enforces `ProxyCount`/`IDPList` there, and a
+   re-login flow compares the subject. `create_authn_response` re-checks a
+   reused session's absolute expiry at issuance, since the callback may have
+   run past it after `check_request` approved the reuse.
 
    `gamlastan-actix` registers the engine's dependencies as an owned
    `ResponseEngineParts` (`Arc<ReleasePolicy>`, `Arc<dyn AttributeRelease>`,

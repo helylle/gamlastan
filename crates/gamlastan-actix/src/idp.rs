@@ -165,12 +165,20 @@ pub struct AuthnCallbackResult {
 /// ForceAuthn/IsPassive/RequestedAuthnContext itself — it only supplies real
 /// attributes and performs the actual login when one is needed.
 ///
+/// The parsed `AuthnRequest` is passed too (a POST body is already consumed by
+/// the time the callback runs), because `ProcessedAuthnRequest` leaves out what
+/// the engine does not enforce: `Scoping` (`ProxyCount` / `IDPList`, which a
+/// proxying IdP must honour) and the requested `Subject` (compare it with the
+/// authenticated user via `AuthnRequest::requested_subject` for a re-login or
+/// step-up). Return [`AuthnSubjectResult::Deny`] to refuse.
+///
 /// Register both this callback and a [`ResponseEngineParts`] as application
 /// data to use it; the SSO handler prefers it over [`AuthnCallback`] when
 /// both are present.
 pub type AuthnSubjectCallback = Box<
     dyn Fn(
             &idp_profile::ProcessedAuthnRequest,
+            &gamlastan::core::protocol::request::AuthnRequest,
             &Disposition,
             &HttpRequest,
         ) -> Result<AuthnSubjectResult, SamlActixError>
@@ -542,7 +550,7 @@ async fn idp_sso(
             return post_issued_response(&issued, &processed.acs_url, relay_state_str.as_deref());
         }
 
-        let result = callback(&processed, &disposition, &req)?;
+        let result = callback(&processed, &authn_request, &disposition, &req)?;
         return match result {
             AuthnSubjectResult::Authenticated(mut subject) => {
                 pin_to_reused_session(&mut subject, &disposition);
@@ -1969,9 +1977,10 @@ mod tests {
             ))))
         };
         let callback = || {
-            let callback: AuthnSubjectCallback = Box::new(|_processed, _disposition, _req| {
-                Ok(AuthnSubjectResult::Deny(Denial::NoPassive))
-            });
+            let callback: AuthnSubjectCallback =
+                Box::new(|_processed, _request, _disposition, _req| {
+                    Ok(AuthnSubjectResult::Deny(Denial::NoPassive))
+                });
             Some(web::Data::new(callback))
         };
 
@@ -2199,7 +2208,7 @@ mod tests {
             cert_b64(SIGN_CERT_PEM),
         )));
         let authn_subject_callback: AuthnSubjectCallback =
-            Box::new(move |_processed, _disposition, _req| {
+            Box::new(move |_processed, _request, _disposition, _req| {
                 Ok(AuthnSubjectResult::Authenticated(AuthenticatedSubject {
                     subject_id: "alice".to_string(),
                     attributes: vec![],
@@ -2265,7 +2274,7 @@ mod tests {
         let callback_invoked = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let callback_invoked_clone = callback_invoked.clone();
         let authn_subject_callback: AuthnSubjectCallback =
-            Box::new(move |_processed, _disposition, _req| {
+            Box::new(move |_processed, _request, _disposition, _req| {
                 callback_invoked_clone.store(true, std::sync::atomic::Ordering::SeqCst);
                 Ok(AuthnSubjectResult::Authenticated(AuthenticatedSubject {
                     subject_id: "alice".to_string(),
@@ -2340,7 +2349,7 @@ mod tests {
         let callback_invoked = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let callback_invoked_clone = callback_invoked.clone();
         let authn_subject_callback: AuthnSubjectCallback =
-            Box::new(move |_processed, _disposition, _req| {
+            Box::new(move |_processed, _request, _disposition, _req| {
                 callback_invoked_clone.store(true, std::sync::atomic::Ordering::SeqCst);
                 Ok(AuthnSubjectResult::Authenticated(AuthenticatedSubject {
                     subject_id: "alice".to_string(),
@@ -2417,7 +2426,7 @@ mod tests {
         let callback_invoked = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let flag = callback_invoked.clone();
         let authn_subject_callback: AuthnSubjectCallback =
-            Box::new(move |_processed, _disposition, _req| {
+            Box::new(move |_processed, _request, _disposition, _req| {
                 flag.store(true, std::sync::atomic::Ordering::SeqCst);
                 Ok(AuthnSubjectResult::Deny(Denial::NoPassive))
             });
@@ -2456,6 +2465,58 @@ mod tests {
     }
 
     #[actix_web::test]
+    async fn the_subject_callback_sees_the_scoping_the_processed_request_drops() {
+        const SP: &str = "https://sp.example.com";
+        let entity = gamlastan::metadata::types::entity_descriptor::EntityDescriptor::for_sp(
+            SP,
+            sp_sso_with_acs("https://sp.example.com/acs"),
+        );
+        let config = web::Data::new(
+            IdpConfig::new("https://idp.example.com", "https://idp.example.com/sso")
+                .with_trusted_sp(entity),
+        );
+        let signing_ctx = web::Data::new(Arc::new(IdpSigningContext::new(
+            test_signer(),
+            cert_b64(SIGN_CERT_PEM),
+        )));
+        let seen = Arc::new(std::sync::Mutex::new(None));
+        let seen_in_callback = seen.clone();
+        let callback: AuthnSubjectCallback = Box::new(move |_processed, request, _d, _req| {
+            *seen_in_callback.lock().unwrap() =
+                Some(request.scoping.as_ref().and_then(|s| s.proxy_count));
+            Ok(AuthnSubjectResult::Deny(Denial::AuthnFailed))
+        });
+
+        let mut request = passive_authn_request(SP);
+        request.is_passive = None;
+        request.scoping = Some(gamlastan::core::protocol::request::Scoping {
+            proxy_count: Some(0),
+            idp_list: vec![],
+            requester_ids: vec![],
+        });
+        let msg = SamlMessage {
+            saml_xml: request.to_xml_string().unwrap().into_bytes(),
+            relay_state: None,
+            is_request: true,
+            binding: crate::extractors::SamlBinding::HttpPost,
+            redirect_signature: None,
+        };
+        idp_sso(
+            msg,
+            config,
+            Some(signing_ctx),
+            None,
+            Some(web::Data::new(callback)),
+            None,
+            Some(web::Data::new(Arc::new(response_engine_parts()))),
+            actix_web::test::TestRequest::default().to_http_request(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(*seen.lock().unwrap(), Some(Some(0)));
+    }
+
+    #[actix_web::test]
     async fn idp_sso_refuses_an_engine_whose_issuer_differs_from_the_config() {
         const SP: &str = "https://sp.example.com";
         let entity = gamlastan::metadata::types::entity_descriptor::EntityDescriptor::for_sp(
@@ -2474,7 +2535,7 @@ mod tests {
             cert_b64(SIGN_CERT_PEM),
         )));
         let callback: AuthnSubjectCallback =
-            Box::new(|_, _, _| Ok(AuthnSubjectResult::Deny(Denial::NoPassive)));
+            Box::new(|_, _, _, _| Ok(AuthnSubjectResult::Deny(Denial::NoPassive)));
         let msg = SamlMessage {
             saml_xml: passive_authn_request(SP)
                 .to_xml_string()
@@ -2548,7 +2609,7 @@ mod tests {
             cert_b64(SIGN_CERT_PEM),
         )));
         let authn_subject_callback: AuthnSubjectCallback =
-            Box::new(move |_processed, _disposition, _req| {
+            Box::new(move |_processed, _request, _disposition, _req| {
                 Ok(AuthnSubjectResult::Authenticated(AuthenticatedSubject {
                     subject_id: "alice".to_string(),
                     attributes: vec![

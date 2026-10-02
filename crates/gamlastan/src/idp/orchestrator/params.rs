@@ -306,10 +306,25 @@ pub struct IssuedResponse {
     pub released_attribute_names: Vec<String>,
 }
 
+/// A signed protocol-error response, ready for delivery.
+///
+/// Separate from [`IssuedResponse`] because a denial has no assertion, no
+/// subject and no session: it carries only what exists.
+#[derive(Debug, Clone)]
+pub struct DeniedResponse {
+    /// The signed response XML, ready to deliver over a binding.
+    pub xml: String,
+    /// The Response element's `ID`.
+    pub response_id: String,
+}
+
 /// The outcome of assembling a response.
 ///
 /// `Issued` is a successful response; `Denied` is a signed protocol error.
 /// Programming/configuration faults are `Err(ProfileError)`, not an outcome.
+// One value per response, returned and consumed at once, so the size gap between
+// the variants costs nothing; boxing `Issued` would only complicate matching.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone)]
 pub enum ResponseOutcome {
     /// A successful, signed response.
@@ -319,6 +334,6 @@ pub enum ResponseOutcome {
         /// The denial reason.
         denial: Denial,
         /// The signed error response.
-        response: IssuedResponse,
+        response: DeniedResponse,
     },
 }

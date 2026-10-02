@@ -105,7 +105,8 @@ pub use ident::{
 };
 pub use orchestrator::{
     check_request, create_authn_response, create_denial_response, AttributeRelease,
-    AuthenticatedSubject, AuthnMethodRef, ChainedRelease, Denial, Disposition, EstablishedSession,
-    IssuedResponse, PassThroughRelease, ResponseEngine, ResponseOutcome, ResponseParams,
+    AuthenticatedSubject, AuthnMethodRef, ChainedRelease, Denial, DeniedResponse, Disposition,
+    EstablishedSession, IssuedResponse, PassThroughRelease, ResponseEngine, ResponseOutcome,
+    ResponseParams,
 };
 pub use policy::{PolicyEntry, PolicyError, ReleasePolicy, SignTargets};

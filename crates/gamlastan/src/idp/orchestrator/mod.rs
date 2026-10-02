@@ -144,8 +144,8 @@ mod tests;
 
 pub use denial::Denial;
 pub use params::{
-    AuthenticatedSubject, AuthnMethodRef, Disposition, EstablishedSession, IssuedResponse,
-    ResponseOutcome, ResponseParams,
+    AuthenticatedSubject, AuthnMethodRef, DeniedResponse, Disposition, EstablishedSession,
+    IssuedResponse, ResponseOutcome, ResponseParams,
 };
 pub use release::{AttributeRelease, ChainedRelease, PassThroughRelease};
 pub use respond::{check_request, create_authn_response, create_denial_response, ResponseEngine};

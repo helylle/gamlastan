@@ -185,7 +185,11 @@ impl AuthnBroker {
     }
 
     /// Find the authentication methods satisfying a request
-    /// (pysaml2 `pick()`), strongest preference first.
+    /// (pysaml2 `pick()`), in the request's class-ref order and, within one
+    /// ref, registration order. This is **not** sorted by strength: a weaker
+    /// method registered first is returned first. [`check_request`](crate::idp::orchestrator::check_request)
+    /// sorts its `Authenticate` methods strongest first, so use that if the
+    /// first entry should be the strongest.
     ///
     /// With no RequestedAuthnContext the `unspecified` class is matched
     /// with `minimum` comparison. If no `unspecified` method is registered

@@ -21,7 +21,8 @@ use crate::xml::serialize::SamlSerialize;
 
 use super::denial::Denial;
 use super::params::{
-    AuthenticatedSubject, Disposition, EstablishedSession, IssuedResponse, ResponseParams,
+    AuthenticatedSubject, DeniedResponse, Disposition, EstablishedSession, IssuedResponse,
+    ResponseParams,
 };
 use super::release::AttributeRelease;
 
@@ -465,7 +466,7 @@ pub fn create_denial_response(
     engine: &ResponseEngine,
     params: &ResponseParams,
     denial: &Denial,
-) -> Result<IssuedResponse, ProfileError> {
+) -> Result<DeniedResponse, ProfileError> {
     params.check_bound()?;
     let processed = &params.processed;
     let now = Utc::now();
@@ -494,20 +495,9 @@ pub fn create_denial_response(
         &signing_algorithms(engine, params),
     )?;
 
-    Ok(IssuedResponse {
+    Ok(DeniedResponse {
         xml: signed_xml,
         response_id,
-        assertion_id: None,
-        name_id: NameId {
-            value: String::new(),
-            format: None,
-            name_qualifier: None,
-            sp_name_qualifier: None,
-            sp_provided_id: None,
-        },
-        session_index: None,
-        not_on_or_after: now,
-        released_attribute_names: vec![],
     })
 }
 

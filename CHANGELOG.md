@@ -304,6 +304,16 @@ where needed to correct protocol handling.
   `maximum` and `better` need the broker's strength ordering, so with nothing
   registered they are denied before login. A broker with registrations that match nothing
   still denies.
+- A denial is a `DeniedResponse` (`xml`, `response_id`), not an
+  `IssuedResponse`: `create_denial_response` and `ResponseOutcome::Denied` no
+  longer carry an empty NameID and a `not_on_or_after` of "now" that an audit
+  consumer could mistake for issuance data.
+- `AuthnBroker::pick`'s documentation now states its real order (the request's
+  class-ref order, then registration order), not "strongest first"; only
+  `check_request` sorts by strength.
+- Added tests that sign and verify a response end to end with ECDSA
+  (P-256/SHA-256, P-384/SHA-384, P-521/SHA-512) using new EC fixtures; before,
+  only RSA was exercised.
 - `InMemoryAssertionStore` keeps both indexes under one lock, and re-storing an
   assertion ID for a different subject removes it from the old subject's index.
   Before, a lookup for the old subject returned the other subject's assertion.

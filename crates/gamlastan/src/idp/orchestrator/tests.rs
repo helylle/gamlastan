@@ -2147,7 +2147,8 @@ fn cancelled_denial_response_is_signed_and_reports_authn_failed() {
     assert!(issued.xml.contains(constants::STATUS_AUTHN_FAILED));
     assert!(issued.xml.contains("Authentication was cancelled"));
     assert!(issued.xml.contains("InResponseTo=\"_req1\""));
-    assert!(issued.assertion_id.is_none());
+    // A denial has no assertion: the type carries none, and the XML has none.
+    assert!(!issued.xml.contains("<saml:Assertion"));
 }
 
 #[test]

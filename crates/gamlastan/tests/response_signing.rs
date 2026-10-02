@@ -213,3 +213,95 @@ fn signs_with_requested_algorithms_and_verifies() {
         "SHA-512 signatures did not validate"
     );
 }
+
+/// Sign a response with `method` using an EC key, then verify it against the
+/// matching certificate: ECDSA has its own key and signature encodings, so the
+/// RSA tests above prove nothing about it.
+fn sign_and_verify_ecdsa(method: SignatureMethod, digest: DigestMethod, cert: &str, key: &str) {
+    let mut private = loader::load_pem_auto(key.as_bytes(), None).expect("load EC private key");
+    private.usage = KeyUsage::Sign;
+    let mut km = KeysManager::new();
+    km.add_key(private);
+    let signer = SamlSigner::new(km);
+
+    let cert_b64: String = cert
+        .lines()
+        .filter(|l| !l.starts_with("-----"))
+        .map(str::trim)
+        .collect();
+    let cert_der = base64::engine::general_purpose::STANDARD
+        .decode(&cert_b64)
+        .expect("certificate body is valid base64");
+
+    let response = create_response(
+        &sample_options(),
+        &sample_name_id(),
+        ResponseTimes::at(Utc::now()),
+    );
+    let response_id = response.base.id.clone();
+    let assertion_id = response.assertions[0].id.clone();
+    let xml = response.to_xml_string().expect("serialize");
+
+    let signed = sign_response_xml_with(
+        &xml,
+        &signer,
+        &cert_b64,
+        &response_id,
+        Some(&assertion_id),
+        true,
+        true,
+        &SigningAlgorithms {
+            signature: Some(method),
+            digest: Some(digest),
+        },
+    )
+    .unwrap_or_else(|e| panic!("sign with {}: {e}", method.uri()));
+    assert_eq!(signed.matches(method.uri()).count(), 2, "{}", method.uri());
+
+    let mut vkey = loader::load_pem_auto(cert.as_bytes(), None).expect("load cert as key");
+    vkey.usage = KeyUsage::Verify;
+    let mut vkm = KeysManager::new();
+    vkm.add_key(vkey);
+    vkm.add_trusted_cert(cert_der);
+    let mut verifier = SamlVerifier::new(vkm);
+    verifier.set_skip_time_checks(true);
+    let results = verifier
+        .verify_all_enveloped(&signed)
+        .unwrap_or_else(|e| panic!("verify {}: {e}", method.uri()));
+    assert_eq!(results.len(), 2, "{}", method.uri());
+    assert!(
+        results.iter().all(|r| r.is_valid()),
+        "{} signatures did not validate: {results:?}",
+        method.uri()
+    );
+}
+
+#[test]
+fn ecdsa_sha256_signs_and_verifies() {
+    sign_and_verify_ecdsa(
+        SignatureMethod::EcdsaSha256,
+        DigestMethod::Sha256,
+        include_str!("fixtures/ec256-cert.pem"),
+        include_str!("fixtures/ec256-key.pem"),
+    );
+}
+
+#[test]
+fn ecdsa_sha384_signs_and_verifies() {
+    sign_and_verify_ecdsa(
+        SignatureMethod::EcdsaSha384,
+        DigestMethod::Sha384,
+        include_str!("fixtures/ec384-cert.pem"),
+        include_str!("fixtures/ec384-key.pem"),
+    );
+}
+
+#[test]
+fn ecdsa_sha512_signs_and_verifies() {
+    sign_and_verify_ecdsa(
+        SignatureMethod::EcdsaSha512,
+        DigestMethod::Sha512,
+        include_str!("fixtures/ec512-cert.pem"),
+        include_str!("fixtures/ec512-key.pem"),
+    );
+}

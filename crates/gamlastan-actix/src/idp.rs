@@ -556,7 +556,11 @@ async fn idp_sso(
         if let Disposition::Deny { denial } = &disposition {
             let issued =
                 create_denial_response(engine, &params, denial).map_err(SamlActixError::Profile)?;
-            return post_issued_response(&issued, &processed.acs_url, relay_state_str.as_deref());
+            return post_signed_response(
+                &issued.xml,
+                &processed.acs_url,
+                relay_state_str.as_deref(),
+            );
         }
 
         let result = callback(&processed, &authn_request, &disposition, &req)?;
@@ -565,17 +569,17 @@ async fn idp_sso(
                 pin_to_reused_session(&mut subject, &disposition);
                 let outcome = create_authn_response(engine, &params, &subject)
                     .map_err(SamlActixError::Profile)?;
-                let issued = match outcome {
-                    ResponseOutcome::Issued(issued) => issued,
-                    ResponseOutcome::Denied { response, .. } => response,
+                let xml = match outcome {
+                    ResponseOutcome::Issued(issued) => issued.xml,
+                    ResponseOutcome::Denied { response, .. } => response.xml,
                 };
-                post_issued_response(&issued, &processed.acs_url, relay_state_str.as_deref())
+                post_signed_response(&xml, &processed.acs_url, relay_state_str.as_deref())
             }
             AuthnSubjectResult::Redirect(response) => Ok(response),
             AuthnSubjectResult::Deny(denial) => {
                 let issued = create_denial_response(engine, &params, &denial)
                     .map_err(SamlActixError::Profile)?;
-                post_issued_response(&issued, &processed.acs_url, relay_state_str.as_deref())
+                post_signed_response(&issued.xml, &processed.acs_url, relay_state_str.as_deref())
             }
         };
     }
@@ -690,14 +694,14 @@ fn require_post_acs(
 
 /// POST-encode a signed, assembled response to the SP's ACS and wrap it as the
 /// HTTP-POST binding response.
-fn post_issued_response(
-    issued: &gamlastan::idp::orchestrator::IssuedResponse,
+fn post_signed_response(
+    xml: &str,
     acs_url: &str,
     relay_state: Option<&str>,
 ) -> Result<HttpResponse, SamlActixError> {
     let relay = relay_state.map(RelayState::echo);
     let html = gamlastan::bindings::post::post_encode(
-        issued.xml.as_bytes(),
+        xml.as_bytes(),
         false, // is_response, not request
         acs_url,
         relay.as_ref(),
@@ -2702,24 +2706,10 @@ mod tests {
     }
 
     #[actix_web::test]
-    async fn test_post_issued_response_wraps_post_binding() {
-        let issued = gamlastan::idp::orchestrator::IssuedResponse {
-            xml: "<samlp:Response/>".to_string(),
-            response_id: "_r1".to_string(),
-            assertion_id: None,
-            name_id: NameId {
-                value: "user@example.com".to_string(),
-                format: None,
-                name_qualifier: None,
-                sp_name_qualifier: None,
-                sp_provided_id: None,
-            },
-            session_index: None,
-            not_on_or_after: Utc::now(),
-            released_attribute_names: vec![],
-        };
+    async fn test_post_signed_response_wraps_post_binding() {
+        let xml = "<samlp:Response/>";
         let response =
-            post_issued_response(&issued, "https://sp.example.com/acs", Some("relay")).unwrap();
+            post_signed_response(xml, "https://sp.example.com/acs", Some("relay")).unwrap();
         assert_eq!(response.status(), actix_web::http::StatusCode::OK);
         let body = actix_web::body::to_bytes(response.into_body())
             .await

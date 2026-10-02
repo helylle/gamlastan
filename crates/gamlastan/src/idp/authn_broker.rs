@@ -183,13 +183,20 @@ impl AuthnBroker {
     /// (pysaml2 `pick()`), strongest preference first.
     ///
     /// With no RequestedAuthnContext the `unspecified` class is matched
-    /// with `minimum` comparison.
+    /// with `minimum` comparison. If no `unspecified` method is registered
+    /// there is no baseline to compare against, and since nothing was
+    /// requested every registered method qualifies, so all are returned (in
+    /// registration order).
     pub fn pick(&self, requested: Option<&RequestedAuthnContext>) -> Vec<&AuthnMethod> {
         let Some(req) = requested else {
-            return self.pick_by_class_ref(
+            let picked = self.pick_by_class_ref(
                 constants::AUTHN_CONTEXT_UNSPECIFIED,
                 AuthnContextComparison::Minimum,
             );
+            if picked.is_empty() {
+                return self.methods.iter().collect();
+            }
+            return picked;
         };
 
         // The listed refs are alternatives (saml-core-2.0-os 3.3.2.2.1:
@@ -368,6 +375,23 @@ mod tests {
         // unspecified at level 0, minimum: everything qualifies
         assert_eq!(picked.len(), 4);
         assert_eq!(picked[0].method, "/login/any");
+    }
+
+    #[test]
+    fn no_request_without_an_unspecified_baseline_offers_every_method() {
+        let mut b = AuthnBroker::new();
+        b.add(
+            constants::AUTHN_CONTEXT_PASSWORD,
+            "/login/password",
+            1,
+            None,
+        );
+        b.add(constants::AUTHN_CONTEXT_X509, "/login/cert", 3, None);
+        let picked = b.pick(None);
+        let methods: Vec<&str> = picked.iter().map(|m| m.method.as_str()).collect();
+        assert_eq!(methods, ["/login/password", "/login/cert"]);
+        // Nothing registered stays empty.
+        assert!(AuthnBroker::new().pick(None).is_empty());
     }
 
     #[test]

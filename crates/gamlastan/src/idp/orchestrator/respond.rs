@@ -587,22 +587,30 @@ fn construct_name_id(
         }
     }
 
-    // A requested format this IdP does not issue to this SP is refused with
-    // InvalidNameIDPolicy (SAML Core 3.4.1.1), before anything is minted or
-    // stored. Without this any format string was honoured: an identifier was
-    // minted with it and recorded.
-    if let Some(format) = policy.as_ref().and_then(|p| p.format.as_deref()) {
-        if !engine
-            .decisions
-            .supports_nameid_format(&params.processed.sp_entity_id, format)
-        {
-            return Err(NameIdFailure::Denied(Denial::InvalidNameIdPolicy));
-        }
-    }
-
+    // The effective format - the requested one, else the SP's default - must be
+    // one this IdP issues to this SP. A refused *request* is InvalidNameIDPolicy
+    // (SAML Core 3.4.1.1), before anything is minted or stored; without this
+    // any format string was honoured, minted and recorded. A refused *default*
+    // is a configuration fault (the SP asked for nothing unusual), so it is an
+    // error, not a denial.
     let default_format = engine
         .decisions
         .nameid_format(&params.processed.sp_entity_id);
+    let requested_format = policy.as_ref().and_then(|p| p.format.as_deref());
+    let effective = requested_format.unwrap_or(default_format.as_str());
+    if !engine
+        .decisions
+        .supports_nameid_format(&params.processed.sp_entity_id, effective)
+    {
+        return Err(match requested_format {
+            Some(_) => NameIdFailure::Denied(Denial::InvalidNameIdPolicy),
+            None => NameIdFailure::Fault(ProfileError::Other(format!(
+                "the default NameID format {effective:?} configured for {} cannot be issued",
+                params.processed.sp_entity_id
+            ))),
+        });
+    }
+
     // The default per-SP format is transient, and a transient is minted fresh
     // on every call - including repeated reuse of the same session. That is
     // fine for the identity store because, by default, `IdentDb` does not

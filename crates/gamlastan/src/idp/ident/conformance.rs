@@ -1,8 +1,8 @@
 //! A reusable check that an [`IdentityStore`] backend honours the contract
 //! [`IdentDb`] relies on.
 //!
-//! The two uniqueness constraints (NameID value; persistent `(user,
-//! sp_name_qualifier, name_qualifier)`) live in the backend, not in this
+//! The two uniqueness constraints (NameID value; durable, i.e. non-transient,
+//! `(user, sp_name_qualifier, name_qualifier, format)`) live in the backend, not in this
 //! crate, so a backend that forgets one - say a missing unique index -
 //! compiles fine and only misbehaves under concurrent load. Run the suite
 //! against a real instance (e.g. in the integration suite of the crate that

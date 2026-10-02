@@ -168,11 +168,15 @@ where needed to correct protocol handling.
   Core 3.3.2.2.1 ("one of the authentication contexts specified") and differs
   from pysaml2, which also reads only the first; it can only accept requests
   that were refused before.
+  With no `RequestedAuthnContext` and no `unspecified` method registered,
+  `pick` now offers every registered method instead of none (nothing was
+  requested, so all qualify).
 - `nameid-format:encrypted` is never issued, with or without an opt-in
   supported-format set: it asks for an `EncryptedID`, which the response path
   cannot produce, and a plain NameID labelled that way would break the
-  requester's confidentiality requirement. The request is denied with
-  `InvalidNameIDPolicy`.
+  requester's confidentiality requirement. A request naming it is denied with
+  `InvalidNameIDPolicy`; an SP whose configured default format it is (the
+  request names none) gets an error, as that is a configuration fault.
 - Added an opt-in supported-format set for requested NameIDs:
   `PolicyEntry::with_supported_nameid_formats`,
   `ReleasePolicy::supports_nameid_format` and `ISSUABLE_NAMEID_FORMATS`. With a

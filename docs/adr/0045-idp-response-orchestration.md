@@ -295,7 +295,10 @@ failure is a real protocol error rather than a silent per-integrator choice.
   request's order (SAML Core 3.3.2.2.1); pysaml2 reads only the first ref for
   `minimum`, `maximum` and `better`. `nameid-format:encrypted` is never issued
   (it asks for an `EncryptedID` the response path cannot produce), even with
-  no supported-format set configured.
+  no supported-format set configured; the check is on the effective format,
+  so an encrypted SP default is a configuration error. With no
+  `RequestedAuthnContext` and no `unspecified` method registered, `pick`
+  offers every registered method.
 - Breaking (pre-release): `AuthnBroker::pick` with `Comparison="exact"`
   changed from level-based matching to literal class-ref matching (see
   above). Any integrator relying on the old broadened behaviour must pass

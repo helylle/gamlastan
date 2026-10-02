@@ -1454,6 +1454,25 @@ fn the_encrypted_nameid_format_is_denied_even_with_no_supported_set() {
 }
 
 #[test]
+fn an_encrypted_default_format_is_a_config_error_never_a_plaintext_nameid() {
+    use crate::idp::policy::PolicyEntry;
+    let decisions = ReleasePolicy::with_default(
+        PolicyEntry::new().with_nameid_format(constants::NAMEID_ENCRYPTED),
+    );
+    with_engine(&decisions, |engine, idents| {
+        // The request names no format, so the default applies.
+        let p = params(processed_with_name_id_policy(None, None, true));
+        assert!(create_authn_response(engine, &p, &subject_without_mail()).is_err());
+        let p = params(processed(false, false, vec![], None)); // no NameIDPolicy at all
+        assert!(create_authn_response(engine, &p, &subject_without_mail()).is_err());
+        assert!(idents
+            .name_ids_for(&subject_without_mail().subject_id)
+            .unwrap()
+            .is_empty());
+    });
+}
+
+#[test]
 fn the_sp_role_must_belong_to_the_supplied_entity() {
     use crate::metadata::types::entity_descriptor::EntityDescriptor;
     let mut foreign = sp_sso();

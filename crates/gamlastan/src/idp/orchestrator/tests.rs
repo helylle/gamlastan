@@ -898,6 +898,29 @@ fn create_authn_response_errors_on_a_stale_broker_reference() {
 }
 
 #[test]
+fn a_bad_authn_method_is_refused_before_a_durable_nameid_is_stored() {
+    use crate::idp::orchestrator::AuthenticatedSubject;
+    let decisions = ReleasePolicy::new();
+    with_engine(&decisions, |engine, idents| {
+        // A durable (persistent) NameID is requested, but the method is stale.
+        let p = params(processed_with_name_id_policy(
+            Some(constants::NAMEID_PERSISTENT),
+            None,
+            true,
+        ));
+        let subject = AuthenticatedSubject {
+            authn_method: AuthnMethodRef::BrokerReference("does-not-exist".to_string()),
+            ..subject_without_mail()
+        };
+        assert!(create_authn_response(engine, &p, &subject).is_err());
+        assert!(
+            idents.name_ids_for(&subject.subject_id).unwrap().is_empty(),
+            "nothing may be stored for a response that is not issued"
+        );
+    });
+}
+
+#[test]
 fn reused_session_asserts_its_original_absolute_expiry_not_a_sliding_one() {
     // Regression: SessionNotOnOrAfter was computed as `now + session_lifetime`
     // unconditionally, so reusing an old session pushed its asserted expiry

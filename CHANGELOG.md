@@ -276,7 +276,8 @@ where needed to correct protocol handling.
   `InMemoryIdentityStore` takes one lock per call; a Mongo/SQL-backed store
   must back the two constraints with real unique indexes (the second a
   partial unique index on `(user, sp_name_qualifier, name_qualifier, format)`
-  where the format is not transient), applied to every write. A store that
+  where the format is not transient, an absent format counting as
+  `unspecified`), applied to every write. A store that
   already holds several records of one format per (user, SP) - 0.9.x minted a
   new one at every login for email and unspecified - must be deduplicated
   before that index can be built.
@@ -284,6 +285,12 @@ where needed to correct protocol handling.
   `PyIdentityStore` is one) implements `KeyValueStore` for the `Eptid` cache
   and the new `IdentityStore` for `IdentDb`; code still implementing the old
   three methods as `IdentityStore` fails to compile rather than misbehaving.
+- `create_authn_response` resolves and checks the authentication method before
+  it constructs the NameID, so a stale `BrokerReference` or a method that does
+  not satisfy the request is refused before anything is stored.
+- `gamlastan-actix`'s SSO handler returns a `Configuration` error when
+  `ResponseEngineParts::idp_entity_id` differs from `IdpConfig::entity_id`,
+  instead of signing responses whose Issuer every SP would reject.
 - **Behaviour change:** AuthnRequest parsing and processing no longer repair
   malformed input into a more permissive request. An `IDPEntry` without the
   required `ProviderID` is rejected, where it used to be dropped (shrinking a

@@ -256,8 +256,9 @@ failure is a real protocol error rather than a silent per-integrator choice.
 - A second, higher-level authentication contract now needs documenting and
   supporting alongside the existing one. Mitigated by making the old path the
   explicit escape hatch.
-- Opinionated ordering: the engine fixes the sequence policy -> NameID ->
-  authn context -> assemble. Deployments needing a different order use the
+- Opinionated ordering: the engine fixes the sequence policy -> authn
+  context -> NameID -> assemble (everything that can refuse before the first
+  store write). Deployments needing a different order use the
   low-level path.
 - Breaking (pre-release): `ResponseOptions` gained
   `authenticating_authorities: Vec<String>` (with a new `impl Default`), and

@@ -515,6 +515,15 @@ async fn idp_sso(
     // released attributes, and authn context, then assembles and signs the
     // response. This is preferred over the lower-level AuthnCallback.
     if let (Some(callback), Some(parts)) = (&authn_subject_callback, &response_engine) {
+        // Metadata and request validation name the IdP `config.entity_id`; the
+        // engine signs with `parts.idp_entity_id` as Issuer. If they differ
+        // every SP rejects the Issuer, so fail loudly instead.
+        if parts.idp_entity_id != config.entity_id {
+            return Err(SamlActixError::Configuration(format!(
+                "ResponseEngineParts::idp_entity_id {:?} differs from IdpConfig::entity_id {:?}",
+                parts.idp_entity_id, config.entity_id
+            )));
+        }
         let params =
             ResponseParams::new(processed.clone(), sp_sso.clone(), Some(sp_entity.clone()))
                 .map_err(SamlActixError::Profile)?;
@@ -2444,6 +2453,52 @@ mod tests {
             !callback_invoked.load(std::sync::atomic::Ordering::SeqCst),
             "the callback must not run for a request that cannot be answered"
         );
+    }
+
+    #[actix_web::test]
+    async fn idp_sso_refuses_an_engine_whose_issuer_differs_from_the_config() {
+        const SP: &str = "https://sp.example.com";
+        let entity = gamlastan::metadata::types::entity_descriptor::EntityDescriptor::for_sp(
+            SP,
+            sp_sso_with_acs("https://sp.example.com/acs"),
+        );
+        let config = web::Data::new(
+            IdpConfig::new(
+                "https://other-idp.example.com",
+                "https://other-idp.example.com/sso",
+            )
+            .with_trusted_sp(entity),
+        );
+        let signing_ctx = web::Data::new(Arc::new(IdpSigningContext::new(
+            test_signer(),
+            cert_b64(SIGN_CERT_PEM),
+        )));
+        let callback: AuthnSubjectCallback =
+            Box::new(|_, _, _| Ok(AuthnSubjectResult::Deny(Denial::NoPassive)));
+        let msg = SamlMessage {
+            saml_xml: passive_authn_request(SP)
+                .to_xml_string()
+                .unwrap()
+                .into_bytes(),
+            relay_state: None,
+            is_request: true,
+            binding: crate::extractors::SamlBinding::HttpPost,
+            redirect_signature: None,
+        };
+
+        // `response_engine_parts()` is built for https://idp.example.com.
+        let result = idp_sso(
+            msg,
+            config,
+            Some(signing_ctx),
+            None,
+            Some(web::Data::new(callback)),
+            None,
+            Some(web::Data::new(Arc::new(response_engine_parts()))),
+            actix_web::test::TestRequest::default().to_http_request(),
+        )
+        .await;
+        assert!(matches!(result, Err(SamlActixError::Configuration(_))));
     }
 
     #[actix_web::test]

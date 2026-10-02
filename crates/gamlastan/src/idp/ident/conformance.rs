@@ -456,6 +456,44 @@ fn durable_is_unique_on_every_write_path<S: IdentityStore>(s: &S) -> Outcome {
         s.insert("bob", nid("p5", constants::NAMEID_PERSISTENT, Some(SP_A))),
     )?;
     step("insert", s.insert("bob", nid("e4", em, Some(SP_A))))?;
+    // A record with no Format is `unspecified`: durable, constrained like any
+    // other, and found by `find_durable(.., NAMEID_UNSPECIFIED)`.
+    let format_less = |value: &str| NameId {
+        format: None,
+        ..nid(value, constants::NAMEID_UNSPECIFIED, Some(SP_A))
+    };
+    step("insert", s.insert("carol", format_less("u1")))?;
+    ensure!(
+        matches!(
+            s.insert("carol", format_less("u2")),
+            Err(InsertError::DurableExists)
+        ),
+        "insert accepted a second format-less record for the same (user, \
+         SPNameQualifier, NameQualifier): an absent Format is `unspecified` and durable"
+    );
+    ensure!(
+        matches!(
+            s.insert(
+                "carol",
+                nid("u3", constants::NAMEID_UNSPECIFIED, Some(SP_A))
+            ),
+            Err(InsertError::DurableExists)
+        ),
+        "an explicit `unspecified` record must conflict with a format-less one"
+    );
+    ensure!(
+        step(
+            "find_durable",
+            s.find_durable(
+                "carol",
+                Some(SP_A),
+                Some(IDP),
+                constants::NAMEID_UNSPECIFIED
+            )
+        )?
+        .is_some_and(|found| found.value == "u1"),
+        "find_durable(unspecified) must find a record stored without a format"
+    );
     // ...and transient records have no constraint at all.
     for value in ["t1", "t2"] {
         step(

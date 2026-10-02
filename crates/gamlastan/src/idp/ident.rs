@@ -137,7 +137,12 @@ impl NameIdFilter {
                 .as_deref()
                 .is_none_or(|w| actual.as_deref() == Some(w))
         }
-        ok(&self.format, &name_id.format)
+        // An absent format is `unspecified`.
+        let format_ok = self
+            .format
+            .as_deref()
+            .is_none_or(|w| effective_format(name_id) == w);
+        format_ok
             && ok(&self.sp_name_qualifier, &name_id.sp_name_qualifier)
             && ok(&self.name_qualifier, &name_id.name_qualifier)
             && ok(&self.sp_provided_id, &name_id.sp_provided_id)
@@ -233,7 +238,9 @@ pub trait IdentityStore: Send + Sync {
 
     /// The user's durable NameID of `format` for `(sp_name_qualifier,
     /// name_qualifier)`, if one exists. `None` for a qualifier means the record
-    /// has no such qualifier. A transient `format` never matches. Overridable
+    /// has no such qualifier. A transient `format` never matches. A record
+    /// stored without a format counts as `NAMEID_UNSPECIFIED`, for this lookup
+    /// and for the uniqueness constraint. Overridable
     /// to push the lookup down to an index; the default filters
     /// [`for_user`](Self::for_user).
     fn find_durable(
@@ -292,9 +299,19 @@ pub trait IdentityStore: Send + Sync {
     fn remove_all(&self, user_id: &str) -> Result<(), StoreError>;
 }
 
+/// The format `name_id` has: its own, or `unspecified` when absent (SAML Core
+/// 8.3: an omitted `Format` means `nameid-format:unspecified`).
+fn effective_format(name_id: &NameId) -> &str {
+    name_id
+        .format
+        .as_deref()
+        .unwrap_or(constants::NAMEID_UNSPECIFIED)
+}
+
 /// Whether `nid` is a durable NameID of `format` with exactly these qualifiers
 /// (`None` matching only a record that has no such qualifier). A transient
-/// `format` is never durable, so never matches.
+/// `format` is never durable, so never matches. A record with no format is
+/// `unspecified`.
 pub(crate) fn is_durable_match(
     nid: &NameId,
     sp_name_qualifier: Option<&str>,
@@ -302,17 +319,15 @@ pub(crate) fn is_durable_match(
     format: &str,
 ) -> bool {
     format != constants::NAMEID_TRANSIENT
-        && nid.format.as_deref() == Some(format)
+        && effective_format(nid) == format
         && nid.sp_name_qualifier.as_deref() == sp_name_qualifier
         && nid.name_qualifier.as_deref() == name_qualifier
 }
 
-/// The format of `name_id` if it is durable: present and not transient.
+/// The format of `name_id` if it is durable: anything but transient. An absent
+/// format is `unspecified`, which is durable.
 fn durable_format(name_id: &NameId) -> Option<&str> {
-    name_id
-        .format
-        .as_deref()
-        .filter(|f| *f != constants::NAMEID_TRANSIENT)
+    Some(effective_format(name_id)).filter(|f| *f != constants::NAMEID_TRANSIENT)
 }
 
 /// Whether writing `name_id` for `user_id` would leave the user with a second

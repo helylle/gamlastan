@@ -224,9 +224,11 @@ fn class_ref_satisfies(
 ///    unrecognized index);
 /// 2. run the release seam;
 /// 3. check `fail_on_missing_requested` (→ [`Denial::MissingRequiredAttributes`]);
-/// 4. construct the NameID (→ [`Denial::InvalidNameIdPolicy`] /
+/// 4. resolve the authn context from the subject's method and check it
+///    satisfies the request (→ [`Denial::NoAuthnContext`]), before anything
+///    can be stored;
+/// 5. construct the NameID (→ [`Denial::InvalidNameIdPolicy`] /
 ///    [`Denial::NameIdCreationNotAllowed`]);
-/// 5. resolve the authn context from the subject's method;
 /// 6. build `ResponseOptions`;
 /// 7. sign per `decisions.sign(sp).resolve(want_assertions_signed)`;
 /// 8. store the assertion (if a store is present);
@@ -317,17 +319,7 @@ pub fn create_authn_response(
         return denied(engine, params, &Denial::MissingRequiredAttributes);
     }
 
-    // 4. Construct the NameID, honouring the request's NameIDPolicy and the
-    //    IdP's default format. A NameID refusal is a protocol denial.
-    let name_id = match construct_name_id(engine, params, subject) {
-        Ok(name_id) => name_id,
-        Err(NameIdFailure::Denied(denial)) => return denied(engine, params, &denial),
-        // A backend failure is an operational fault, not something the SP
-        // caused: surface it as an error rather than a signed denial.
-        Err(NameIdFailure::Fault(e)) => return Err(e),
-    };
-
-    // 5. Resolve the authn context from the subject's method, and verify it
+    // 4. Resolve the authn context from the subject's method, and verify it
     //    actually satisfies what the SP requested. `check_request` only
     //    offers methods that would satisfy the request via `Disposition`; it
     //    cannot guarantee which method the application ultimately used to
@@ -347,6 +339,16 @@ pub fn create_authn_response(
     ) {
         return denied(engine, params, &Denial::NoAuthnContext);
     }
+
+    // 5. Construct the NameID, honouring the request's NameIDPolicy and the
+    //    IdP's default format. A NameID refusal is a protocol denial.
+    let name_id = match construct_name_id(engine, params, subject) {
+        Ok(name_id) => name_id,
+        Err(NameIdFailure::Denied(denial)) => return denied(engine, params, &denial),
+        // A backend failure is an operational fault, not something the SP
+        // caused: surface it as an error rather than a signed denial.
+        Err(NameIdFailure::Fault(e)) => return Err(e),
+    };
 
     // 6. Build the response options. Assertion and session lifetimes are
     //    independent: the assertion's own validity window is typically

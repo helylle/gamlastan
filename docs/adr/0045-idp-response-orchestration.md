@@ -7,6 +7,8 @@
 - **Related:** [0008](0008-idp-server-infrastructure.md) (IdP server infrastructure),
   [0033](0033-idp-response-signing-helpers.md) (in-core signing helpers)
 - **Implementation:** `crates/gamlastan/src/idp/orchestrator/`,
+  `crates/gamlastan/src/idp/{ident.rs,ident/conformance.rs,policy.rs,authn_broker.rs,assertion_store.rs,eptid.rs}`,
+  `crates/gamlastan/src/crypto/algorithms.rs`, `crates/gamlastan/src/profiles/sso/idp.rs`,
   `crates/gamlastan-actix/src/idp.rs`, `example-idp/src/main.rs`
 
 ## Context
@@ -258,7 +260,7 @@ failure is a real protocol error rather than a silent per-integrator choice.
   signed -- is exercised by the crate's own test suite and attack corpus
   rather than reimplemented per deployment.
 - `example-idp` was rewritten onto the engine: production code (excluding
-  tests) shrank from 1516 to 1462 lines, with the hand-rolled
+  tests) shrank from 1514 to 1498 lines, with the hand-rolled
   `build_saml_response`/`build_saml_error_response`/`render_saml_response`/
   `select_authn_context`/`authn_context_satisfies` plumbing replaced by calls
   into `check_request`/`create_authn_response`/`create_denial_response`.
@@ -300,7 +302,9 @@ failure is a real protocol error rather than a silent per-integrator choice.
   (eduID's re-login and MFA step-up flows send a subject and enforce it in
   application code, for allowlisted SPs only).
   `AuthnRequest::requested_subject` reads it for an application that supports
-  a requested subject. The request parser rejects what it used to repair: an `IDPEntry`
+  a requested subject, and the Actix `AuthnSubjectCallback` receives the parsed
+  request so it can enforce both; `example-idp` supports neither and refuses a
+  request that names a `Subject`. The request parser rejects what it used to repair: an `IDPEntry`
   without `ProviderID`, and a repeated singleton child, so what a consumer
   reads is what the SP sent.
 - `AuthnBroker::pick` treats every listed class ref (else decl ref) as an
@@ -312,6 +316,10 @@ failure is a real protocol error rather than a silent per-integrator choice.
   so an encrypted SP default is a configuration error. With no
   `RequestedAuthnContext` and no `unspecified` method registered, `pick`
   offers every registered method.
+- Behaviour change: `SignTargets::resolve` never resolves to "sign nothing" (see
+  above), so the default policy signs the assertion and the engine needs a
+  signing key; pysaml2's default signs nothing. A denial is a `DeniedResponse`
+  (`xml`, `response_id`), not an `IssuedResponse` with a fabricated NameID.
 - Breaking (pre-release): `AuthnBroker::pick` with `Comparison="exact"`
   changed from level-based matching to literal class-ref matching (see
   above). Any integrator relying on the old broadened behaviour must pass
@@ -420,8 +428,20 @@ failure is a real protocol error rather than a silent per-integrator choice.
   an SP advertising nothing usable gets the IdP's first choice, and an SP
   cannot introduce an algorithm the IdP did not list; an HSM-backed signer
   refuses a signature method other than its token's. `tests/response_signing.rs`
-  signs a response and its assertion with RSA-SHA512 and a SHA-512 digest and
-  verifies both signatures.
+  signs a response and its assertion with RSA-SHA512 and a SHA-512 digest, and
+  with ECDSA P-256/SHA-256, P-384/SHA-384 and P-521/SHA-512 (EC fixtures), and
+  verifies both signatures each time.
+- Further orchestrator tests: the default policy signs the assertion; an empty
+  broker defers an `exact` request to the callback and denies the other
+  comparisons; the effective NameID format (a default as well as a requested
+  one) cannot be `encrypted`; an authn method that is stale, unsatisfying or
+  attached to an expired session is refused before anything is stored; the SP
+  role must belong to the supplied entity; a denial carries no assertion data.
+  `idp/authn_broker.rs`: every listed class ref is an alternative.
+  `idp/assertion_store.rs`: re-storing an ID for another subject leaves the old
+  subject's index. `gamlastan-actix`: the callback sees `Scoping`, a reused
+  session pins subject, instant and index, and an engine whose Issuer differs
+  from `IdpConfig::entity_id` is refused.
 - `idp/authn_broker.rs`: exact matching excludes a method registered at the
   same security level under a different, unrequested class ref by default;
   `allow_exact_level_matching` restores the old pysaml2-compatible
@@ -444,7 +464,7 @@ failure is a real protocol error rather than a silent per-integrator choice.
   naming a *different* entity is rejected outright before response assembly
   -- covered in `idp/orchestrator/tests.rs`); a denial's `StatusMessage`
   never echoes SP-supplied text.
-- `example-idp` rewritten on the engine; all 12 of its tests pass against a
+- `example-idp` rewritten on the engine; all 13 of its tests pass against a
   real fixture signing key (denials now sign unconditionally, so a keyless
   test signer no longer suffices).
 - `gamlastan-actix`'s `idp_sso` policy-driven path, exercised end-to-end for

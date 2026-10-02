@@ -49,7 +49,18 @@ where needed to correct protocol handling.
 - Added `gamlastan-actix`'s `AuthnSubjectCallback`, a higher-level companion
   to the existing `AuthnCallback`, returning an `AuthnSubjectResult` of
   `Authenticated(AuthenticatedSubject) | Redirect(HttpResponse) |
-  Deny(Denial)` for handlers built on `idp::orchestrator`.
+  Deny(Denial)` for handlers built on `idp::orchestrator`. It receives the
+  processed request, the parsed `&AuthnRequest`, the `&Disposition` and the
+  `HttpRequest`. The parsed request carries what `ProcessedAuthnRequest`
+  leaves out - `Scoping` (a proxy must enforce `ProxyCount` / `IDPList`) and the
+  requested `Subject` - which a POST callback could not otherwise read, as the
+  form body is already consumed. The SSO handler calls
+  `idp::orchestrator::check_request` itself before invoking the callback and
+  handles a `Deny` disposition directly (a signed protocol error; the callback
+  is never invoked for it), so a callback cannot redirect to a login form for
+  `IsPassive` or reuse a session `ForceAuthn` should have defeated.
+  `AuthnCallback`, the lower-level path, is unchanged and does not receive the
+  request; its documentation points to `AuthnSubjectCallback`.
 - Added `ResponseOptions::authenticating_authorities` and an `impl Default`
   for `ResponseOptions`. `create_response` now writes the field into the
   `AuthnContext` instead of hardcoding an empty list, so proxying IdPs can
@@ -161,23 +172,6 @@ where needed to correct protocol handling.
   insertion order for a map with several wire names per local name.
   `from_static` now goes through `from_directions` with identical results,
   which a test checks for every shipped map.
-- `AuthnBroker::pick` treats every listed `AuthnContextClassRef` (or, failing
-  those, `AuthnContextDeclRef`) as an alternative for every comparison, not
-  just `exact`: a method qualifies if it satisfies any of them, deduplicated
-  and in the request's order. Before, `minimum`, `maximum` and `better` read
-  only the first ref, so `[unknown, supported]` was denied. This follows SAML
-  Core 3.3.2.2.1 ("one of the authentication contexts specified") and differs
-  from pysaml2, which also reads only the first; it can only accept requests
-  that were refused before.
-  With no `RequestedAuthnContext` and no `unspecified` method registered,
-  `pick` now offers every registered method instead of none (nothing was
-  requested, so all qualify).
-- `nameid-format:encrypted` is never issued, with or without an opt-in
-  supported-format set: it asks for an `EncryptedID`, which the response path
-  cannot produce, and a plain NameID labelled that way would break the
-  requester's confidentiality requirement. A request naming it is denied with
-  `InvalidNameIDPolicy`; an SP whose configured default format it is (the
-  request names none) gets an error, as that is a configuration fault.
 - Added an opt-in supported-format set for requested NameIDs:
   `PolicyEntry::with_supported_nameid_formats`,
   `ReleasePolicy::supports_nameid_format` and `ISSUABLE_NAMEID_FORMATS`. With a
@@ -244,17 +238,6 @@ where needed to correct protocol handling.
   filters each entity's roles by SAML 2.0 protocol support before collecting
   signing certificates, so a certificate published only for a non-SAML-2.0
   role can no longer become trusted for verifying SAML 2.0 messages.
-- **Breaking:** `gamlastan-actix`'s `AuthnSubjectCallback` gains the parsed
-  `&AuthnRequest` (second parameter) and a `&Disposition` (third, before the
-  `HttpRequest`). The request carries what `ProcessedAuthnRequest` leaves out -
-  `Scoping` (a proxy must enforce `ProxyCount` / `IDPList`) and the requested
-  `Subject` - which a POST callback could not otherwise read, as the form body
-  is already consumed. The SSO handler now calls
-  `idp::orchestrator::check_request` before invoking the callback and handles
-  a `Deny` disposition directly (a signed protocol error; the callback is
-  never invoked for it) — previously the handler bypassed `check_request`
-  entirely, so a callback could redirect to a login form for `IsPassive` or
-  reuse a session `ForceAuthn` should have defeated.
 - **Breaking:** `IdentityStore` is now a record-shaped backend: one record per
   (user, NameID) association (`for_user`, `user_for`, `find_durable`,
   `get_or_insert_durable`, `insert`, `replace`, `remove`, `remove_all`).
@@ -289,6 +272,23 @@ where needed to correct protocol handling.
   `PyIdentityStore` is one) implements `KeyValueStore` for the `Eptid` cache
   and the new `IdentityStore` for `IdentDb`; code still implementing the old
   three methods as `IdentityStore` fails to compile rather than misbehaving.
+- **Behaviour change:** `AuthnBroker::pick` treats every listed
+  `AuthnContextClassRef` (or, failing those, `AuthnContextDeclRef`) as an
+  alternative for every comparison, not just `exact`: a method qualifies if it satisfies any of them, deduplicated
+  and in the request's order. Before, `minimum`, `maximum` and `better` read
+  only the first ref, so `[unknown, supported]` was denied. This follows SAML
+  Core 3.3.2.2.1 ("one of the authentication contexts specified") and differs
+  from pysaml2, which also reads only the first; it can only accept requests
+  that were refused before.
+  With no `RequestedAuthnContext` and no `unspecified` method registered,
+  `pick` now offers every registered method instead of none (nothing was
+  requested, so all qualify).
+- **Behaviour change:** `nameid-format:encrypted` is never issued, with or
+  without an opt-in supported-format set: it asks for an `EncryptedID`, which the response path
+  cannot produce, and a plain NameID labelled that way would break the
+  requester's confidentiality requirement. A request naming it is denied with
+  `InvalidNameIDPolicy`; an SP whose configured default format it is (the
+  request names none) gets an error, as that is a configuration fault.
 - **Behaviour change:** `SignTargets::resolve` never resolves to "sign nothing".
   The Web Browser SSO profile (SAML Profiles 4.1.4.5) requires a signed
   Response or a signed Assertion, so when the response is not to be signed the
@@ -296,14 +296,14 @@ where needed to correct protocol handling.
   the assertion, and the engine needs a real signing key; before, it issued an
   unsigned, forgeable response. pysaml2's default signs nothing; set
   `SignTargets::response` to sign the envelope instead.
-- `AuthnBroker::is_empty` was added. `check_request` no longer denies a request
-  with `NoAuthnContext` before login when the broker has no registrations at
-  all and the request is `exact`: an `Inline`-only deployment (a proxy) has no
+- `check_request` does not deny a request with `NoAuthnContext` before login
+  when the broker has no registrations at all (new `AuthnBroker::is_empty`) and
+  the request is `exact`: an `Inline`-only deployment (a proxy) has no
   capabilities to check, so it gets `Authenticate` with no methods and
   `create_authn_response` checks the method the callback reports. `minimum`,
   `maximum` and `better` need the broker's strength ordering, so with nothing
-  registered they are denied before login. A broker with registrations that match nothing
-  still denies.
+  registered they are denied before login. A broker with registrations that
+  match nothing still denies.
 - A denial is a `DeniedResponse` (`xml`, `response_id`), not an
   `IssuedResponse`: `create_denial_response` and `ResponseOutcome::Denied` no
   longer carry an empty NameID and a `not_on_or_after` of "now" that an audit
@@ -311,9 +311,6 @@ where needed to correct protocol handling.
 - `AuthnBroker::pick`'s documentation now states its real order (the request's
   class-ref order, then registration order), not "strongest first"; only
   `check_request` sorts by strength.
-- Added tests that sign and verify a response end to end with ECDSA
-  (P-256/SHA-256, P-384/SHA-384, P-521/SHA-512) using new EC fixtures; before,
-  only RSA was exercised.
 - `InMemoryAssertionStore` keeps both indexes under one lock, and re-storing an
   assertion ID for a different subject removes it from the old subject's index.
   Before, a lookup for the old subject returned the other subject's assertion.

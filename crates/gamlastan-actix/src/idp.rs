@@ -115,6 +115,15 @@ impl IdpSigningContext {
 /// When the IdP receives an AuthnRequest, the application must authenticate the user.
 /// This callback receives the processed request and returns the authenticated
 /// user's NameId and attributes (or an error to reject the request).
+///
+/// # Limits
+///
+/// The processed request leaves out `Scoping` (`ProxyCount` / `IDPList`, which
+/// a proxying IdP must honour) and the requested `Subject`, and this callback
+/// is not given the original `AuthnRequest`. It also decides everything itself
+/// (NameID, attributes, authn context), with none of the engine's checks. An
+/// application that needs either should use [`AuthnSubjectCallback`], which
+/// receives the parsed `AuthnRequest`.
 pub type AuthnCallback = Box<
     dyn Fn(
             &idp_profile::ProcessedAuthnRequest,

@@ -127,12 +127,18 @@ pub fn check_request(
 
     // No reusable session: authenticate, unless a context was requested and the
     // broker has nothing that satisfies it. An empty broker is not a statement
-    // that nothing can: a deployment using only `AuthnMethodRef::Inline` (a
-    // proxy, or a login flow outside the broker) registers nothing, so it has
-    // no capabilities to check before login. Offer no methods and let the
-    // callback authenticate; `create_authn_response` then checks the method it
-    // reports against the request.
-    if picked.is_empty() && requested.is_some() && !engine.broker.is_empty() {
+    // that nothing can, but only for `exact`: a deployment using only
+    // `AuthnMethodRef::Inline` (a proxy, or a login flow outside the broker)
+    // registers nothing, and `create_authn_response` accepts an inline method
+    // whose class ref literally matches an exact request. Offer no methods and
+    // let the callback authenticate; the response-time check enforces it. The
+    // other comparisons need the broker's strength ordering, so with nothing
+    // registered they can never be satisfied: deny before the user logs in.
+    let inline_can_satisfy = engine.broker.is_empty()
+        && requested.as_ref().is_some_and(|r| {
+            r.comparison == crate::core::protocol::request::AuthnContextComparison::Exact
+        });
+    if picked.is_empty() && requested.is_some() && !inline_can_satisfy {
         return Disposition::Deny {
             denial: Denial::NoAuthnContext,
         };

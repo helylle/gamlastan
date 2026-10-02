@@ -170,8 +170,10 @@ existing primitives into the profile flow, and move the semantics proven in
    response: `SignTargets::resolve` signs the assertion when the response is
    not signed (SAML Profiles 4.1.4.5), so the default policy signs the
    assertion. An empty `AuthnBroker` means an `Inline`-only deployment with no
-   capabilities to check, so `check_request` leaves the decision to the
-   response-time check instead of denying before login.
+   capabilities to check, so for an `exact` request `check_request` leaves the
+   decision to the response-time check instead of denying before login; the
+   other comparisons cannot be met without the broker's strength ordering and
+   are denied.
 
 2. Invert the application contract. The application supplies what only it
    knows -- subject identifier, raw attribute values, which authentication

@@ -298,9 +298,11 @@ where needed to correct protocol handling.
   `SignTargets::response` to sign the envelope instead.
 - `AuthnBroker::is_empty` was added. `check_request` no longer denies a request
   with `NoAuthnContext` before login when the broker has no registrations at
-  all: an `Inline`-only deployment (a proxy) has no capabilities to check, so it
-  gets `Authenticate` with no methods and `create_authn_response` checks the
-  method the callback reports. A broker with registrations that match nothing
+  all and the request is `exact`: an `Inline`-only deployment (a proxy) has no
+  capabilities to check, so it gets `Authenticate` with no methods and
+  `create_authn_response` checks the method the callback reports. `minimum`,
+  `maximum` and `better` need the broker's strength ordering, so with nothing
+  registered they are denied before login. A broker with registrations that match nothing
   still denies.
 - `create_authn_response` resolves and checks the authentication method before
   it constructs the NameID, so a stale `BrokerReference` or a method that does

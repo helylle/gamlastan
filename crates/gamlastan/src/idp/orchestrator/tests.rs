@@ -1550,6 +1550,29 @@ fn an_empty_broker_defers_an_exact_request_to_the_callback() {
         check_request(&engine, &p, None),
         Disposition::Authenticate { methods } if methods.is_empty()
     ));
+    // The other comparisons need the broker's strength ordering: with nothing
+    // registered they can never be met, so deny before login.
+    for comparison in [
+        AuthnContextComparison::Minimum,
+        AuthnContextComparison::Maximum,
+        AuthnContextComparison::Better,
+    ] {
+        let p = params(processed(
+            false,
+            false,
+            vec!["urn:custom:inline-method"],
+            Some(comparison),
+        ));
+        assert!(
+            matches!(
+                check_request(&engine, &p, None),
+                Disposition::Deny {
+                    denial: crate::idp::orchestrator::Denial::NoAuthnContext
+                }
+            ),
+            "{comparison:?}"
+        );
+    }
     // With a registered method that does not match, it is still a denial.
     let populated = self::broker();
     let engine = ResponseEngine {

@@ -46,8 +46,26 @@ pub trait AssertionStore: Send + Sync {
 /// In-memory assertion store.
 #[derive(Debug, Default)]
 pub struct InMemoryAssertionStore {
-    by_id: Mutex<HashMap<String, Assertion>>,
-    by_subject: Mutex<HashMap<String, Vec<String>>>,
+    state: Mutex<State>,
+}
+
+/// Both indexes behind one lock, so they cannot disagree.
+#[derive(Debug, Default)]
+struct State {
+    by_id: HashMap<String, Assertion>,
+    by_subject: HashMap<String, Vec<String>>,
+}
+
+impl State {
+    /// Drop `assertion_id` from the subject index entry for `subject`.
+    fn unindex(&mut self, subject: &str, assertion_id: &str) {
+        if let Some(ids) = self.by_subject.get_mut(subject) {
+            ids.retain(|id| id != assertion_id);
+            if ids.is_empty() {
+                self.by_subject.remove(subject);
+            }
+        }
+    }
 }
 
 impl InMemoryAssertionStore {
@@ -69,17 +87,17 @@ impl AssertionStore for InMemoryAssertionStore {
         let assertion_id = assertion.id.clone();
         let subject = subject_value(&assertion);
 
-        self.by_id
-            .lock()
-            .unwrap()
-            .insert(assertion_id.clone(), assertion);
-
+        let mut state = self.state.lock().unwrap();
+        // Re-storing an ID replaces the assertion, so it must leave the index of
+        // whatever subject the old one named: otherwise a lookup for that
+        // subject would return an assertion issued to someone else.
+        if let Some(previous) = state.by_id.insert(assertion_id.clone(), assertion) {
+            if let Some(old_subject) = subject_value(&previous) {
+                state.unindex(&old_subject, &assertion_id);
+            }
+        }
         if let Some(subject) = subject {
-            let mut by_subject = self.by_subject.lock().unwrap();
-            let ids = by_subject.entry(subject).or_default();
-            // Re-storing the same assertion ID (overwriting in `by_id`) must
-            // not duplicate it in the subject index, or `assertions_for_subject`
-            // would return the assertion more than once.
+            let ids = state.by_subject.entry(subject).or_default();
             if !ids.contains(&assertion_id) {
                 ids.push(assertion_id);
             }
@@ -88,40 +106,25 @@ impl AssertionStore for InMemoryAssertionStore {
     }
 
     fn get_assertion(&self, assertion_id: &str) -> Result<Option<Assertion>, StoreError> {
-        Ok(self.by_id.lock().unwrap().get(assertion_id).cloned())
+        Ok(self.state.lock().unwrap().by_id.get(assertion_id).cloned())
     }
 
     fn assertions_for_subject(&self, name_id_value: &str) -> Result<Vec<Assertion>, StoreError> {
-        let ids = self
+        let state = self.state.lock().unwrap();
+        Ok(state
             .by_subject
-            .lock()
-            .unwrap()
             .get(name_id_value)
-            .cloned()
-            .unwrap_or_default();
-
-        if ids.is_empty() {
-            return Ok(vec![]);
-        }
-
-        let by_id = self.by_id.lock().unwrap();
-        Ok(ids
             .into_iter()
-            .filter_map(|id| by_id.get(&id).cloned())
+            .flatten()
+            .filter_map(|id| state.by_id.get(id).cloned())
             .collect())
     }
 
     fn remove_assertion(&self, assertion_id: &str) -> Result<(), StoreError> {
-        let removed = self.by_id.lock().unwrap().remove(assertion_id);
-        if let Some(subject) = removed.as_ref().and_then(subject_value) {
-            let mut by_subject = self.by_subject.lock().unwrap();
-            let mut remove_subject_entry = false;
-            if let Some(ids) = by_subject.get_mut(&subject) {
-                ids.retain(|id| id != assertion_id);
-                remove_subject_entry = ids.is_empty();
-            }
-            if remove_subject_entry {
-                by_subject.remove(&subject);
+        let mut state = self.state.lock().unwrap();
+        if let Some(removed) = state.by_id.remove(assertion_id) {
+            if let Some(subject) = subject_value(&removed) {
+                state.unindex(&subject, assertion_id);
             }
         }
         Ok(())
@@ -415,6 +418,28 @@ mod tests {
         store.remove_assertion("_a1").unwrap();
         assert!(store.get_assertion("_a1").unwrap().is_none());
         assert!(store.assertions_for_subject("alice").unwrap().is_empty());
+    }
+
+    #[test]
+    fn restoring_an_id_for_another_subject_leaves_the_old_subjects_index() {
+        let store = InMemoryAssertionStore::new();
+        let class = constants::AUTHN_CONTEXT_PASSWORD;
+        store
+            .store_assertion(assertion("_a1", "alice", "_s1", class))
+            .unwrap();
+        // Same ID, now naming bob: alice must no longer see it.
+        store
+            .store_assertion(assertion("_a1", "bob", "_s2", class))
+            .unwrap();
+        assert!(store.assertions_for_subject("alice").unwrap().is_empty());
+        assert_eq!(store.assertions_for_subject("bob").unwrap().len(), 1);
+        assert_eq!(
+            subject_value(&store.get_assertion("_a1").unwrap().unwrap()).as_deref(),
+            Some("bob")
+        );
+        // Removing it leaves nothing behind in either index.
+        store.remove_assertion("_a1").unwrap();
+        assert!(store.assertions_for_subject("bob").unwrap().is_empty());
     }
 
     #[test]

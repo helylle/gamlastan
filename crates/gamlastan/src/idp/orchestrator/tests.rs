@@ -1380,6 +1380,19 @@ fn the_requested_authn_context_helper_keeps_declaration_refs() {
         requested.authn_context_decl_refs,
         vec!["urn:example:decl".to_string()]
     );
+
+    // A present but empty element (the comparison records it) is a constraint
+    // too, not "none".
+    let mut p = params(processed(
+        false,
+        false,
+        vec![],
+        Some(AuthnContextComparison::Exact),
+    ));
+    p.processed.requested_authn_context_decl_refs = vec![];
+    let requested = p.requested_authn_context().expect("a constraint");
+    assert!(requested.authn_context_class_refs.is_empty());
+    assert!(requested.authn_context_decl_refs.is_empty());
 }
 
 #[test]

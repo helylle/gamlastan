@@ -304,6 +304,13 @@ where needed to correct protocol handling.
   `maximum` and `better` need the broker's strength ordering, so with nothing
   registered they are denied before login. A broker with registrations that match nothing
   still denies.
+- `InMemoryAssertionStore` keeps both indexes under one lock, and re-storing an
+  assertion ID for a different subject removes it from the old subject's index.
+  Before, a lookup for the old subject returned the other subject's assertion.
+- `ResponseParams::requested_authn_context` returns a constraint (not `None`)
+  for a present but empty `RequestedAuthnContext`, which the engine refuses.
+- `example-idp` refuses an `AuthnRequest` that names a `Subject`: it issues for
+  whoever logs in and does not compare them with a requested principal.
 - `create_authn_response` resolves and checks the authentication method before
   it constructs the NameID, so a stale `BrokerReference` or a method that does
   not satisfy the request is refused before anything is stored. It also

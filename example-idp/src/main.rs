@@ -1025,6 +1025,13 @@ fn validate_authn_request(
         return Err("unsigned AuthnRequest rejected by IdP policy".to_string());
     }
 
+    // This example issues an assertion for whoever logs in and never compares
+    // them with a principal the SP names, so a requested Subject is refused:
+    // otherwise an SP could ask for Alice and receive an assertion for Bob.
+    if authn_request.requested_subject().is_some() {
+        return Err("this IdP does not support a requested Subject".to_string());
+    }
+
     let processed = idp_profile::process_authn_request(authn_request, &sp.sp_sso, signed)
         .map_err(|e| e.to_string())?;
     // This example delivers every Response by HTTP-POST. An ACS registered for
@@ -1675,6 +1682,28 @@ mod tests {
 
         let err = validate_authn_request(&state, &request, "", None).unwrap_err();
         assert!(err.contains("HTTP-POST only"), "{err}");
+    }
+
+    #[test]
+    fn test_validate_authn_request_refuses_a_requested_subject() {
+        let state = test_state(false, &["https://sp.example.se/metadata"]);
+        let mut request = unsigned_request("https://sp.example.se/metadata");
+        request.subject = Some(gamlastan::core::assertion::subject::Subject {
+            name_id: Some(
+                gamlastan::core::assertion::name_id::NameIdOrEncryptedId::NameId(
+                    gamlastan::core::assertion::name_id::NameId {
+                        value: "alice".to_string(),
+                        format: None,
+                        name_qualifier: None,
+                        sp_name_qualifier: None,
+                        sp_provided_id: None,
+                    },
+                ),
+            ),
+            subject_confirmations: vec![],
+        });
+        let err = validate_authn_request(&state, &request, "", None).unwrap_err();
+        assert!(err.contains("requested Subject"), "{err}");
     }
 
     /// Build a validated request for helper-level policy and state tests.

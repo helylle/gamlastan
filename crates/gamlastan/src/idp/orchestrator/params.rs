@@ -226,14 +226,19 @@ impl ResponseParams {
     }
 
     /// The raw AuthnRequest's `RequestedAuthnContext`, if any, including any
-    /// `AuthnContextDeclRef`s. A request that names only declarations is still a
-    /// constraint, so this does not return `None` for it (the engine denies such
-    /// a request: see [`ProcessedAuthnRequest::requested_authn_context_decl_refs`]).
+    /// `AuthnContextDeclRef`s. A request that names only declarations, or an
+    /// empty element, is still a constraint, so this does not return `None` for
+    /// it (the engine denies both: see
+    /// [`ProcessedAuthnRequest::requested_authn_context_decl_refs`]).
     pub fn requested_authn_context(
         &self,
     ) -> Option<crate::core::protocol::request::RequestedAuthnContext> {
+        // Present-but-empty (the comparison records the element was there) is
+        // still a constraint, a malformed one the engine refuses; only a request
+        // with no element at all is "no constraint".
         if self.processed.requested_authn_context_class_refs.is_empty()
             && self.processed.requested_authn_context_decl_refs.is_empty()
+            && self.processed.authn_context_comparison.is_none()
         {
             return None;
         }

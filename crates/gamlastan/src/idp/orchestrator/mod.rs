@@ -20,6 +20,25 @@
 //! audience/conditions, session index and lifetime, and signed protocol
 //! errors — is the fixed correctness core.
 //!
+//! # What the application must still enforce
+//!
+//! The engine decides from the processed request, which deliberately leaves out
+//! two things an application may need to act on. Read them from the original
+//! [`AuthnRequest`](crate::core::protocol::request::AuthnRequest) before
+//! calling [`create_authn_response`]:
+//!
+//! - **`Scoping`** (`ProxyCount`, `IDPList`, `RequesterID`). An originating IdP may
+//!   ignore it. A **proxying** IdP must not forward a request it was told not to
+//!   (SAML Core 3.4.1.2); the engine never forwards, so it cannot know.
+//! - **The requested `Subject`**, via `AuthnRequest::requested_subject`. The
+//!   engine issues for whoever authenticated and does not compare them with the
+//!   principal the SP named, because mapping a NameID to a local user is
+//!   deployment-specific. An application that cannot honour a requested subject
+//!   should refuse the request, as `example-idp` does.
+//!
+//! The `gamlastan-actix` `AuthnSubjectCallback` receives the parsed request for
+//! this reason.
+//!
 //! # Example
 //!
 //! ```

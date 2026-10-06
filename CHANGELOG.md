@@ -367,6 +367,18 @@ where needed to correct protocol handling.
   (`find_durable` takes the format), and `InsertError::PersistentExists`
   became `DurableExists`. `AllowCreate=false` still gates only the persistent
   format.
+- **Behaviour change:** `IdentDb::construct_nameid` treats a request with **no
+  `NameIDPolicy` at all** as allowing the IdP to create a persistent identifier.
+  0.9.x computed `AllowCreate` as `false` in that case, so an IdP whose default
+  format is persistent refused every first-time user whose request omitted the
+  policy with `CreateNotAllowed`. Only an explicit `NameIDPolicy` with
+  `AllowCreate="false"` forbids creating one, and a policy that is present but
+  omits `AllowCreate` is unchanged (`false`, the schema default). This matches
+  pysaml2, whose SSO flow mints whatever `AllowCreate` says; gamlastan still
+  honours an explicit `false`. It affects the persistent format only, and it
+  mints a new durable identifier where an upgrade used to refuse, so check it
+  if SPs omit `NameIDPolicy`. Before this PR nothing in a response path called
+  `construct_nameid`, so it concerns applications that did.
 - **Behaviour change:** ACS endpoint selection honours `ProtocolBinding`, as
   pysaml2 does. A `ProtocolBinding` with no URL or index picks the default
   endpoint among those registered with that binding (it used to be ignored, so

@@ -343,6 +343,14 @@ failure is a real protocol error rather than a silent per-integrator choice.
   are stable per (user, SP, format) instead of being minted anew at each login,
   as `IdentDb` always did for persistent, matching what pysaml2's server does
   by looking up an existing NameID before constructing one (see above).
+- Behaviour change: a request with no `NameIDPolicy` at all no longer counts as
+  `AllowCreate=false`, so the IdP may mint a persistent identifier in its default
+  format; 0.9.x refused with `CreateNotAllowed`, which made a persistent-default
+  IdP deny every first-time user whose request omitted the policy. An explicit
+  policy with `AllowCreate="false"` still forbids creation, and a present policy
+  that omits `AllowCreate` is still `false`. pysaml2's SSO flow never consults
+  `AllowCreate` and always mints; gamlastan is stricter in honouring an explicit
+  `false`. Persistent format only.
 - Behaviour change: transient NameIDs are no longer stored by default (see
   above), so `find_local_id` on one finds nothing unless
   `IdentDb::with_persist_transient` is set.

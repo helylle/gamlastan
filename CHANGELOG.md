@@ -175,6 +175,12 @@ where needed to correct protocol handling.
   insertion order for a map with several wire names per local name.
   `from_static` now goes through `from_directions` with identical results,
   which a test checks for every shipped map.
+- A requested NameID format longer than `MAX_NAMEID_FORMAT_LEN` (256 bytes) is
+  refused with `InvalidNameIDPolicy`, whatever is configured
+  (`ReleasePolicy::supports_nameid_format`). Formats are short URIs, and the
+  requested one is stored with each durable record, so it is bounded. The orchestrator module docs
+  now list the permissive defaults to review before production (attribute
+  release, NameID formats, signing with an HSM, transient NameIDs).
 - Added an opt-in supported-format set for requested NameIDs:
   `PolicyEntry::with_supported_nameid_formats`,
   `ReleasePolicy::supports_nameid_format` and `ISSUABLE_NAMEID_FORMATS`. With a

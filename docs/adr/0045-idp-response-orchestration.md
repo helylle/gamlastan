@@ -125,6 +125,9 @@ existing primitives into the profile flow, and move the semantics proven in
    failure surfaces from the orchestrator as `Err(ProfileError::Store)`, never
    as a signed denial.
 
+   A requested format longer than `MAX_NAMEID_FORMAT_LEN` (256 bytes) is
+   refused whatever is configured, since it is stored with each durable record.
+
    Refusing requested NameID formats is opt-in. By default any
    `NameIDPolicy/@Format` is honoured, as in pysaml2, which never validates it
    (so an SP that sends invented format strings gets one stored record per

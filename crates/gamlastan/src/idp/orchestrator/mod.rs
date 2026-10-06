@@ -20,6 +20,29 @@
 //! audience/conditions, session index and lifetime, and signed protocol
 //! errors — is the fixed correctness core.
 //!
+//! # Defaults to review before production
+//!
+//! Some defaults are permissive on purpose, to match pysaml2. Each has a switch;
+//! decide each one for a production IdP rather than inherit it:
+//!
+//! - **Attribute release.** With no rule covering an SP (entity categories,
+//!   attributes requested in its metadata, restrictions), every attribute the
+//!   application supplies is released. Configure the rules, or fail closed with
+//!   [`PolicyEntry::with_deny_unconfigured_release`](crate::idp::policy::PolicyEntry::with_deny_unconfigured_release).
+//! - **NameID formats.** Any requested format (up to
+//!   [`MAX_NAMEID_FORMAT_LEN`](crate::idp::policy::MAX_NAMEID_FORMAT_LEN) bytes) is
+//!   accepted, and every non-transient one is stored, so an SP that invents format
+//!   strings grows the identity store by one record per string. Set
+//!   [`PolicyEntry::with_supported_nameid_formats`](crate::idp::policy::PolicyEntry::with_supported_nameid_formats)
+//!   (`ISSUABLE_NAMEID_FORMATS` is a starting set).
+//! - **Signing.** Nothing configured signs the assertion. With an HSM, list only
+//!   the token's signature method in any
+//!   [`SigningPreference`](crate::crypto::SigningPreference).
+//! - **Transient NameIDs** are not stored, so a back-channel logout cannot
+//!   resolve one unless
+//!   [`IdentDb::with_persist_transient`](crate::idp::IdentDb::with_persist_transient)
+//!   is set.
+//!
 //! # What the application must still enforce
 //!
 //! The engine decides from the processed request, which deliberately leaves out

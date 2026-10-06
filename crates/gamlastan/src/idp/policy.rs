@@ -54,6 +54,12 @@ pub enum PolicyError {
     },
 }
 
+/// The longest NameID format, in bytes, this IdP will issue. Formats are short
+/// URIs (the longest standard one is about 60 bytes); the requested format comes
+/// from the SP and is stored with each durable record, so it is bounded. A longer
+/// one is refused whatever is configured.
+pub const MAX_NAMEID_FORMAT_LEN: usize = 256;
+
 /// The NameID formats [`IdentDb`](crate::idp::ident::IdentDb) issues
 /// meaningfully: a reasonable set to hand to
 /// [`PolicyEntry::with_supported_nameid_formats`] when an IdP wants to refuse
@@ -465,10 +471,18 @@ impl ReleasePolicy {
     /// With no supported set configured
     /// ([`PolicyEntry::with_supported_nameid_formats`]) every format is
     /// accepted, as in pysaml2, except `nameid-format:encrypted`, which is
-    /// always refused because the response path cannot encrypt a NameID. With one, the SP's own default format
-    /// ([`nameid_format`](Self::nameid_format)) is always allowed and any other
-    /// format must be in the set.
+    /// always refused because the response path cannot encrypt a NameID. With
+    /// one, the SP's own default format ([`nameid_format`](Self::nameid_format))
+    /// is always allowed and any other format must be in the set. A format longer
+    /// than [`MAX_NAMEID_FORMAT_LEN`] is refused in every case.
+    ///
+    /// An accepted format other than transient is stored: with no supported set,
+    /// an SP that sends invented format strings gets one durable record per
+    /// string. Configure a set in production.
     pub fn supports_nameid_format(&self, sp_entity_id: &str, format: &str) -> bool {
+        if format.len() > MAX_NAMEID_FORMAT_LEN {
+            return false;
+        }
         // `nameid-format:encrypted` asks for an `EncryptedID`, not an opaque
         // identifier. The response path cannot encrypt, so issuing a plain
         // NameID under that label would break the requester's
@@ -1022,6 +1036,22 @@ mod tests {
         ] {
             assert!(policy.supports_nameid_format("https://sp.example.org", format));
         }
+    }
+
+    #[test]
+    fn an_overlong_format_is_never_supported() {
+        let sp = "https://sp.example.org";
+        let long = format!("urn:example:{}", "a".repeat(MAX_NAMEID_FORMAT_LEN));
+        assert!(long.len() > MAX_NAMEID_FORMAT_LEN);
+        assert!(!ReleasePolicy::new().supports_nameid_format(sp, &long));
+        // Not even when listed or set as the SP default.
+        let listed = ReleasePolicy::with_default(
+            PolicyEntry::new().with_supported_nameid_formats(vec![long.clone()]),
+        );
+        assert!(!listed.supports_nameid_format(sp, &long));
+        // The limit itself is allowed.
+        let at_limit = "x".repeat(MAX_NAMEID_FORMAT_LEN);
+        assert!(ReleasePolicy::new().supports_nameid_format(sp, &at_limit));
     }
 
     #[test]

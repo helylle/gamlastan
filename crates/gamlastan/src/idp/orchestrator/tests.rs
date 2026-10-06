@@ -1506,6 +1506,23 @@ fn an_unsupported_requested_nameid_format_is_denied_and_nothing_is_minted() {
 }
 
 #[test]
+fn an_overlong_requested_nameid_format_is_denied_and_nothing_is_stored() {
+    use crate::idp::orchestrator::Denial;
+    use crate::idp::policy::MAX_NAMEID_FORMAT_LEN;
+    let long = format!("urn:example:{}", "a".repeat(MAX_NAMEID_FORMAT_LEN));
+    with_engine(&ReleasePolicy::new(), |engine, idents| {
+        assert_eq!(
+            issued_name_id(engine, &long),
+            Err(Denial::InvalidNameIdPolicy)
+        );
+        assert!(idents
+            .name_ids_for(&subject_without_mail().subject_id)
+            .unwrap()
+            .is_empty());
+    });
+}
+
+#[test]
 fn the_encrypted_nameid_format_is_denied_even_with_no_supported_set() {
     use crate::idp::orchestrator::Denial;
     with_engine(&ReleasePolicy::new(), |engine, idents| {

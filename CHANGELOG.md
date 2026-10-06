@@ -330,6 +330,18 @@ where needed to correct protocol handling.
   owner it just looked up). A Mongo or SQL upsert filtered on `(value, user_id)`
   gets this from the unique index on the value; the conformance check
   `replace_upserts_by_value` now asserts it.
+- Added `PolicyEntry::with_deny_unconfigured_release` (and
+  `ReleasePolicy::deny_unconfigured_release`), an opt-in to fail closed on
+  attribute release. **By default, as in pysaml2 and unchanged from 0.9.x, an SP
+  that no attribute rule covers is released every attribute the application
+  supplied**: the policy only narrows (entity categories, the attributes the SP
+  requests in its metadata, attribute restrictions), so with none of those the
+  application is the only filter. With the setting on, such an SP gets an
+  assertion with no attribute statement; an SP covered by any rule is filtered
+  as before. It resolves like the other policy settings (SP entry, registration
+  authority, `default`), so it can be set globally on the `default` entry and
+  overridden per SP. `PassThroughRelease` is unaffected. This default is now
+  documented on `ReleasePolicy`.
 - `IdentDb` gives up after 8 attempts to mint an unused NameID, with a
   `StoreError`, instead of looping forever against a backend that always reports
   `ValueTaken` or says every value is in use. Real collisions of 256-bit values

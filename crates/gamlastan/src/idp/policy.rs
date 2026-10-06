@@ -127,6 +127,7 @@ pub struct PolicyEntry {
     sign: Option<SignTargets>,
     signing_preference: Option<SigningPreference>,
     fail_on_missing_requested: Option<bool>,
+    deny_unconfigured_release: Option<bool>,
     entity_categories: Option<Vec<OwnedEntityCategoryPolicy>>,
 }
 
@@ -207,6 +208,25 @@ impl PolicyEntry {
         self
     }
 
+    /// Release **nothing** to an SP that no attribute rule covers.
+    ///
+    /// By default (as in pysaml2) a policy with no rule for an SP releases every
+    /// attribute the application hands the engine: the application is then the
+    /// only filter. Set this on the `default` entry, or on one SP's entry, to
+    /// fail closed instead. An SP is covered when any of these applies to it:
+    /// entity categories are configured, its metadata requests attributes
+    /// (`RequestedAttribute`), or attribute restrictions are configured. A
+    /// covered SP is filtered by those rules exactly as before; an uncovered one
+    /// gets an assertion without an attribute statement.
+    ///
+    /// Passing `false` on an SP entry overrides a `true` on the default.
+    /// [`PassThroughRelease`](crate::idp::orchestrator::PassThroughRelease) is
+    /// unaffected: it is the explicit "already filtered" choice.
+    pub fn with_deny_unconfigured_release(mut self, deny: bool) -> Self {
+        self.deny_unconfigured_release = Some(deny);
+        self
+    }
+
     /// Set the attribute NameFormat used in assertions for this SP.
     pub fn with_name_form(mut self, name_form: impl Into<String>) -> Self {
         self.name_form = Some(name_form.into());
@@ -262,6 +282,17 @@ impl PolicyEntry {
 }
 
 /// The IdP-side attribute release policy (pysaml2 `Policy`).
+///
+/// # Default release
+///
+/// **With nothing configured for an SP, every attribute the application hands
+/// the engine is released.** As in pysaml2, the policy only narrows: entity
+/// categories, the attributes the SP requests in its metadata, and attribute
+/// restrictions each reduce the set, and with none of them there is nothing to
+/// reduce it. The application is then the first and only filter. To fail closed
+/// instead, set [`PolicyEntry::with_deny_unconfigured_release`]; to release
+/// nothing but what an SP is entitled to, configure entity categories or
+/// restrictions.
 ///
 /// Entry resolution per knob: the SP-specific entry first; if the SP has no
 /// entry of its own, the entry keyed on its registration authority (when one is
@@ -496,6 +527,14 @@ impl ReleasePolicy {
             .unwrap_or_default()
     }
 
+    /// Whether an SP that no attribute rule covers is released nothing
+    /// (default: false, which releases everything the application supplied; see
+    /// [`PolicyEntry::with_deny_unconfigured_release`]).
+    pub fn deny_unconfigured_release(&self, sp_entity_id: &str) -> bool {
+        self.get(sp_entity_id, |e| e.deny_unconfigured_release)
+            .unwrap_or(false)
+    }
+
     /// Whether a missing required attribute is an error (default: true).
     pub fn fail_on_missing_requested(&self, sp_entity_id: &str) -> bool {
         self.get(sp_entity_id, |e| e.fail_on_missing_requested)
@@ -650,6 +689,21 @@ impl ReleasePolicy {
     ) -> Result<Vec<Attribute>, PolicyError> {
         let mut result = attributes;
         let fail_on_missing_requested = self.fail_on_missing_requested(sp_entity_id);
+
+        // Fail closed, when asked to, for an SP that no attribute rule covers.
+        // Without this an empty policy releases everything (pysaml2's default).
+        if self.deny_unconfigured_release(sp_entity_id)
+            && self
+                .get_ref(sp_entity_id, |e| e.entity_categories.as_deref())
+                .is_none()
+            && self
+                .get_ref(sp_entity_id, |e| e.attribute_restrictions.as_ref())
+                .is_none()
+            && required.is_empty()
+            && optional.is_empty()
+        {
+            result.clear();
+        }
 
         // Step 1: entity-category release rules take precedence over
         // per-attribute requested/optional matching when configured. Borrow the
@@ -1736,6 +1790,69 @@ mod tests {
         let mut bad = HashMap::new();
         bad.insert("mail".to_string(), vec!["other@example.com".to_string()]);
         assert!(policy.filter_on_demands(attrs, &bad, &optional).is_err());
+    }
+
+    fn filter_for(policy: &ReleasePolicy, required: &[RequestedAttribute]) -> Vec<Attribute> {
+        policy
+            .filter(
+                vec![
+                    mail_attribute(&["alice@example.com"]),
+                    eppn_attribute("alice@example.org"),
+                ],
+                "https://sp.example.com",
+                &[],
+                required,
+                &[],
+                SubjectIdReq::None,
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn with_nothing_configured_everything_supplied_is_released() {
+        // pysaml2's default, pinned: the policy only narrows.
+        assert_eq!(filter_for(&ReleasePolicy::new(), &[]).len(), 2);
+    }
+
+    #[test]
+    fn deny_unconfigured_release_releases_nothing_without_a_rule() {
+        let deny =
+            ReleasePolicy::with_default(PolicyEntry::new().with_deny_unconfigured_release(true));
+        assert!(filter_for(&deny, &[]).is_empty());
+    }
+
+    #[test]
+    fn a_rule_covers_the_sp_under_deny_unconfigured_release() {
+        // SP-requested attributes.
+        let deny =
+            ReleasePolicy::with_default(PolicyEntry::new().with_deny_unconfigured_release(true));
+        let mail = requested(&mail_attribute(&[]).name, Some("mail"), false);
+        let out = filter_for(&deny, std::slice::from_ref(&mail));
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].friendly_name.as_deref(), Some("mail"));
+
+        // Attribute restrictions.
+        let restricted = ReleasePolicy::with_default(
+            PolicyEntry::new()
+                .with_deny_unconfigured_release(true)
+                .with_attribute_restrictions(&[("mail", None)])
+                .unwrap(),
+        );
+        let out = filter_for(&restricted, &[]);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].friendly_name.as_deref(), Some("mail"));
+    }
+
+    #[test]
+    fn deny_unconfigured_release_can_be_overridden_per_sp() {
+        let mut policy =
+            ReleasePolicy::with_default(PolicyEntry::new().with_deny_unconfigured_release(true));
+        policy.insert(
+            "https://sp.example.com",
+            PolicyEntry::new().with_deny_unconfigured_release(false),
+        );
+        assert_eq!(filter_for(&policy, &[]).len(), 2);
+        assert!(policy.deny_unconfigured_release("https://other.example.com"));
     }
 
     #[test]

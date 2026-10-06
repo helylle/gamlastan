@@ -1521,6 +1521,33 @@ fn the_encrypted_nameid_format_is_denied_even_with_no_supported_set() {
 }
 
 #[test]
+fn an_sp_no_rule_covers_gets_every_attribute_unless_deny_unconfigured_is_set() {
+    use crate::idp::orchestrator::AuthenticatedSubject;
+    use crate::idp::policy::PolicyEntry;
+    let subject = AuthenticatedSubject {
+        attributes: vec![mail_attribute()],
+        ..subject_without_mail()
+    };
+    // `with_engine` uses the policy itself as the release seam.
+    let released_by = |decisions: &ReleasePolicy| {
+        with_engine(decisions, |engine, _| {
+            let p = params(processed(false, false, vec![], None));
+            match create_authn_response(engine, &p, &subject).unwrap() {
+                ResponseOutcome::Issued(issued) => issued.released_attribute_names,
+                other => panic!("expected Issued, got {other:?}"),
+            }
+        })
+    };
+
+    // pysaml2's default, pinned: nothing configured releases what was supplied.
+    assert_eq!(released_by(&ReleasePolicy::new()).len(), 1);
+    // Opted into fail-closed: the same SP gets no attributes.
+    let strict =
+        ReleasePolicy::with_default(PolicyEntry::new().with_deny_unconfigured_release(true));
+    assert!(released_by(&strict).is_empty());
+}
+
+#[test]
 fn the_default_policy_signs_the_assertion() {
     // Nothing configured: the response is not signed, so the assertion must be.
     let decisions = ReleasePolicy::new();

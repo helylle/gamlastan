@@ -49,6 +49,11 @@ pub trait AttributeRelease: Send + Sync {
 }
 
 /// The full release engine, used by originating IdPs.
+///
+/// With no rule configured for an SP it releases every attribute the
+/// application supplied (see [`ReleasePolicy`]'s "Default release");
+/// [`PolicyEntry::with_deny_unconfigured_release`](crate::idp::policy::PolicyEntry::with_deny_unconfigured_release)
+/// makes it release nothing instead.
 impl AttributeRelease for ReleasePolicy {
     fn release(
         &self,

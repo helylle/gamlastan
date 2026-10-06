@@ -148,6 +148,16 @@ existing primitives into the profile flow, and move the semantics proven in
    stored transient is still never handed out again, e.g. by a NameIDMapping
    request. 0.9.x stored them, so this default is a behaviour change.
 
+   The default release policy only narrows: with no entity categories, no
+   attributes requested in the SP's metadata and no restrictions, an SP is
+   released every attribute the application supplied, as in pysaml2 and as
+   `ReleasePolicy::filter` already did in 0.9.x. The application is then the
+   only filter. Failing closed is opt-in
+   (`PolicyEntry::with_deny_unconfigured_release`), for the same reason as the
+   NameID format list: a default-deny would give a deployment that sets only a
+   lifetime or signing option, and relies on pysaml2's "release unless
+   restricted", assertions with no attributes.
+
    Attribute release is a seam, not a hardwired step, because deployments
    legitimately source the released set differently: an originating IdP
    applies federation policy (`ReleasePolicy` + entity categories); a proxy
@@ -458,6 +468,10 @@ failure is a real protocol error rather than a silent per-integrator choice.
   subject's index. `gamlastan-actix`: the callback sees `Scoping`, a reused
   session pins subject, instant and index, and an engine whose Issuer differs
   from `IdpConfig::entity_id` is refused.
+- `idp/policy.rs` / `idp/orchestrator/tests.rs`: with nothing configured every
+  supplied attribute is released (pinned); `with_deny_unconfigured_release`
+  releases none for an uncovered SP, is lifted by SP-requested attributes or
+  restrictions, and can be overridden per SP.
 - `idp/authn_broker.rs`: exact matching excludes a method registered at the
   same security level under a different, unrequested class ref by default;
   `allow_exact_level_matching` restores the old pysaml2-compatible

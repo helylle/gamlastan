@@ -321,6 +321,15 @@ where needed to correct protocol handling.
   for a present but empty `RequestedAuthnContext`, which the engine refuses.
 - `example-idp` refuses an `AuthnRequest` that names a `Subject`: it issues for
   whoever logs in and does not compare them with a requested principal.
+- **Behaviour change (store contract):** `IdentityStore::replace` (and so
+  `IdentDb::store`) no longer moves a record to another user. A value held by a
+  different user is `InsertError::ValueTaken` (`IdentError::ValueTaken` from
+  `IdentDb::store`) and left untouched; the owner can still update it in place.
+  Reassigning would let the new user log in as the old one at every SP that has
+  seen the value. Nothing in this crate relied on it (ManageNameID passes the
+  owner it just looked up). A Mongo or SQL upsert filtered on `(value, user_id)`
+  gets this from the unique index on the value; the conformance check
+  `replace_upserts_by_value` now asserts it.
 - `IdentDb` gives up after 8 attempts to mint an unused NameID, with a
   `StoreError`, instead of looping forever against a backend that always reports
   `ValueTaken` or says every value is in use. Real collisions of 256-bit values

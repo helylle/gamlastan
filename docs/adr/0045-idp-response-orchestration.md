@@ -109,7 +109,10 @@ existing primitives into the profile flow, and move the semantics proven in
    a second durable record of the same format for the same `(user,
    sp_name_qualifier, name_qualifier)` (`InsertError::DurableExists`) just as
    `get_or_insert_durable` returns the existing one -- and the suite checks
-   each path, since a backend can guard one and forget another.
+   each path, since a backend can guard one and forget another. `replace`
+   updates a record in place for its owner but never moves it to another user
+   (`ValueTaken`): reassigning a value would let the new user log in as the old
+   one at every SP that has seen it.
    `InMemoryIdentityStore` takes one lock per call; a Mongo/SQL-backed store
    must back the two constraints with real unique indexes (the second a
    partial unique index on `(user, sp_name_qualifier, name_qualifier, format)`
@@ -390,11 +393,13 @@ failure is a real protocol error rather than a silent per-integrator choice.
   field.
 - `ident::conformance`: the backend contract suite (value uniqueness,
   durable get-or-insert for persistent and email, the durable constraint on
-  `insert` and `replace`, filtered lookup, scoped removal, and two concurrent
+  `insert` and `replace`, `replace` refusing another user's value, filtered
+  lookup, scoped removal, and two concurrent
   checks run for both formats) passes on `InMemoryIdentityStore` and is
   verified to fail against a backend with no value uniqueness, a
   check-then-insert backend, a backend that guards only
-  `get_or_insert_durable`, and one that guards `insert` but not `replace`. The
+  `get_or_insert_durable`, one that guards `insert` but not `replace`, and one
+  whose `replace` reassigns a record to another user. The
   non-panicking `check` / `check_one` entry points return the
   violation, run a check by name, and report a failing backend call as a
   failed check rather than a lost race.

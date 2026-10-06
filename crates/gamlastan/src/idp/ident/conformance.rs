@@ -421,7 +421,7 @@ fn durable_is_unique_on_every_write_path<S: IdentityStore>(s: &S) -> Outcome {
                 ));
             }
             Err(InsertError::ValueTaken) => {
-                return Err("replace reported ValueTaken; it upserts by value".to_string());
+                return Err("replace reported ValueTaken for a value nobody holds".to_string());
             }
             Err(e) => return Err(format!("backend call `replace` failed: {e}")),
         }
@@ -687,15 +687,26 @@ fn replace_upserts_by_value<S: IdentityStore>(s: &S) -> Outcome {
         vec![updated],
         "replace must update in place, not add a second record for the value"
     );
-    step(
-        "replace",
-        s.replace("bob", nid("r1", constants::NAMEID_EMAIL, Some(SP_A))),
-    )?;
+    // A value another user holds is refused and left alone: reassigning it would
+    // let that user log in as the owner at every SP that has seen the value.
+    match s.replace("bob", nid("r1", constants::NAMEID_EMAIL, Some(SP_A))) {
+        Err(InsertError::ValueTaken) => {}
+        Ok(()) => {
+            return Err("replace moved a record to another user: a value held by a \
+                        different user must be refused with ValueTaken"
+                .to_string())
+        }
+        Err(e) => return Err(format!("backend call `replace` failed: {e}")),
+    }
     let owner = step("user_for", s.user_for("r1"))?;
-    ensure_eq!(owner.as_deref(), Some("bob"), "replace reassigns");
+    ensure_eq!(
+        owner.as_deref(),
+        Some("alice"),
+        "a refused replace must leave the owner unchanged"
+    );
     ensure!(
-        step("for_user", s.for_user("alice"))?.is_empty(),
-        "the previous owner no longer has the record"
+        step("for_user", s.for_user("bob"))?.is_empty(),
+        "a refused replace must not create a record for the other user"
     );
     Ok(())
 }

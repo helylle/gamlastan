@@ -56,19 +56,22 @@ pub enum IdentError {
         "a NameID of this format already exists for this user and (SPNameQualifier, NameQualifier)"
     )]
     DurableExists,
+
+    /// The NameID value already belongs to a different user. A record is never
+    /// moved from one user to another: that would let the second user log in as
+    /// the first at every SP that has seen the value.
+    #[error("the NameID value already belongs to a different user")]
+    ValueTaken,
 }
 
 impl From<InsertError> for IdentError {
-    /// For a write that can only conflict on the durable tuple
-    /// ([`IdentityStore::replace`]). `ValueTaken` is outside that contract
-    /// (`replace` upserts by value), so it is reported as a backend fault.
+    /// For [`IdentityStore::replace`], which conflicts on the durable tuple or on
+    /// a value another user holds.
     fn from(e: InsertError) -> Self {
         match e {
             InsertError::DurableExists => IdentError::DurableExists,
+            InsertError::ValueTaken => IdentError::ValueTaken,
             InsertError::Store(e) => IdentError::Store(e),
-            InsertError::ValueTaken => IdentError::Store(StoreError::new(
-                "the backend reported ValueTaken from a write that upserts by value",
-            )),
         }
     }
 }
@@ -289,16 +292,20 @@ pub trait IdentityStore: Send + Sync {
     /// [`get_or_insert_durable`](Self::get_or_insert_durable).
     fn insert(&self, user_id: &str, name_id: NameId) -> Result<(), InsertError>;
 
-    /// Insert or overwrite the record with this value, assigning it to
-    /// `user_id`. Records are keyed by value, so this changes a record's *other*
-    /// fields in place (e.g. a ManageNameID `NewID` sets `SPProvidedID` on the
-    /// same NameID value). It cannot give a durable record a new value: a
+    /// Insert the record, or overwrite the record with this value if `user_id`
+    /// already owns it. Records are keyed by value, so this changes a record's
+    /// *other* fields in place (e.g. a ManageNameID `NewID` sets `SPProvidedID`
+    /// on the same NameID value). It cannot give a durable record a new value: a
     /// different value is a different record. Durable identifiers are meant to
     /// stay stable, and rotating one is not an operation this trait offers
     /// (`remove` followed by `insert` is not atomic).
     ///
-    /// It never reports `ValueTaken`, since it upserts by value, but it holds
-    /// the same durable constraint as [`insert`](Self::insert):
+    /// A value held by a **different** user is `Err(InsertError::ValueTaken)`
+    /// and left untouched: a record is never reassigned, because that would let
+    /// the new user log in as the old one at every SP that has seen the value. A
+    /// backend gets this from the unique index on the value (an upsert filtered
+    /// on `(value, user_id)` reports a duplicate key). It also holds the same
+    /// durable constraint as [`insert`](Self::insert):
     /// `Err(InsertError::DurableExists)` if the write would leave `user_id`
     /// with a second durable record (a different value) of the same format for
     /// the same `(sp_name_qualifier, name_qualifier)`. Updating the existing
@@ -436,6 +443,12 @@ impl IdentityStore for InMemoryIdentityStore {
 
     fn replace(&self, user_id: &str, name_id: NameId) -> Result<(), InsertError> {
         let mut records = self.records.lock().unwrap();
+        if records
+            .iter()
+            .any(|(owner, nid)| nid.value == name_id.value && owner != user_id)
+        {
+            return Err(InsertError::ValueTaken);
+        }
         if durable_tuple_taken(&records, user_id, &name_id) {
             return Err(InsertError::DurableExists);
         }
@@ -644,8 +657,10 @@ impl<S: IdentityStore> IdentDb<S> {
     /// any record that already has the same value, so it updates that
     /// NameID's other fields in place rather than changing its value.
     ///
-    /// Fails with [`IdentError::DurableExists`] if `name_id` is persistent
-    /// and the user already has a different persistent NameID for the same
+    /// Fails with [`IdentError::ValueTaken`] if the value already belongs to a
+    /// different user (a record is never moved between users), and with
+    /// [`IdentError::DurableExists`] if `name_id` is durable
+    /// and the user already has a different NameID of that format for the same
     /// `(SPNameQualifier, NameQualifier)`; use
     /// [`persistent_nameid`](Self::persistent_nameid) to obtain that one. A
     /// persistent identifier cannot be rotated through this method.
@@ -1091,7 +1106,16 @@ mod tests {
         }
         fn insert(&self, user_id: &str, name_id: NameId) -> Result<(), InsertError> {
             if self.no_value_uniqueness {
-                self.inner.replace(user_id, name_id)?;
+                // Upsert by value with no ownership check: what a backend
+                // without a unique index on the value does.
+                let mut records = self.inner.records.lock().unwrap();
+                match records
+                    .iter_mut()
+                    .find(|(_, nid)| nid.value == name_id.value)
+                {
+                    Some(slot) => *slot = (user_id.to_string(), name_id),
+                    None => records.push((user_id.to_string(), name_id)),
+                }
                 return Ok(());
             }
             self.inner.insert(user_id, name_id)
@@ -1236,6 +1260,7 @@ mod tests {
                 .iter_mut()
                 .find(|(_, nid)| nid.value == name_id.value)
             {
+                Some((owner, _)) if owner != user_id => return Err(InsertError::ValueTaken),
                 Some(slot) => *slot = (user_id.to_string(), name_id),
                 None => records.push((user_id.to_string(), name_id)),
             }
@@ -1294,13 +1319,20 @@ mod tests {
             .unwrap();
         store.insert("bob", persistent_nid("p5", SP)).unwrap();
         store.replace("alice", persistent_nid("p1", SP)).unwrap();
-        // Moving a persistent value to a user who already has one is refused too.
+        // A value another user holds is never moved to them, whatever it is.
         assert!(matches!(
             store.replace("bob", persistent_nid("p4", "https://other-sp.example.com")),
-            Ok(())
+            Err(InsertError::ValueTaken)
         ));
         assert!(matches!(
             store.replace("bob", persistent_nid("p1", SP)),
+            Err(InsertError::ValueTaken)
+        ));
+        assert_eq!(store.user_for("p1").unwrap().as_deref(), Some("alice"));
+        // A fresh value for a user who already has a persistent one for the SP
+        // is still the durable conflict.
+        assert!(matches!(
+            store.replace("bob", persistent_nid("p6", SP)),
             Err(InsertError::DurableExists)
         ));
     }
@@ -1402,6 +1434,60 @@ mod tests {
         fn remove_all(&self, user_id: &str) -> Result<(), StoreError> {
             self.0.remove_all(user_id)
         }
+    }
+
+    /// A backend whose `replace` moves a record to whichever user asks.
+    #[derive(Default)]
+    struct ReassigningStore(InMemoryIdentityStore);
+
+    impl IdentityStore for ReassigningStore {
+        fn for_user(&self, user_id: &str) -> Result<Vec<NameId>, StoreError> {
+            self.0.for_user(user_id)
+        }
+        fn user_for(&self, value: &str) -> Result<Option<String>, StoreError> {
+            self.0.user_for(value)
+        }
+        fn get_or_insert_durable(&self, u: &str, n: NameId) -> Result<NameId, InsertError> {
+            self.0.get_or_insert_durable(u, n)
+        }
+        fn insert(&self, user_id: &str, name_id: NameId) -> Result<(), InsertError> {
+            self.0.insert(user_id, name_id)
+        }
+        fn replace(&self, user_id: &str, name_id: NameId) -> Result<(), InsertError> {
+            self.0.remove(&name_id.value)?;
+            self.0.insert(user_id, name_id)
+        }
+        fn remove(&self, value: &str) -> Result<(), StoreError> {
+            self.0.remove(value)
+        }
+        fn remove_all(&self, user_id: &str) -> Result<(), StoreError> {
+            self.0.remove_all(user_id)
+        }
+    }
+
+    #[test]
+    fn a_record_is_never_moved_to_another_user() {
+        // Through IdentDb::store ...
+        let db = IdentDb::in_memory(IDP);
+        let nid = db
+            .get_nameid("alice", constants::NAMEID_PERSISTENT, Some(SP), Some(IDP))
+            .unwrap();
+        assert!(matches!(db.store("bob", &nid), Err(IdentError::ValueTaken)));
+        assert_eq!(db.find_local_id(&nid).unwrap().as_deref(), Some("alice"));
+        // ... and the owner can still update it in place.
+        db.store("alice", &nid).unwrap();
+
+        // The conformance suite catches a backend that reassigns.
+        let err = conformance::check_one(
+            "replace_upserts_by_value",
+            ReassigningStore::default,
+            &conformance::Options::default(),
+        )
+        .unwrap_err();
+        assert!(
+            err.message.contains("moved a record to another user"),
+            "{err}"
+        );
     }
 
     #[test]

@@ -436,9 +436,11 @@ where needed to correct protocol handling.
   session pushed its own absolute cap further out on each SSO hop, turning
   it into an unbounded sliding window in practice. The Actix handler enforces
   this for the `AuthnSubjectCallback` path: on `ReuseSession` it takes the
-  subject, method, `authn_instant` and session index from the established
-  session, so a callback returning `authn_instant: None` cannot restart the
-  window.
+  method, `authn_instant` and session index from the established session, so
+  a callback returning `authn_instant: None` cannot restart the window. The
+  callback must return the session's own `subject_id`: a different one is a
+  `Configuration` error, not relabelled, since that would sign the session
+  user's NameID over another user's attributes.
 
 ## [0.9.1] - 2026-09-29
 

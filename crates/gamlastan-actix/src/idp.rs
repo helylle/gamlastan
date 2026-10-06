@@ -181,6 +181,12 @@ pub struct AuthnCallbackResult {
 /// authenticated user via `AuthnRequest::requested_subject` for a re-login or
 /// step-up). Return [`AuthnSubjectResult::Deny`] to refuse.
 ///
+/// When the disposition is `ReuseSession`, the subject returned must be the
+/// session's own (`subject_id`); the handler takes the method, authn instant and
+/// session index from the session, and answers a different subject with a
+/// `Configuration` error instead of signing one user's NameID over another's
+/// attributes.
+///
 /// Register both this callback and a [`ResponseEngineParts`] as application
 /// data to use it; the SSO handler prefers it over [`AuthnCallback`] when
 /// both are present.
@@ -566,7 +572,7 @@ async fn idp_sso(
         let result = callback(&processed, &authn_request, &disposition, &req)?;
         return match result {
             AuthnSubjectResult::Authenticated(mut subject) => {
-                pin_to_reused_session(&mut subject, &disposition);
+                pin_to_reused_session(&mut subject, &disposition)?;
                 let outcome = create_authn_response(engine, &params, &subject)
                     .map_err(SamlActixError::Profile)?;
                 let xml = match outcome {
@@ -659,26 +665,41 @@ async fn idp_sso(
     Ok(crate::response_adapter::post_binding_response(&html))
 }
 
+/// On `ReuseSession` the session owns the subject, the method that ran, when
+/// it ran and the session index; `check_request` validated exactly those. The
+/// callback keeps only the attributes. Without this, a callback returning
+/// `authn_instant: None` would restart the absolute session expiry from now,
+/// or attach a different session index to the reused session.
+///
+/// The callback must name the same subject as the session. Overwriting a
+/// different one would sign the session user's NameID over the other user's
+/// attributes, so a mismatch is a configuration error: the established-session
+/// callback and the authn-subject callback disagree about who is at the browser.
+fn pin_to_reused_session(
+    subject: &mut AuthenticatedSubject,
+    disposition: &Disposition,
+) -> Result<(), SamlActixError> {
+    if let Disposition::ReuseSession { session } = disposition {
+        if subject.subject_id != session.subject_id {
+            return Err(SamlActixError::Configuration(
+                "AuthnSubjectCallback returned a different subject than the established \
+                 session it was told to reuse"
+                    .into(),
+            ));
+        }
+        subject.authn_method = session.authn_method.clone();
+        subject.authn_instant = Some(session.authn_instant);
+        subject.session_index = Some(session.session_index.clone());
+    }
+    Ok(())
+}
+
 /// The ready handlers deliver a full Response through an auto-submitting HTTP-POST
 /// form, whatever the ACS binding the request resolved to. A request that resolves
 /// to an endpoint registered for another binding (HTTP-Artifact, HTTP-Redirect)
 /// would be answered with the wrong binding, so it is refused here instead.
 /// An application that has to serve such an SP uses the profile functions
 /// directly: `ProcessedAuthnRequest::acs_binding` says how to deliver.
-/// On `ReuseSession` the session owns the subject, the method that ran, when
-/// it ran and the session index; `check_request` validated exactly those. The
-/// callback keeps only the attributes. Without this, a callback returning
-/// `authn_instant: None` would restart the absolute session expiry from now,
-/// or attach a different subject or session index to the reused session.
-fn pin_to_reused_session(subject: &mut AuthenticatedSubject, disposition: &Disposition) {
-    if let Disposition::ReuseSession { session } = disposition {
-        subject.subject_id = session.subject_id.clone();
-        subject.authn_method = session.authn_method.clone();
-        subject.authn_instant = Some(session.authn_instant);
-        subject.session_index = Some(session.session_index.clone());
-    }
-}
-
 fn require_post_acs(
     processed: &gamlastan::profiles::sso::idp::ProcessedAuthnRequest,
 ) -> Result<(), SamlActixError> {
@@ -2722,7 +2743,7 @@ mod tests {
     }
 
     #[test]
-    fn a_reused_session_owns_the_subject_instant_and_index() {
+    fn a_reused_session_owns_the_instant_and_index_and_the_subject_must_match() {
         use gamlastan::idp::orchestrator::AuthnMethodRef;
         let method = |c: &str| AuthnMethodRef::Inline {
             class_ref: c.to_string(),
@@ -2735,27 +2756,45 @@ mod tests {
             authn_instant: instant,
             session_index: "s-1".into(),
         };
-        let mut subject = AuthenticatedSubject {
-            subject_id: "mallory".into(),
+        let subject_for = |id: &str| AuthenticatedSubject {
+            subject_id: id.into(),
             attributes: vec![],
             authn_method: method("urn:other"),
             authn_instant: None,
             session_index: Some("s-2".into()),
         };
+        let reuse = Disposition::ReuseSession { session };
 
-        // A fresh login is the callback's own.
-        let fresh = Disposition::Authenticate { methods: vec![] };
-        pin_to_reused_session(&mut subject, &fresh);
-        assert_eq!(subject.subject_id, "mallory");
-        assert_eq!(subject.authn_instant, None);
+        // A fresh login is the callback's own, whoever it names.
+        let mut fresh_login = subject_for("mallory");
+        pin_to_reused_session(
+            &mut fresh_login,
+            &Disposition::Authenticate { methods: vec![] },
+        )
+        .unwrap();
+        assert_eq!(fresh_login.subject_id, "mallory");
+        assert_eq!(fresh_login.authn_instant, None);
 
-        pin_to_reused_session(&mut subject, &Disposition::ReuseSession { session });
-        assert_eq!(subject.subject_id, "alice");
-        assert_eq!(subject.authn_instant, Some(instant));
-        assert_eq!(subject.session_index.as_deref(), Some("s-1"));
+        // Reuse keeps the callback's attributes, and takes the rest from the session.
+        let mut same = subject_for("alice");
+        pin_to_reused_session(&mut same, &reuse).unwrap();
+        assert_eq!(same.authn_instant, Some(instant));
+        assert_eq!(same.session_index.as_deref(), Some("s-1"));
         assert!(matches!(
-            subject.authn_method,
+            same.authn_method,
             AuthnMethodRef::Inline { ref class_ref, .. } if class_ref == "urn:session"
         ));
+
+        // A different subject is refused rather than relabelled: it would sign
+        // alice's NameID over mallory's attributes.
+        let mut other = subject_for("mallory");
+        assert!(matches!(
+            pin_to_reused_session(&mut other, &reuse),
+            Err(SamlActixError::Configuration(_))
+        ));
+        assert_eq!(
+            other.subject_id, "mallory",
+            "nothing is rewritten on refusal"
+        );
     }
 }

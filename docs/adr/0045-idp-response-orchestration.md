@@ -201,7 +201,10 @@ existing primitives into the profile flow, and move the semantics proven in
    already consumed: a proxy enforces `ProxyCount`/`IDPList` there, and a
    re-login flow compares the subject. `create_authn_response` re-checks a
    reused session's absolute expiry at issuance, since the callback may have
-   run past it after `check_request` approved the reuse.
+   run past it after `check_request` approved the reuse. On a reused session the
+   handler takes the method, authn instant and session index from the session
+   and refuses (a `Configuration` error) a callback that names a different
+   subject, instead of signing one user's NameID over another's attributes.
 
    `gamlastan-actix` registers the engine's dependencies as an owned
    `ResponseEngineParts` (`Arc<ReleasePolicy>`, `Arc<dyn AttributeRelease>`,

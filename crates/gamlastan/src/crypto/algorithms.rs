@@ -111,6 +111,16 @@ pub struct SigningAlgorithms {
 /// advertises none of them (or nothing at all), the first entry wins. An empty
 /// list leaves that kind at the signer's default.
 ///
+/// # HSM-backed signers
+///
+/// An HSM token can sign with only its own algorithm, and a response resolved to
+/// any other signature method fails with an error (denials included), for
+/// that SP only. So with an HSM list **only the token's signature method**, or
+/// leave the signature list empty: an entry the token cannot produce breaks
+/// every SP that advertises nothing if it is listed first, and every SP that
+/// advertises it otherwise. Digest methods are not affected. The check happens
+/// when a response is signed, not at startup.
+///
 /// # Security
 ///
 /// The SP's advertisement is an **untrusted** claim copied from its metadata.

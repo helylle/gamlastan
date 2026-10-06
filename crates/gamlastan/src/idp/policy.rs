@@ -223,6 +223,10 @@ impl PolicyEntry {
     /// SP, most preferred first. The orchestrator picks, per response, the
     /// first the SP also advertises in its metadata, else the first listed
     /// (see [`SigningPreference`]). Without it the signer's defaults apply.
+    ///
+    /// With an HSM-backed signer, list only the token's own signature method (or
+    /// none): any other makes the response fail for the SPs that resolve to it,
+    /// at signing time. See [`SigningPreference`].
     pub fn with_signing_preference(mut self, preference: SigningPreference) -> Self {
         self.signing_preference = Some(preference);
         self

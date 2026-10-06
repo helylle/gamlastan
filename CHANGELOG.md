@@ -145,6 +145,9 @@ where needed to correct protocol handling.
   extensions and the SAML 2.0 SP role the request was bound to, not from every
   IdP and SP role of the entity (which `EntityDescriptor::supported_algorithms`
   aggregates), so an algorithm advertised only by another role is not selected.
+  With an HSM-backed signer, list only the token's signature method in a
+  preference: another one makes the response (and a denial) fail with an error
+  for the SPs that resolve to it, when it is signed, not at startup.
 - `ident::conformance` (the reusable `IdentityStore` backend check) gains
   non-panicking entry points for callers that are not Rust tests, such as a
   language binding: `check` / `check_with` return the first violation as a

@@ -73,11 +73,24 @@ impl From<InsertError> for IdentError {
     }
 }
 
+/// How many fresh values `IdentDb` mints before giving up on a backend that
+/// keeps rejecting them. A real collision of 256-bit values does not happen, so
+/// reaching this means the backend is broken, and looping on it would hold the
+/// request thread forever.
+const MAX_MINT_ATTEMPTS: usize = 8;
+
+fn mint_exhausted(why: &str) -> StoreError {
+    StoreError::new(format!(
+        "could not mint an unused NameID in {MAX_MINT_ATTEMPTS} attempts: {why}"
+    ))
+}
+
 /// A storage backend failed (connection lost, timeout, query error, ...).
 ///
 /// Distinct from a *conflict*: a NameID value that is already taken is an
 /// expected outcome of the uniqueness constraints and is reported as
-/// [`InsertError::ValueTaken`], which callers retry with a fresh value. A
+/// [`InsertError::ValueTaken`], which callers retry with a fresh value (a bounded
+/// number of times). A
 /// `StoreError` is never retried blindly; it means the store could not answer,
 /// and treating it as "not found" would, for example, mint a second
 /// "stable" persistent identifier for a user who already has one.
@@ -683,7 +696,7 @@ impl<S: IdentityStore> IdentDb<S> {
         sp_name_qualifier: Option<&str>,
         check_free: bool,
     ) -> Result<String, StoreError> {
-        loop {
+        for _ in 0..MAX_MINT_ATTEMPTS {
             let mut seed = [0u8; 32];
             rand::fill(&mut seed);
             let mut input = seed.to_vec();
@@ -705,6 +718,9 @@ impl<S: IdentityStore> IdentDb<S> {
                 return Ok(value);
             }
         }
+        Err(mint_exhausted(
+            "every freshly minted value was already in use",
+        ))
     }
 
     /// Get or create the NameID of the given format (pysaml2 `get_nameid()`).
@@ -751,7 +767,7 @@ impl<S: IdentityStore> IdentDb<S> {
         }
 
         let stored = durable || self.persist_transient;
-        loop {
+        for _ in 0..MAX_MINT_ATTEMPTS {
             let value = self.create_id(format, name_qualifier, sp_name_qualifier, stored)?;
             let name_id = NameId {
                 value,
@@ -791,6 +807,7 @@ impl<S: IdentityStore> IdentDb<S> {
                 }
             }
         }
+        Err(mint_exhausted("the backend kept reporting ValueTaken"))
     }
 
     /// Generate a transient NameID (pysaml2 `transient_nameid()`).
@@ -1357,6 +1374,51 @@ mod tests {
         fn remove_all(&self, user_id: &str) -> Result<(), StoreError> {
             self.0.remove_all(user_id)
         }
+    }
+
+    /// A backend that says every value is already in use.
+    #[derive(Default)]
+    struct EveryValueInUseStore(PartialConstraintStore);
+
+    impl IdentityStore for EveryValueInUseStore {
+        fn for_user(&self, user_id: &str) -> Result<Vec<NameId>, StoreError> {
+            self.0.for_user(user_id)
+        }
+        fn user_for(&self, _: &str) -> Result<Option<String>, StoreError> {
+            Ok(Some("someone".to_string()))
+        }
+        fn get_or_insert_durable(&self, u: &str, n: NameId) -> Result<NameId, InsertError> {
+            self.0.get_or_insert_durable(u, n)
+        }
+        fn insert(&self, user_id: &str, name_id: NameId) -> Result<(), InsertError> {
+            self.0.insert(user_id, name_id)
+        }
+        fn replace(&self, user_id: &str, name_id: NameId) -> Result<(), InsertError> {
+            self.0.replace(user_id, name_id)
+        }
+        fn remove(&self, value: &str) -> Result<(), StoreError> {
+            self.0.remove(value)
+        }
+        fn remove_all(&self, user_id: &str) -> Result<(), StoreError> {
+            self.0.remove_all(user_id)
+        }
+    }
+
+    #[test]
+    fn minting_against_a_lying_backend_gives_up_with_an_error() {
+        // Both loops are bounded: one that retries after ValueTaken, and the
+        // free-value check inside the minting helper.
+        let db = IdentDb::new(AlwaysTakenStore::default(), IDP);
+        let err = db
+            .get_nameid("alice", constants::NAMEID_PERSISTENT, Some(SP), Some(IDP))
+            .unwrap_err();
+        assert!(err.to_string().contains("attempts"), "{err}");
+
+        let db = IdentDb::new(EveryValueInUseStore::default(), IDP);
+        let err = db
+            .get_nameid("alice", constants::NAMEID_PERSISTENT, Some(SP), Some(IDP))
+            .unwrap_err();
+        assert!(err.to_string().contains("attempts"), "{err}");
     }
 
     #[test]

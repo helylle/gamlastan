@@ -321,6 +321,10 @@ where needed to correct protocol handling.
   for a present but empty `RequestedAuthnContext`, which the engine refuses.
 - `example-idp` refuses an `AuthnRequest` that names a `Subject`: it issues for
   whoever logs in and does not compare them with a requested principal.
+- `IdentDb` gives up after 8 attempts to mint an unused NameID, with a
+  `StoreError`, instead of looping forever against a backend that always reports
+  `ValueTaken` or says every value is in use. Real collisions of 256-bit values
+  do not occur, so this only bounds a broken backend's cost.
 - `create_authn_response` resolves and checks the authentication method before
   it constructs the NameID, so a stale `BrokerReference` or a method that does
   not satisfy the request is refused before anything is stored. It also
